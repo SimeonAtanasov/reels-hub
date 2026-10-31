@@ -7,8 +7,9 @@ Keep this file next to reels2notes.py (e.g. in GitHub/reels-hub) and run:
 Downloaded reels are stored in Downloads/reels (change with --out).
 It opens http://127.0.0.1:8765 in your browser.
 
-- Paste Instagram, TikTok or YouTube (incl. Shorts) links, one per line, and press Run: reels2notes.py
+- Paste Instagram, TikTok, YouTube (incl. Shorts) or X links, one per line, and press Run: reels2notes.py
   processes them, with a live log
+- If a site needs login (often X), put a cookies.txt next to this file: Run uses it automatically
 - Categories in the sidebar: create your own (e.g. Training), assign reels by dropdown or drag;
   reels without a category stay under Unassigned at the bottom
 - Per reel: video, caption, transcript (click a line to jump there), on-screen text, snapshots, notes
@@ -19,7 +20,7 @@ It opens http://127.0.0.1:8765 in your browser.
 Data: favorites and category live in reels/<reel>/hub.json, categories in reels/_categories.json,
 and favorites are also written into each note.md (## Favorites) for Obsidian.
 
-Obsidian: each reel gets a note in <vault>/Instagram, /TikTok or /YouTube named after the reel
+Obsidian: each reel gets a note in <vault>/Instagram, /TikTok, /YouTube or /X named after the reel
 (caption, transcript); "Send to Obsidian" copies starred images to <Platform>/attachments and
 writes them with their text.
 
@@ -35,10 +36,10 @@ HERE = Path(__file__).resolve().parent
 SCRIPT = HERE / "reels2notes.py"
 OUT = Path.home() / "Downloads" / "reels"   # downloaded videos, snapshots and notes
 VAULT = Path.home() / "OneDrive" / "Documents" / "Obsidian Vault"   # Obsidian vault
-PLATFORM_DIRS = ("Instagram", "TikTok", "YouTube")                  # one vault folder per platform
+PLATFORM_DIRS = ("Instagram", "TikTok", "YouTube", "X")             # one vault folder per platform
 FAV_START, FAV_END = "<!-- reels-hub:favorites start -->", "<!-- reels-hub:favorites end -->"
 
-JOB = {"running": False, "log": [], "started": None, "finished": None, "urls": []}
+JOB = {"running": False, "log": [], "started": None, "finished": None, "urls": [], "progress": None}
 JOB_LOCK = threading.Lock()
 DATA_LOCK = threading.Lock()
 
@@ -97,10 +98,13 @@ def parse_note(folder):
     platform = meta.get("platform") or platform_of(url)
     if caption == "_none_":
         caption = ""
-    generic = not title or title.startswith("Video by") or title.startswith("Post by") or title in folder.name
+    # Instagram titles are "Video by ...", X titles are "Name - truncated post": use the caption instead
+    generic = (not title or title.startswith("Video by") or title.startswith("Post by")
+               or title in folder.name or platform == "X")
     label = ((caption.splitlines()[0] if caption else title) if generic else title)[:80]
     return {
         "id": folder.name, "title": title, "label": label or folder.name, "platform": platform,
+        "version": int(re.search(r"_v(\d+)$", folder.name).group(1)) if re.search(r"_v(\d+)$", folder.name) else 1,
         "url": meta.get("source", ""), "author": meta.get("author", ""),
         "date": meta.get("date", ""), "duration": meta.get("duration_s", ""),
         "caption": caption, "lang": lang.group(1) if lang else "",
@@ -160,6 +164,8 @@ def platform_of(url):
         return "YouTube"
     if "instagram.com" in u:
         return "Instagram"
+    if re.match(r"^https?://([a-z0-9-]+\.)*(x|twitter)\.com(/|$)", u):
+        return "X"
     return "Web"
 
 
@@ -372,6 +378,37 @@ def recategorize(old, new):
                 f.write_text(json.dumps(s, indent=1, ensure_ascii=False), encoding="utf-8")
 
 
+def delete_shots(reel_id, names):
+    """Delete snapshot files (never favorites) and drop them from shots.json and note.md."""
+    folder = safe_path(reel_id)
+    if folder.parent != OUT.resolve() or not (folder / "note.md").exists():
+        raise ValueError("unknown reel")
+    if JOB["running"]:
+        raise ValueError("Wait for the current run to finish")
+    with DATA_LOCK:
+        favs = {f["shot"] for f in read_state(folder)["favorites"]}
+        gone = []
+        for n in names:
+            n = str(n)
+            if n in favs or not re.fullmatch(r"shot_\d+\.jpg", n):
+                continue
+            p = folder / "shots" / n
+            if p.exists():
+                p.unlink(); gone.append(n)
+        sj = folder / "shots.json"
+        if sj.exists():
+            try:
+                d = json.loads(sj.read_text(encoding="utf-8"))
+                sj.write_text(json.dumps({k: v for k, v in d.items() if k not in gone}, indent=1), encoding="utf-8")
+            except ValueError:
+                pass
+        note = folder / "note.md"
+        text = note.read_text(encoding="utf-8")
+        drop = {f"![[{folder.name}/shots/{n}]]" for n in gone}
+        note.write_text("\n".join(l for l in text.split("\n") if l.strip() not in drop), encoding="utf-8")
+    return {"deleted": gone}
+
+
 def _unique(dest):
     if not dest.exists():
         return dest
@@ -453,23 +490,54 @@ def change_cats(body):
 
 
 # ---------------------------------------------------------------- job runner
-def run_job(urls):
+def find_done(url):
+    """Reel folders that already hold a finished copy of this link (same video id or same page)."""
+    hits = []
+    for info_file in sorted(OUT.glob("*/video.info.json")):
+        folder = info_file.parent
+        if folder.name.startswith("_") or not (folder / "note.md").exists():
+            continue
+        try:
+            info = json.loads(info_file.read_text(encoding="utf-8"))
+        except ValueError:
+            continue
+        if (info.get("id") and str(info["id"]) in url) or url.rstrip("/") in (
+                str(info.get("webpage_url", "")).rstrip("/"), str(info.get("original_url", "")).rstrip("/")):
+            hits.append(folder)
+    return hits
+
+
+def run_job(urls, max_shots=200, redo=False, flags=()):
     with JOB_LOCK:
-        JOB.update(running=True, log=[], started=time.time(), finished=None, urls=urls)
+        JOB.update(running=True, log=[], started=time.time(), finished=None, urls=urls, progress=None)
     env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
-    cmd = [sys.executable, "-u", str(SCRIPT), "--out", str(OUT), *urls]
+    cmd = [sys.executable, "-u", str(SCRIPT), "--out", str(OUT), "--max-shots", str(max_shots)]
+    if redo:
+        cmd.append("--redo")
+    cmd += list(flags)
+    cookies = HERE / "cookies.txt"          # optional: login cookies next to the app (git-ignored)
+    if cookies.exists():
+        cmd += ["--cookies", str(cookies)]
+        JOB["log"].append("-- using cookies.txt for sites that need login")
+    cmd += urls
     try:
         proc = subprocess.Popen(cmd, cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, encoding="utf-8", errors="replace", env=env)
         for line in proc.stdout:
             line = line.rstrip()
+            if line.startswith("@@PROGRESS "):
+                try:
+                    JOB["progress"] = {**json.loads(line[11:]), "at": time.time()}
+                except ValueError:
+                    pass
+                continue
             if line and "warnings.warn" not in line:
                 JOB["log"].append(line)
         proc.wait()
         JOB["log"].append(f"-- finished (exit code {proc.returncode})")
     except Exception as e:
         JOB["log"].append(f"-- could not start: {e}")
-    JOB.update(running=False, finished=time.time())
+    JOB.update(running=False, finished=time.time(), progress=None)
 
 
 # ---------------------------------------------------------------- HTTP
@@ -499,8 +567,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"reels": list_reels(), "categories": read_cats(),
                             "vault": {"path": str(VAULT), "ok": vault_ok()}})
         elif path == "/api/status":
+            prog = JOB["progress"]
+            if prog:   # age the ETA by the time since the last update
+                prog = {**prog, "eta": None if prog.get("eta") is None else max(0, prog["eta"] - (time.time() - prog["at"])),
+                        "elapsed": prog["elapsed"] + (time.time() - prog["at"])}
             self.send_json({"running": JOB["running"], "log": JOB["log"][-300:], "urls": JOB["urls"],
-                            "finished": JOB["finished"]})
+                            "finished": JOB["finished"], "progress": prog,
+                            "total_elapsed": time.time() - JOB["started"] if JOB["started"] else 0})
         elif path.startswith("/media/"):
             self.serve_file(path[len("/media/"):])
         else:
@@ -519,9 +592,40 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json({"error": "A run is already in progress"}, 409)
                 urls = [u.strip() for u in re.split(r"[\s,]+", body.get("urls", "")) if u.strip().startswith("http")]
                 urls = list(dict.fromkeys(urls))
-                if not urls:
+                if not urls and not body.get("target"):
                     return self.send_json({"error": "No links found"}, 400)
-                threading.Thread(target=run_job, args=(urls,), daemon=True).start()
+                try:
+                    max_shots = max(10, min(1000, int(body.get("max_shots") or 200)))
+                except (TypeError, ValueError):
+                    max_shots = 200
+                flags, redo = [], False
+                target = str(body.get("target") or "")
+                if target:                                   # a button on one reel
+                    folder = safe_path(target)
+                    if folder.parent != OUT.resolve() or not (folder / "note.md").exists():
+                        raise ValueError("unknown reel")
+                    r = parse_note(folder)
+                    if not r or not r["url"]:
+                        raise ValueError("This reel has no source link")
+                    urls = [r["url"]]
+                    flags = ["--target", target]
+                    if body.get("action") == "redo":         # snapshots get replaced: their favorites no longer apply
+                        redo = True
+                        with DATA_LOCK:
+                            st = read_state(folder); st["favorites"] = []; write_state(folder, st)
+                    else:
+                        flags.append("--new-version")
+                else:
+                    mode = body.get("existing")              # what to do with links that are already done
+                    if mode is None:
+                        done = [(u, f) for u in urls for f in find_done(u)[:1]]
+                        if done:
+                            return self.send_json({"existing": [
+                                {"url": u, "id": f.name, "label": (parse_note(f) or {}).get("label", f.name)} for u, f in done],
+                                "total": len(urls)})
+                    elif mode == "new":
+                        flags.append("--new-version")
+                threading.Thread(target=run_job, args=(urls, max_shots, redo, flags), daemon=True).start()
                 self.send_json({"ok": True, "count": len(urls)})
             elif path == "/api/notes":
                 save_notes(body["id"], body.get("notes", ""))
@@ -530,6 +634,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "state": save_state(body["id"], body.get("state", {}))})
             elif path == "/api/obsidian":
                 self.send_json({"ok": True, **send_to_obsidian(body["id"])})
+            elif path == "/api/shots/delete":
+                self.send_json({"ok": True, **delete_shots(body["id"], body.get("shots") or [])})
             elif path == "/api/delete":
                 ids = body.get("ids") or []
                 if not isinstance(ids, list) or not ids:
@@ -622,6 +728,14 @@ aside{border-right:1px solid var(--line);display:flex;flex-direction:column;min-
 .runbox .row{display:flex;gap:8px;align-items:center}
 .status{font-size:12px;color:var(--muted)}
 .status.on{color:var(--warn)}
+#prog{display:flex;flex-direction:column;gap:4px}
+.pline{display:flex;justify-content:space-between;gap:8px;font-size:12px}
+.pline.sub{color:var(--muted);font-size:11px}
+#peta{color:var(--accent);font-variant-numeric:tabular-nums;white-space:nowrap}
+.pbar{height:6px;background:var(--panel2);border-radius:4px;overflow:hidden}
+#pfill{height:100%;width:0;background:var(--accent);transition:width .6s}
+#pfill[data-stage="download"]{background:#6aa8ff}
+#pfill[data-stage="ocr"]{background:var(--star)}
 .listtools{display:flex;gap:8px;padding:10px 12px 6px;align-items:center}
 #filters{padding:0 12px 6px;display:flex;flex-direction:column;gap:5px;border-bottom:1px solid var(--line)}
 #filters:empty{display:none}
@@ -726,6 +840,11 @@ textarea.notes{width:100%;min-height:200px;background:var(--bg);border:1px solid
 .btn.danger.solid{background:#c94a47;color:#fff;border-color:#c94a47;font-weight:600}
 #confirm{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:50;padding:16px}
 #confirm.show{display:flex}
+#choice{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:50;padding:16px}
+#choice.show{display:flex}
+#choice p{white-space:normal}
+.chlist{margin:0 0 12px;padding-left:20px;font-size:13px}
+.vtag{display:inline-block;font-size:10px;font-weight:700;padding:0 5px;border-radius:4px;background:var(--panel2);border:1px solid var(--line);color:var(--accent);line-height:14px;vertical-align:1px}
 .cbox{width:min(460px,100%);padding:18px 20px}
 .cbox h3{margin:0 0 8px;font-size:16px}
 .cbox p{margin:0 0 14px;white-space:pre-wrap;color:var(--muted);font-size:13px}
@@ -752,19 +871,34 @@ textarea.notes{width:100%;min-height:200px;background:var(--bg);border:1px solid
 .shots figcaption{font-size:11px;color:var(--muted);text-align:center;font-variant-numeric:tabular-nums}
 .star{position:absolute;top:4px;right:4px;width:28px;height:28px;border-radius:50%;border:0;background:rgba(0,0,0,.6);color:#fff;cursor:pointer;font-size:16px;line-height:28px;padding:0}
 .star.on{color:var(--star);background:rgba(0,0,0,.75)}
+.shotcopy{position:absolute;bottom:22px;right:4px;width:26px;height:26px;border-radius:50%;border:0;background:rgba(0,0,0,.65);color:#fff;cursor:pointer;font-size:13px;line-height:26px;padding:0;opacity:0;transition:opacity .15s}
+.shots figure:hover .shotcopy,.favimg:hover .shotcopy{opacity:1}
+.shotcopy:hover{background:var(--accent);color:var(--accent-ink)}
+.shotcopy.fc2{bottom:6px;right:6px}
+.shotdel{position:absolute;top:4px;left:4px;width:24px;height:24px;border-radius:50%;border:0;background:rgba(0,0,0,.6);color:#fff;cursor:pointer;font-size:12px;line-height:24px;padding:0;opacity:0;transition:opacity .15s}
+.shots figure:hover .shotdel{opacity:1}
+.shotdel:hover{background:#c94a47}
+.star.on ~ .shotdel{display:none}
+#maxshots{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:5px 6px;font-size:12px}
+.rowbtns{display:flex;gap:8px;flex-wrap:wrap}
 .right{display:flex;flex-direction:column;gap:16px;min-width:0}
 #log{position:fixed;right:16px;bottom:16px;width:min(560px,calc(100vw - 32px));max-height:40vh;display:none;flex-direction:column;z-index:5}
 #log.show{display:flex}
 #log pre{margin:0;padding:10px 12px;overflow:auto;font:12px/1.45 ui-monospace,Consolas,monospace;white-space:pre-wrap;flex:1}
 #log .head{display:flex;align-items:center;padding:6px 10px;border-bottom:1px solid var(--line);gap:8px}
 #log .head span{flex:1;font-size:12px;color:var(--muted)}
-#lightbox{position:fixed;inset:0;background:rgba(0,0,0,.9);display:none;align-items:center;justify-content:center;z-index:30}
+#lightbox{position:fixed;inset:0;background:rgba(6,8,10,.97);display:none;align-items:center;justify-content:center;z-index:30}
 #lightbox.show{display:flex}
 #lightbox img{max-width:92vw;max-height:84vh;border-radius:8px}
 #lightbox .lb-nav{position:absolute;top:50%;transform:translateY(-50%);font-size:34px;background:none;border:0;color:#fff;cursor:pointer;padding:20px}
 #lightbox .prev{left:8px}#lightbox .next{right:8px}
 #lightbox .cap{position:absolute;bottom:14px;left:0;right:0;text-align:center;color:#ccc;font-size:13px;padding:0 60px}
 #lbstar{position:absolute;top:16px;right:16px;width:44px;height:44px;font-size:22px;line-height:44px}
+#lbcopy{position:absolute;top:16px;right:72px;height:40px;padding:0 14px;border-radius:20px;border:1px solid var(--line);background:rgba(0,0,0,.65);color:var(--text);font-size:14px;cursor:pointer}
+#lbcopy:hover{border-color:var(--accent);color:var(--accent)}
+#lbdel{position:absolute;top:16px;left:16px;height:40px;padding:0 14px;border-radius:20px;border:1px solid #6b2f2d;background:rgba(0,0,0,.65);color:#ff8a87;font-size:14px;cursor:pointer}
+#lbdel:hover:not(:disabled){background:#c94a47;color:#fff;border-color:#c94a47}
+#lbdel:disabled{opacity:.35;cursor:not-allowed}
 kbd{background:var(--panel2);border:1px solid var(--line);border-bottom-width:2px;border-radius:4px;padding:0 5px;font-size:11px}
 
 /* print preview */
@@ -812,10 +946,18 @@ kbd{background:var(--panel2);border:1px solid var(--line);border-bottom-width:2p
 <div class="layout">
   <aside>
     <div class="runbox">
-      <textarea id="urls" placeholder="Paste Instagram, TikTok or YouTube links, one per line"></textarea>
+      <textarea id="urls" placeholder="Paste Instagram, TikTok, YouTube or X links, one per line"></textarea>
       <div class="row">
         <button class="btn primary" id="run">Run</button>
+        <select id="maxshots" title="Most snapshots per video: one every 2 s plus scene cuts; longer videos are spread out">
+          <option value="60">60 shots</option><option value="120">120 shots</option>
+          <option value="200" selected>200 shots</option><option value="400">400 shots</option></select>
         <span class="status" id="status">Idle</span>
+      </div>
+      <div id="prog" hidden>
+        <div class="pline"><span id="pstage"></span><span id="peta"></span></div>
+        <div class="pbar"><div id="pfill"></div></div>
+        <div class="pline sub"><span id="pvid"></span><span id="pel"></span></div>
       </div>
     </div>
     <div class="listtools">
@@ -836,6 +978,14 @@ kbd{background:var(--panel2);border:1px solid var(--line);border-bottom-width:2p
   <button class="btn small" id="bulkclear">Clear</button>
 </div>
 <div id="toast"></div>
+<div id="choice" class="modal"><div class="cbox card">
+  <h3 id="chtitle"></h3>
+  <ul id="chlist" class="chlist"></ul>
+  <p>Run them again as a <b>new version</b>? The current one and its favorites stay. The downloaded video is reused.</p>
+  <p id="chnote" class="meta"></p>
+  <div class="cbtns"><button class="btn" id="chcancel">Cancel</button><button class="btn" id="chopen">Open it</button>
+    <button class="btn" id="chskip">Skip</button><button class="btn primary" id="chnew">New version</button></div>
+</div></div>
 <div id="confirm"><div class="cbox card">
   <h3 id="ctitle"></h3>
   <p id="cmsg"></p>
@@ -849,6 +999,8 @@ kbd{background:var(--panel2);border:1px solid var(--line);border-bottom-width:2p
 </div>
 <div id="lightbox">
   <button class="star" id="lbstar" title="Favorite (F)">&#9734;</button>
+  <button id="lbdel" title="Delete this snapshot and show the next one (Delete key)">&#128465; Delete</button>
+  <button id="lbcopy" title="Copy image - then paste it in Viber, WhatsApp, email... (C)">&#10697; Copy image</button>
   <button class="lb-nav prev" id="lbprev">&#8249;</button>
   <img id="lbimg" alt="">
   <button class="lb-nav next" id="lbnext">&#8250;</button>
@@ -877,8 +1029,9 @@ try { collapsed = new Set(JSON.parse(localStorage.getItem("rh-collapsed") || "[]
 const media = (id, f) => `/media/${encodeURIComponent(id)}/${f.split("/").map(encodeURIComponent).join("/")}`;
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const mmss = t => { t = Math.round(t || 0); return `${String(Math.floor(t/60)).padStart(2,"0")}:${String(t%60).padStart(2,"0")}`; };
-const PB = {Instagram: ["IG", "#e1306c"], TikTok: ["TT", "#25f4ee"], YouTube: ["YT", "#ff4e45"]};
+const PB = {Instagram: ["IG", "#e1306c"], TikTok: ["TT", "#25f4ee"], YouTube: ["YT", "#ff4e45"], X: ["X", "#e7e9ea"]};
 const pbadge = r => { const [t, c] = PB[r.platform] || [String(r.platform||"").slice(0,3), "#8b949b"]; return `<span class="pb" style="--pc:${c}" title="${esc(r.platform)}">${t}</span>`; };
+const vtag = r => r.version > 1 ? ` <span class="vtag" title="Version ${r.version}">v${r.version}</span>` : "";
 const catOf = r => cats.includes(r.state.category) ? r.state.category : "";
 const isFav = (r, shot) => r.state.favorites.some(f => f.shot === shot);
 
@@ -967,7 +1120,7 @@ function renderList(){
       <div class="item ${current && current.id===r.id?"active":""} ${selected.has(r.id)?"sel":""}" data-id="${esc(r.id)}" draggable="true">
         ${r.shots[0] ? `<img loading="lazy" src="${media(r.id,"shots/"+r.shots[0])}" alt="">` : `<img alt="">`}
         <div><div class="t">${esc(r.label)}</div>
-        <div class="s">${pbadge(r)} ${esc(r.author)} · ${esc(r.date)}${r.state.favorites.length?` · <span class="fc">&#9733; ${r.state.favorites.length}</span>`:""}</div></div>
+        <div class="s">${pbadge(r)}${vtag(r)} ${esc(r.author)} · ${esc(r.date)}${r.state.favorites.length?` · <span class="fc">&#9733; ${r.state.favorites.length}</span>`:""}</div></div>
       </div>`).join("") : `<div class="gempty">${g.name ? "Drag reels here or pick this category on a reel" : "Nothing here"}</div>`;
   });
   $("#list").innerHTML = html || `<div class="empty">No matches</div>`;
@@ -1008,6 +1161,48 @@ function moveReels(ids, cat){
 function updateNavSafe(){ if ($("#pos")) updateNav(); }
 let toastTimer;
 function toast(msg){ const t = $("#toast"); t.textContent = msg; t.classList.add("show"); clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove("show"), 2200); }
+
+/* ---------- snapshots: delete, re-process ---------- */
+async function deleteShots(names, ask){
+  const r = current, keep = names.filter(n => !isFav(r, n));
+  if (!keep.length) return;
+  if (ask && !confirm(`Delete ${keep.length} snapshot${keep.length>1?"s":""} that aren't favorites?\n\nYour ${r.state.favorites.length} favorite${r.state.favorites.length===1?"":"s"} stay. Deleted snapshots only come back with Re-process.`)) return;
+  let j;
+  try { j = await api("/api/shots/delete", {id: r.id, shots: keep}); } catch (e) { return alert(e.message); }
+  const gone = new Set(j.deleted);
+  r.shots = r.shots.filter(s => !gone.has(s));
+  if (lb.list && $("#lightbox").classList.contains("show")) { lb.list = r.shots; lb.i = Math.min(lb.i, lb.list.length - 1); if (lb.list.length) showLb(); else $("#lightbox").classList.remove("show"); }
+  const sc = $("#main").scrollTop; render(r); $("#main").scrollTop = sc;
+  renderList();
+  toast(`Deleted ${gone.size} snapshot${gone.size===1?"":"s"}`);
+}
+async function reprocess(r){
+  if (!r.url) return alert("This reel has no source link, so it can't be re-processed.");
+  const n = +$("#maxshots").value;
+  const favNote = r.state.favorites.length ? `\n\nIts ${r.state.favorites.length} favorite${r.state.favorites.length===1?"":"s"} will be cleared, because the snapshots are replaced.` : "";
+  if (!confirm(`Re-process this video with up to ${n} snapshots?\n\nThe transcript and snapshots are made again from the downloaded video (no new download). Your Obsidian note is not changed.${favNote}`)) return;
+  try { await api("/api/run", {target: r.id, action: "redo", max_shots: n}); } catch (e) { return alert(e.message); }
+  r.state.favorites = []; $("#log").classList.add("show"); poll();
+}
+async function newVersion(r){
+  const n = +$("#maxshots").value;
+  if (!confirm(`Make a new version of this video with up to ${n} snapshots?\n\nIt reuses the downloaded file (no new download). This version and its favorites stay as they are.`)) return;
+  try { await api("/api/run", {target: r.id, action: "new", max_shots: n}); } catch (e) { return alert(e.message); }
+  $("#log").classList.add("show"); poll();
+}
+function chooseExisting(list, total){
+  return new Promise(res => {
+    const box = $("#choice");
+    $("#chtitle").textContent = list.length === 1 ? "Already in your library" : `${list.length} of ${total} links are already in your library`;
+    $("#chlist").innerHTML = list.slice(0, 6).map(x => `<li>${esc(x.label)}</li>`).join("") + (list.length > 6 ? `<li>and ${list.length - 6} more</li>` : "");
+    $("#chnote").textContent = total > list.length ? "The other links run normally either way." : "";
+    box.classList.add("show");
+    const done = v => { box.classList.remove("show"); res(v); };
+    $("#chnew").onclick = () => done("new"); $("#chskip").onclick = () => done("skip");
+    $("#chopen").onclick = () => done("open"); $("#chcancel").onclick = () => done(null);
+    $("#chopen").hidden = list.length !== 1;
+  });
+}
 
 /* ---------- delete ---------- */
 function askDelete(rs){
@@ -1072,7 +1267,7 @@ function renderGallery(){
             ${r.state.favorites.length ? `<span class="gstar">&#9733; ${r.state.favorites.length}</span>` : ""}
             ${r.duration ? `<span class="gdur">${mmss(+r.duration)}</span>` : ""}</div>
           <div class="gtitle">${esc(r.label)}</div>
-          <div class="s">${pbadge(r)} ${esc(r.author)} · ${esc(r.date)}</div>
+          <div class="s">${pbadge(r)}${vtag(r)} ${esc(r.author)} · ${esc(r.date)}</div>
         </div>`).join("") : `<div class="gdrop">Drop reels here</div>`}</div></section>`;
   }
   $("#main").innerHTML = `<div class="gallery"><div class="ghint">Click to open · <kbd>Ctrl</kbd>+click or <kbd>Shift</kbd>+click to select several · drag onto a category to move</div>${html || `<div class="empty">No reels match.</div>`}</div>`;
@@ -1131,8 +1326,10 @@ function render(r){
         <button class="btn" id="next">Next &rarr;</button>
       </div>
       <label class="catsel">Category ${catSelect(r)}</label>
-      <div><button class="btn small danger" id="delone">Delete this reel</button></div>
-      <div class="meta">${esc(r.author)} · ${esc(r.date)}${r.duration?` · ${Math.round(r.duration)}s`:""}${r.url?` · <a href="${esc(r.url)}" target="_blank" rel="noopener">Open on ${esc(r.platform)}</a>`:""}</div>
+      <div class="rowbtns"><button class="btn small" id="redo" title="Transcribe and take snapshots again, replacing this version">&#8635; Re-process</button>
+        <button class="btn small" id="newver" title="Process the video again as a separate copy; this version and its favorites stay">+ New version</button>
+        <button class="btn small danger" id="delone">Delete this reel</button></div>
+      <div class="meta">${esc(r.author)} · ${esc(r.date)}${r.duration?` · ${Math.round(r.duration)}s`:""}${r.url?` · <a href="${esc(r.url)}" target="_blank" rel="noopener">Open on ${esc(r.platform)}</a> · <button class="link" id="copylink" title="${esc(r.url)}">Copy link</button>`:""}</div>
       <div class="meta">${r.obsidian && r.obsidian.uri ? `Obsidian note: <a href="${esc(r.obsidian.uri)}">${esc(r.obsidian.name)}</a>` : (r.obsidian && r.obsidian.error ? esc(r.obsidian.error) : "")}</div>
     </div>
     <div class="right">
@@ -1143,7 +1340,7 @@ function render(r){
           : `<span class="meta">No speech detected</span>`}${r.lang?`<div class="meta" style="margin-top:8px">Language: ${esc(r.lang)}</div>`:""}</div>
         <div class="pane ${tab==="caption"?"active":""}" data-pane="caption">${esc(r.caption) || `<span class="meta">No caption</span>`}</div>
         <div class="pane ${tab==="ocr"?"active":""}" data-pane="ocr">${
-          r.ocr.length ? r.ocr.map(x => `<div class="oline"><img src="${media(r.id,"shots/"+x.shot)}" data-shot="${esc(x.shot)}" alt=""><span><span class="ts">${mmss(r.times[x.shot])}</span> ${esc(x.text)}</span></div>`).join("")
+          r.ocr.length ? r.ocr.map(x => `<div class="oline">${r.shots.includes(x.shot) ? `<img src="${media(r.id,"shots/"+x.shot)}" data-shot="${esc(x.shot)}" alt="">` : ""}<span><span class="ts">${mmss(r.times[x.shot])}</span> ${esc(x.text)}</span></div>`).join("")
           : `<span class="meta">No on-screen text found</span>`}</div>
         <div class="pane ${tab==="notes"?"active":""}" data-pane="notes">
           <textarea class="notes" id="notes" placeholder="Your notes: weight used, sets/reps, cues, how it felt">${esc(r.notes)}</textarea>
@@ -1161,10 +1358,13 @@ function render(r){
         <div id="favs"></div>
       </div>
       <div class="card">
-        <div class="cardhead"><h2>Snapshots · ${r.shots.length}</h2><span class="hint">&#9734; adds to favorites · click to enlarge</span></div>
+        <div class="cardhead"><h2>Snapshots · ${r.shots.length}</h2><span class="hint">&#9734; adds to favorites · &#10005; deletes · click to enlarge</span>
+          <button class="btn small danger" id="delunstarred" ${r.shots.length > r.state.favorites.length ? "" : "disabled"}>Delete unstarred</button></div>
         <div class="shots">${r.shots.map(s => `
           <figure><img loading="lazy" src="${media(r.id,"shots/"+s)}" data-shot="${esc(s)}" alt="">
             <button class="star" data-star="${esc(s)}" title="Favorite">&#9734;</button>
+            <button class="shotdel" data-delshot="${esc(s)}" title="Delete this snapshot">&#10005;</button>
+            <button class="shotcopy" data-copyshot="${esc(s)}" title="Copy image">&#10697;</button>
             <figcaption>${mmss(r.times[s])}</figcaption></figure>`).join("")}</div>
       </div>
       </div>
@@ -1192,6 +1392,7 @@ function renderFavs(r){
         <img src="${media(r.id,"shots/"+f.shot)}" alt="" draggable="false">
         <span class="num">${i+1}</span><span class="tb">${mmss(r.times[f.shot])}</span>
         <button class="ico rm" data-unfav="${esc(f.shot)}" title="Remove from favorites">&#10005;</button>
+        <button class="shotcopy fc2" data-copyshot="${esc(f.shot)}" title="Copy image">&#10697;</button>
       </div>
       <textarea class="favtext" data-i="${i}" placeholder="No speech here, type your own text">${esc(f.text)}</textarea>
       <div class="favfoot"><span class="corr" ${f.corrected?"":"hidden"}>Corrected text</span>
@@ -1253,10 +1454,45 @@ function renderPaper(){
 
 /* ---------- lightbox ---------- */
 function openLightbox(shot){ lb.list = current.shots; lb.i = Math.max(0, lb.list.indexOf(shot)); showLb(); $("#lightbox").classList.add("show"); }
+/* ---------- clipboard ---------- */
+async function copyText(text, msg){
+  try { await navigator.clipboard.writeText(text); }
+  catch (e) {                                  // fallback for browsers that block the clipboard API
+    const ta = document.createElement("textarea"); ta.value = text; document.body.appendChild(ta); ta.select();
+    document.execCommand("copy"); ta.remove();
+  }
+  toast(msg);
+}
+async function copyImage(shot){
+  if (!shot || !current) return;
+  try {
+    // browsers only accept PNG on the clipboard: draw the JPG onto a canvas and convert
+    const blob = await (await fetch(media(current.id, "shots/" + shot))).blob();
+    const bmp = await createImageBitmap(blob);
+    const cv = document.createElement("canvas"); cv.width = bmp.width; cv.height = bmp.height;
+    cv.getContext("2d").drawImage(bmp, 0, 0);
+    const png = await new Promise(res => cv.toBlob(res, "image/png"));
+    await navigator.clipboard.write([new ClipboardItem({"image/png": png})]);
+    toast("Image copied - paste it in Viber, WhatsApp... with Ctrl+V");
+  } catch (e) {
+    alert("Your browser blocked copying the image (" + e.message + ").\nOpen it, right-click it and choose Copy image instead.");
+  }
+}
+
+let lbBusy = false;
+async function lbDelete(){
+  const s = lb.list[lb.i];
+  if (lbBusy || !s || isFav(current, s)) return;
+  lbBusy = true;
+  try { await deleteShots([s], false); }      // same position then shows the next snapshot
+  finally { lbBusy = false; }
+}
 function showLb(){
   const s = lb.list[lb.i], on = isFav(current, s);
   $("#lbimg").src = media(current.id, "shots/" + s);
   $("#lbstar").classList.toggle("on", on); $("#lbstar").innerHTML = on ? "&#9733;" : "&#9734;";
+  $("#lbdel").disabled = on;
+  $("#lbdel").title = on ? "Favorites can't be deleted - unstar it first" : "Delete this snapshot and show the next one (Delete key)";
   const t = textAt(current, s);
   $("#lbcap").textContent = `${lb.i+1} / ${lb.list.length} · ${mmss(current.times[s])}` + (t ? `  ·  ${t}` : "");
 }
@@ -1288,6 +1524,11 @@ document.addEventListener("click", async e => {
     try { localStorage.setItem("rh-collapsed", JSON.stringify([...collapsed])); } catch (err) {} return renderList(); }
   if ((el = c(".item"))) { if (e.ctrlKey || e.metaKey || e.shiftKey) { e.preventDefault(); return pick(el.dataset.id, e); } clearSel(); return select(el.dataset.id, false); }
   if (t.id === "bulkclear") return clearSel();
+  if ((el = c("[data-copyshot]"))) return copyImage(el.dataset.copyshot);
+  if ((el = c("[data-delshot]"))) return deleteShots([el.dataset.delshot], false);
+  if (t.id === "delunstarred") return deleteShots(current.shots.filter(s => !isFav(current, s)), true);
+  if (t.id === "redo") return reprocess(current);
+  if (t.id === "newver") return newVersion(current);
   if (t.id === "bulkdel") return deleteReels([...selected]);
   if (t.id === "delone") return deleteReels([current.id]);
   if (t.id === "bulkall") { filtered.forEach(r => selected.add(r.id)); return refreshSel(); }
@@ -1303,6 +1544,9 @@ document.addEventListener("click", async e => {
     case "lbprev": lb.i = (lb.i - 1 + lb.list.length) % lb.list.length; return showLb();
     case "lbnext": lb.i = (lb.i + 1) % lb.list.length; return showLb();
     case "lbstar": return toggleFav(current, lb.list[lb.i]);
+    case "lbdel": return lbDelete();
+    case "lbcopy": return copyImage(lb.list[lb.i]);
+    case "copylink": return copyText(current.url, "Link copied - paste it anywhere with Ctrl+V");
     case "addcat": { const n = prompt("New category name (e.g. Training)"); if (n && n.trim()) catAction({action:"add", name: n.trim()}); return; }
     case "obsbtn": return sendObsidian();
     case "printbtn": renderPaper(); return $("#printsheet").classList.add("show");
@@ -1317,7 +1561,17 @@ document.addEventListener("click", async e => {
       catch (err) { alert(err.message); } return;
     }
     case "run": {
-      try { await api("/api/run", {urls: $("#urls").value}); } catch (err) { return alert(err.message); }
+      try { localStorage.setItem("rh-maxshots", $("#maxshots").value); } catch (e2) {}
+      const body = {urls: $("#urls").value, max_shots: +$("#maxshots").value};
+      let j;
+      try { j = await api("/api/run", body); } catch (err) { return alert(err.message); }
+      if (j.existing) {
+        const pick = await chooseExisting(j.existing, j.total);
+        if (!pick) return;
+        if (pick === "open") { $("#urls").value = ""; return select(j.existing[0].id); }
+        if (pick === "skip" && j.existing.length === j.total) { $("#urls").value = ""; return toast("Nothing to run: all links are already done"); }
+        try { await api("/api/run", {...body, existing: pick}); } catch (err) { return alert(err.message); }
+      }
       $("#urls").value = ""; $("#log").classList.add("show"); return poll();
     }
   }
@@ -1408,9 +1662,26 @@ document.addEventListener("keydown", e => {
   if (e.key === "Escape") $("#lightbox").classList.remove("show");
   if (view === "gallery" && !open) return;
   if (open && (e.key === "f" || e.key === "F")) toggleFav(current, lb.list[lb.i]);
+  if (open && e.key === "Delete") { e.preventDefault(); return lbDelete(); }
+  if (open && (e.key === "c" || e.key === "C") && !e.altKey) { e.preventDefault(); return copyImage(lb.list[lb.i]); }
   if (e.key === "ArrowLeft") open ? (lb.i = (lb.i-1+lb.list.length)%lb.list.length, showLb()) : move(-1);
   if (e.key === "ArrowRight") open ? (lb.i = (lb.i+1)%lb.list.length, showLb()) : move(1);
 });
+
+/* ---------- progress / ETA ---------- */
+const hms = sec => { sec = Math.max(0, Math.round(sec)); const h = Math.floor(sec/3600), m = Math.floor(sec%3600/60), x = sec%60;
+  return h ? `${h}:${String(m).padStart(2,"0")}:${String(x).padStart(2,"0")}` : `${m}:${String(x).padStart(2,"0")}`; };
+function showProgress(s){
+  const p = s.progress, box = $("#prog");
+  if (!s.running || !p) { box.hidden = !s.running; if (s.running) { $("#pstage").textContent = "Starting..."; $("#peta").textContent = ""; $("#pfill").style.width = "0%"; $("#pvid").textContent = ""; $("#pel").textContent = ""; } return; }
+  box.hidden = false;
+  $("#pstage").textContent = `${p.label} ${p.stage_pct ? Math.round(p.stage_pct) + "%" : ""}`;
+  $("#peta").textContent = p.eta == null ? "estimating..." : (p.eta_partial ? `download ~${hms(p.eta)} left` : `~${hms(p.eta)} left`);
+  $("#pfill").style.width = `${Math.min(100, p.stage_pct || 0)}%`;
+  $("#pfill").dataset.stage = p.stage;
+  $("#pvid").textContent = p.n > 1 ? `Video ${p.i} of ${p.n}` : "This video";
+  $("#pel").textContent = `${hms(p.elapsed)} elapsed`;
+}
 
 /* ---------- run polling ---------- */
 async function poll(){
@@ -1418,11 +1689,12 @@ async function poll(){
   $("#logtext").textContent = s.log.join("\n") || "(waiting for output)";
   $("#logtext").scrollTop = 1e9;
   $("#run").disabled = s.running;
-  const done = s.log.filter(l => l.includes("done ->") || l.includes("already done")).length;
+  const done = s.log.filter(l => /^\s*done( in [^>]*)? ->/.test(l) || l.includes("already done")).length;
   $("#status").textContent = s.running ? `Running · ${done} / ${s.urls.length} done` : (s.finished ? "Finished" : "Idle");
+  showProgress(s);
   $("#status").classList.toggle("on", s.running);
   $("#logtitle").textContent = s.running ? "Run log · working (first run downloads models)" : "Run log";
-  if (s.running) { wasRunning = true; refreshQuiet(); setTimeout(poll, 1500); }
+  if (s.running) { wasRunning = true; refreshQuiet(); setTimeout(poll, 1000); }
   else if (wasRunning) { wasRunning = false; loadReels(current && current.id); }
 }
 async function refreshQuiet(){
@@ -1435,6 +1707,7 @@ async function refreshQuiet(){
   }
 }
 
+try { const m = localStorage.getItem("rh-maxshots"); if (m) $("#maxshots").value = m; } catch (e) {}
 loadReels().then(() => { setView(view); poll(); });
 </script>
 </body>
@@ -1447,7 +1720,7 @@ def main():
     ap = argparse.ArgumentParser(description="Local web app for reels2notes.py")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--out", default=str(OUT))
-    ap.add_argument("--vault", default=str(VAULT), help="Obsidian vault folder (notes go into Instagram/TikTok/YouTube folders)")
+    ap.add_argument("--vault", default=str(VAULT), help="Obsidian vault folder (notes go into Instagram/TikTok/YouTube/X folders)")
     ap.add_argument("--no-browser", action="store_true")
     args = ap.parse_args()
     OUT = Path(args.out).resolve()
