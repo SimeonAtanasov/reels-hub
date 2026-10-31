@@ -425,7 +425,15 @@ def old_notes(note):
     return ""
 
 
-def write_note(workdir, url, info, shots, transcript, lang, ocr_lines):
+def old_owner(note):
+    """Who added this video (kept when it is re-processed)."""
+    if not note.exists():
+        return ""
+    m = re.search(r"^owner:\s*(\S+)\s*$", note.read_text(encoding="utf-8", errors="replace")[:1500], re.M)
+    return m.group(1) if m else ""
+
+
+def write_note(workdir, url, info, shots, transcript, lang, ocr_lines, owner=""):
     author = info.get("uploader") or info.get("channel") or "unknown"
     caption = (info.get("description") or "").strip()
     date = info.get("upload_date", "")
@@ -436,6 +444,7 @@ def write_note(workdir, url, info, shots, transcript, lang, ocr_lines):
         "---",
         f"source: {url}",
         f"platform: {platform}",
+        f"owner: {old_owner(workdir / 'note.md') or owner or 'me'}",
         f"author: {author}",
         f"date: {date}",
         f"duration_s: {info.get('duration', '')}",
@@ -566,7 +575,7 @@ def _process(url, args, i=1, n=1, stats=None):
         prog.start("ocr")
         step = max(1, -(-len(shots) // args.ocr_max))       # read text from at most --ocr-max frames
         ocr_lines = ocr(shots[::step], prog, args.out)
-    note = write_note(workdir, url, info, shots, transcript, lang, ocr_lines)
+    note = write_note(workdir, url, info, shots, transcript, lang, ocr_lines, args.owner)
     print(f"  done in {fmt_dur(time.time() - prog.t0)} -> {note}")
 
 
@@ -582,6 +591,7 @@ def main():
     ap.add_argument("--model", default="small")
     ap.add_argument("--lang", default=None)
     ap.add_argument("--no-ocr", action="store_true")
+    ap.add_argument("--owner", default="", help="who adds the videos (set by Reels Hub from its settings)")
     ap.add_argument("--redo", action="store_true", help="re-process videos that were already done (replaces them)")
     ap.add_argument("--new-version", action="store_true", help="process already-done videos again as a new copy (_v2, _v3)")
     ap.add_argument("--target", help="reel folder name to use (with --redo or --new-version)")

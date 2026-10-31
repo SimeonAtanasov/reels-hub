@@ -36,6 +36,86 @@ HERE = Path(__file__).resolve().parent
 SCRIPT = HERE / "reels2notes.py"
 OUT = Path.home() / "Downloads" / "reels"   # downloaded videos, snapshots and notes
 VAULT = Path.home() / "OneDrive" / "Documents" / "Obsidian Vault"   # Obsidian vault
+CONFIG = {}                                   # this laptop's settings (who you are, folders); see config_path()
+OVERRIDES = {}                                # --out / --vault given on the command line win over the settings
+
+
+# ---------------------------------------------------------------- settings (one file per laptop/user)
+def config_path():
+    base = os.environ.get("APPDATA") or str(Path.home() / ".config")
+    return Path(base) / "ReelsHub" / "config.json"
+
+
+def default_config():
+    vault = Path.home() / "OneDrive" / "Documents" / "Obsidian Vault"
+    if not vault.is_dir():
+        vault = Path.home() / "Documents" / "Obsidian Vault"
+    return {"name": os.environ.get("USERNAME", "").title() if os.environ.get("USERNAME") else "",
+            "out": str(Path.home() / "Downloads" / "reels"),
+            "vault": str(vault) if vault.is_dir() else ""}
+
+
+def person_id(name):
+    return re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")[:40] or "me"
+
+
+def load_config():
+    try:
+        c = json.loads(config_path().read_text(encoding="utf-8"))
+        return c if isinstance(c, dict) and c.get("name") and c.get("out") else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def apply_config(cfg):
+    """Use the settings (command-line --out / --vault still win)."""
+    global OUT, VAULT, CONFIG
+    CONFIG = dict(cfg)
+    OUT = Path(OVERRIDES.get("out") or cfg.get("out") or OUT).expanduser().resolve()
+    v = OVERRIDES.get("vault") if "vault" in OVERRIDES else cfg.get("vault", "")
+    VAULT = Path(v).expanduser() if v else Path("/nonexistent-vault-disabled")
+    OUT.mkdir(parents=True, exist_ok=True)
+
+
+def save_config(body):
+    """Validate and store the settings from the setup screen."""
+    if JOB["running"]:
+        raise ValueError("Wait for the current run to finish")
+    name = str(body.get("name") or "").strip()[:60]
+    if not name:
+        raise ValueError("Please enter your name")
+    out = str(body.get("out") or "").strip().strip('"')
+    if not out:
+        raise ValueError("Please enter a folder for your reels")
+    out_p = Path(out).expanduser()
+    if not out_p.is_absolute():
+        raise ValueError("The reels folder must be a full path, e.g. C:\\Users\\you\\Downloads\\reels")
+    try:
+        out_p.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise ValueError(f"Can't create the reels folder: {e}")
+    vault = str(body.get("vault") or "").strip().strip('"')
+    warn = ""
+    if vault:
+        vp = Path(vault).expanduser()
+        if not vp.is_dir():
+            raise ValueError("That Obsidian vault folder doesn't exist - check the path, or leave it empty")
+        if not (vp / ".obsidian").is_dir():
+            warn = "Note: that folder has no .obsidian folder - make sure it's the vault itself"
+    cfg = {"name": name, "person": person_id(name), "out": str(out_p.resolve()), "vault": vault,
+           "saved": time.strftime("%Y-%m-%d %H:%M")}
+    p = config_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(p, json.dumps(cfg, indent=1, ensure_ascii=False))
+    apply_config(cfg)
+    MISS.clear()
+    return {"config": cfg, "warning": warn}
+
+
+def config_info():
+    return {"configured": bool(CONFIG.get("name")), "config": CONFIG, "defaults": default_config(),
+            "path": str(config_path()), "effective": {"out": str(OUT), "vault": str(VAULT) if vault_ok() else ""},
+            "overrides": sorted(OVERRIDES)}
 PLATFORM_DIRS = ("Instagram", "TikTok", "YouTube", "X")             # one vault folder per platform
 FAV_START, FAV_END = "<!-- reels-hub:favorites start -->", "<!-- reels-hub:favorites end -->"
 
@@ -169,6 +249,7 @@ def parse_note(folder):
         "edited": sorted(p.name for p in (folder / "shots" / "_orig").glob("*.jpg")) if (folder / "shots" / "_orig").exists() else [],
         "video": videos[0] if videos else None,
         "added": _added(folder),
+        "owner": meta.get("owner", "") or CONFIG.get("person", ""),
         "state": read_state(folder),
     }
 
@@ -909,6 +990,8 @@ def run_job(urls, max_shots="auto", redo=False, flags=(), target=None):
     JOB.update(log=[], started=time.time(), finished=None, urls=urls, progress=None, busy={target} if target else set())
     env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
     cmd = [sys.executable, "-u", str(SCRIPT), "--out", str(OUT), "--max-shots", str(max_shots)]
+    if CONFIG.get("person"):
+        cmd += ["--owner", CONFIG["person"]]
     if redo:
         cmd.append("--redo")
     cmd += list(flags)
@@ -995,8 +1078,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
+        elif path == "/api/config":
+            self.send_json(config_info())
         elif path == "/api/reels":
-            self.send_json({"reels": list_reels(), "categories": read_cats(),
+            self.send_json({"reels": list_reels() if CONFIG.get("name") else [], "categories": read_cats(),
+                            "me": {"name": CONFIG.get("name", ""), "person": CONFIG.get("person", "")},
                             "vault": {"path": str(VAULT), "ok": vault_ok()}})
         elif path == "/api/status":
             prog = JOB["progress"]
@@ -1068,6 +1154,8 @@ class Handler(BaseHTTPRequestHandler):
                     JOB["busy"] = {target} if (target and redo) else set()
                 threading.Thread(target=run_job, args=(urls, max_shots, redo, flags, target if redo else None), daemon=True).start()
                 self.send_json({"ok": True, "count": len(urls)})
+            elif path == "/api/config":
+                self.send_json({"ok": True, **save_config(body), **config_info()})
             elif path == "/api/notes":
                 save_notes(body["id"], body.get("notes", ""))
                 self.send_json({"ok": True})
@@ -1317,6 +1405,20 @@ video.seekflash{animation:seekflash 1s}
 .btn.danger.solid{background:#c94a47;color:#fff;border-color:#c94a47;font-weight:600}
 #confirm{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:50;padding:16px}
 #confirm.show{display:flex}
+#setup{position:fixed;inset:0;background:rgba(6,8,10,.92);display:none;align-items:center;justify-content:center;z-index:60;padding:16px}
+#setup.show{display:flex}
+.setbox{width:min(560px,100%);display:flex;flex-direction:column;gap:12px}
+.setbox h3{margin:0;font-size:18px}
+.setbox p{margin:0}
+.fld{display:flex;flex-direction:column;gap:5px;font-size:13px;font-weight:600}
+.fld .meta{font-weight:400}
+.fld input{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-weight:400}
+.fld input:focus{outline:none;border-color:var(--accent)}
+.setbox .sterr{color:#ef6f6c;font-size:13px}
+.setbox .sterr.stwarn{color:var(--warn)}
+.stpath{font-size:11px;word-break:break-all}
+.who{font-size:12px;color:var(--accent);border:1px solid #2f5551;border-radius:12px;padding:1px 9px}
+.who:empty{display:none}
 #choice{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:50;padding:16px}
 #choice.show{display:flex}
 #choice p{white-space:normal}
@@ -1458,9 +1560,11 @@ body:has(#bulkbar.show) #log{bottom:84px}
 <body>
 <header>
   <h1 id="home" title="Home: back to the start">Reels Hub</h1><span class="count" id="count"></span>
+  <span class="who" id="who" title="Whose Reels Hub this is"></span>
   <span class="spacer"></span>
   <span class="status"><kbd>&larr;</kbd> <kbd>&rarr;</kbd> switch reels</span>
   <button class="btn" id="viewbtn" title="Show all reels as a gallery">&#9638; Gallery</button>
+  <button class="btn" id="setbtn" title="Your name and folders">&#9881; Settings</button>
   <button class="btn" id="showlog">Log</button>
 </header>
 <div class="layout">
@@ -1531,6 +1635,19 @@ body:has(#bulkbar.show) #log{bottom:84px}
   <div class="edstage" id="edstage"><div class="edwrap" id="edwrap"><canvas id="edcv"></canvas><canvas id="edov"></canvas><input id="edtext" autocomplete="off"></div></div>
   <div class="edhint" id="edhint"></div>
 </div>
+<div id="setup"><div class="cbox card setbox">
+  <h3 id="sttitle">Welcome to Reels Hub</h3>
+  <p class="meta" id="stintro">Tell the app who you are and where to keep things. You can change this later under Settings.</p>
+  <label class="fld">Your name<input id="stname" autocomplete="off" placeholder="e.g. Stela"></label>
+  <label class="fld">Reels folder <span class="meta">- videos, snapshots and notes are saved here</span>
+    <input id="stout" autocomplete="off" spellcheck="false"></label>
+  <label class="fld">Obsidian vault <span class="meta">- optional; leave empty if you don't use Obsidian</span>
+    <input id="stvault" autocomplete="off" spellcheck="false" placeholder="C:\Users\you\Documents\Obsidian Vault"></label>
+  <p class="meta sthelp">Tip: in File Explorer, open the folder, click the address bar and copy the path.</p>
+  <p class="sterr" id="sterr" hidden></p>
+  <div class="cbtns"><button class="btn" id="stcancel" hidden>Cancel</button><button class="btn primary" id="stsave">Save and start</button></div>
+  <p class="meta stpath" id="stpath"></p>
+</div></div>
 <div id="choice" class="modal"><div class="cbox card">
   <h3 id="chtitle"></h3>
   <ul id="chlist" class="chlist"></ul>
@@ -1623,7 +1740,8 @@ async function loadReels(keepId, changedIds){
     if (o && !(changedIds && changedIds.has(r.id))) { r.state = o.state; if (o.notesDraft !== undefined) r.notesDraft = o.notesDraft; }
     return r;
   });
-  cats = j.categories; vault = j.vault || vault;
+  cats = j.categories; vault = j.vault || vault; me = j.me || me;
+  $("#who").textContent = me.name || "";
   if (changedIds && current && !changedIds.has(current.id) && reels.some(r => r.id === current.id)) {
     current = reels.find(r => r.id === current.id);      // same reel still open: don't redraw (keeps video + typing)
     $("#count").textContent = reels.length ? `${reels.length} reel${reels.length>1?"s":""}` : "";
@@ -2452,6 +2570,9 @@ document.addEventListener("click", async e => {
     case "lbcopy": return copyImage(lb.list[lb.i]);
     case "lbedit": return openEditor(lb.list[lb.i]);
     case "home": return goHome();
+    case "setbtn": return openSetup(false);
+    case "stcancel": return $("#setup").classList.remove("show");
+    case "stsave": return saveSetup();
     case "copyai": { try { const j = await api("/api/aiprompt", {id: current.id}); copyText(j.text, "AI prompt + transcript copied - paste it into ChatGPT or Claude"); } catch (err) { alert(err.message); } return; }
     case "lbplay": return seekTo(current.times[lb.list[lb.i]]);
     case "capbtn": return capture(false);
@@ -2586,6 +2707,11 @@ document.addEventListener("drop", e => {
 
 document.addEventListener("keydown", e => {
   if (ed) return edKey(e);
+  if ($("#setup").classList.contains("show")) {
+    if (e.key === "Enter" && document.activeElement && document.activeElement.closest("#setup") && document.activeElement.tagName === "INPUT") { e.preventDefault(); saveSetup(); }
+    if (e.key === "Escape" && !setupFirst) $("#setup").classList.remove("show");
+    return;
+  }
   if ($("#choice").classList.contains("show")) {           // the "already in your library" dialog owns the keyboard
     if (e.key === "Escape") { e.preventDefault(); $("#chcancel").click(); }
     else if (e.key === "Enter") { e.preventDefault(); if (document.activeElement && document.activeElement.closest("#choice")) document.activeElement.click(); }
@@ -2670,7 +2796,37 @@ $("#groupby").value = groupBy; $("#sortby").value = sortBy;
 if (!$("#groupby").value) { groupBy = "category"; $("#groupby").value = groupBy; }
 if (!$("#sortby").value) { sortBy = "posted-new"; $("#sortby").value = sortBy; }
 try { const m = localStorage.getItem("rh-maxshots"); if (m && [...$("#maxshots").options].some(o => o.value === m)) $("#maxshots").value = m; } catch (e) {}
-loadReels().then(() => { setView(view); poll(); });
+let me = {name: "", person: ""}, setupFirst = false;
+async function openSetup(first){
+  const c = await api("/api/config");
+  setupFirst = first;
+  const cfg = c.configured ? c.config : c.defaults;
+  $("#sttitle").textContent = first ? "Welcome to Reels Hub" : "Settings";
+  $("#stintro").textContent = first ? "Tell the app who you are and where to keep things. You can change this later under Settings."
+                                    : "Your name and folders on this computer.";
+  $("#stname").value = cfg.name || ""; $("#stout").value = cfg.out || ""; $("#stvault").value = cfg.vault || "";
+  $("#stcancel").hidden = first; $("#stsave").textContent = first ? "Save and start" : "Save";
+  $("#sterr").hidden = true; $("#sterr").className = "sterr";
+  $("#stpath").textContent = "Saved on this computer in " + c.path + (c.overrides.length ? " · started with --" + c.overrides.join(" --") + ", which overrides these" : "");
+  $("#setup").classList.add("show");
+  setTimeout(() => (first && !cfg.name ? $("#stname") : $("#stsave")).focus(), 0);
+}
+async function saveSetup(){
+  const b = $("#stsave"); b.disabled = true;
+  try {
+    const j = await api("/api/config", {name: $("#stname").value, out: $("#stout").value, vault: $("#stvault").value});
+    if (j.warning) { $("#sterr").textContent = j.warning; $("#sterr").className = "sterr stwarn"; $("#sterr").hidden = false; }
+    $("#setup").classList.remove("show");
+    current = null; reels = [];
+    await loadReels(); setView(view);
+    toast(setupFirst ? `Welcome, ${j.config.name}!` : "Settings saved");
+  } catch (e) { $("#sterr").textContent = e.message; $("#sterr").className = "sterr"; $("#sterr").hidden = false; }
+  finally { b.disabled = false; }
+}
+(async () => {
+  try { const c = await api("/api/config"); if (!c.configured) await openSetup(true); } catch (e) {}
+  await loadReels(); setView(view); poll();
+})();
 </script>
 </body>
 </html>
@@ -2678,19 +2834,25 @@ loadReels().then(() => { setView(view); poll(); });
 
 
 def main():
-    global OUT, VAULT, PORT
+    global PORT
     ap = argparse.ArgumentParser(description="Local web app for reels2notes.py")
     ap.add_argument("--port", type=int, default=8765)
-    ap.add_argument("--out", default=str(OUT))
-    ap.add_argument("--vault", default=str(VAULT), help="Obsidian vault folder (notes go into Instagram/TikTok/YouTube/X folders)")
+    ap.add_argument("--out", default=None, help="reels folder (overrides Settings)")
+    ap.add_argument("--vault", default=None, help="Obsidian vault folder (overrides Settings; '' turns Obsidian off)")
     ap.add_argument("--no-browser", action="store_true")
     args = ap.parse_args()
-    OUT = Path(args.out).resolve()
     PORT = args.port
-    OUT.mkdir(parents=True, exist_ok=True)
-    VAULT = Path(args.vault)
-    if not VAULT.is_dir():
-        print(f"Obsidian vault not found at {VAULT} - Obsidian notes are off (use --vault PATH).")
+    if args.out is not None:
+        OVERRIDES["out"] = args.out
+    if args.vault is not None:
+        OVERRIDES["vault"] = args.vault
+    cfg = load_config()
+    apply_config(cfg or default_config())
+    CONFIG.clear(); CONFIG.update(cfg)          # empty until the setup screen has been filled in
+    if not cfg:
+        print(f"First start: the app will ask who you are and where your folders are (saved in {config_path()}).")
+    elif not vault_ok():
+        print(f"No Obsidian vault set (or not found) - Obsidian notes are off. Change it under Settings.")
     if not SCRIPT.exists():
         print(f"reels2notes.py not found next to this file ({HERE}) - Run will not work.")
     url = f"http://127.0.0.1:{args.port}"

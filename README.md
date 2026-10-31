@@ -15,14 +15,29 @@ While watching, **📸 Snapshot** (or the S key; Shift+S also stars it) captures
 
 Snapshots can be edited inside the app (crop, rotate, draw, arrows, boxes, text, blur, undo) or opened in Paint; the original is always kept for **Reset to original**. Images and video links can be copied to paste into chat apps.
 
-## Setup (Windows)
+## Install (Windows)
+
+**Easiest:** download this folder (on GitHub: Code, Download ZIP, then extract it, e.g. to `Documents\reels-hub`) and double-click **`install.bat`**. It installs Python, ffmpeg and Deno if they are missing, the Python packages, and puts a **Reels Hub** shortcut on the desktop. If it says Windows needs a fresh window, close it and run `install.bat` once more.
+
+By hand instead:
 
 ```
 pip install yt-dlp faster-whisper easyocr
 winget install Gyan.FFmpeg
+winget install DenoLand.Deno
 ```
 
 Open a new terminal after installing ffmpeg.
+
+## First start
+
+Double-click **Reels Hub** on the desktop (or `reels-hub.bat`). The first time, it asks:
+
+- **Your name** - each laptop belongs to one person; every video you add is marked as yours.
+- **Reels folder** - where videos, snapshots and notes are saved (suggested: `Downloads\reels`).
+- **Obsidian vault** - optional; leave it empty if you don't use Obsidian.
+
+These are saved on that computer only (`%APPDATA%\ReelsHub\config.json`). Change them any time with **Settings** at the top right. Each of you has your own library, categories, favorites and notes on your own laptop.
 
 ## Run
 
@@ -45,10 +60,10 @@ python reels2notes.py -f links.txt
 
 | What | Default location | Change with |
 |---|---|---|
-| Videos, snapshots, notes, favorites, categories | `Downloads/reels` | `--out PATH` |
+| Videos, snapshots, notes, favorites, categories | the reels folder from Settings (default `Downloads/reels`) | Settings, or `--out PATH` |
 | Obsidian notes | new notes in `<vault>/YouTube`, `/TikTok`, `/Instagram`, `/X` - move or rename them freely, the app finds them again; favorite images in `910_Attachments/ReelsHub` | `--vault PATH` |
 
-The default vault path is `Documents/Obsidian Vault` under OneDrive. If it is not found, Obsidian sync is switched off.
+The vault comes from Settings. If none is set or it is not found, Obsidian sync is switched off.
 
 Notes follow the vault's video template: date and time, Title, Source, Tags, Related (MOC links), Creator; then the AI sections (Obsidian Tags, Summary, Main Takeaways, Key Concepts, Reflective Questions, Actionable Insights, Compare and Contrast) left ready to fill, Favorites, My notes, Description, Content (transcript in paragraphs) and Original text (with timestamps). YouTube notes start with `'` and TikTok notes with a backtick, like the templates. **Copy AI prompt** in the app copies the vault's `$Obsidian AI prompts` with the transcript, for ChatGPT or Claude.
 
