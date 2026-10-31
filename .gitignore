@@ -29,3 +29,8 @@ links*.txt
 .DS_Store
 Thumbs.db
 .vscode/
+
+# Claude project docs: local only (paths and personal rules)
+PROMPT.md
+CLAUDE.md
+to-do/
