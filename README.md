@@ -13,6 +13,8 @@ The **Reels Hub** web app (local only) lets you paste links and run them, browse
 
 While watching, **📸 Snapshot** (or the S key; Shift+S also stars it) captures the current frame; it slots into the snapshots in time order. Every time shown on a snapshot, favorite or on-screen text is clickable and plays the video from that moment (P in the enlarged view).
 
+Drag the edges between the list, the video and the text to give each one more or less room, and drag the bar under the video to make it taller (a wide YouTube video grows when you widen its column instead). Double-click an edge or the bar to go back to the standard size. The sizes are remembered in that browser on that computer.
+
 Snapshots can be edited inside the app (crop, rotate, draw, arrows, boxes, text, blur, undo) or opened in Paint; the original is always kept for **Reset to original**. Images and video links can be copied to paste into chat apps.
 
 ## Install (Windows)

@@ -1272,8 +1272,22 @@ header .spacer{flex:1}
 .ico{background:none;border:0;color:var(--muted);cursor:pointer;padding:2px 5px;border-radius:5px;font-size:13px;line-height:1}
 .ico:hover{color:var(--text);background:var(--panel2)}
 .link{background:none;border:0;color:var(--accent);cursor:pointer;padding:0;font-size:12px;text-decoration:underline}
-.layout{flex:1;display:grid;grid-template-columns:310px 1fr;min-height:0}
+.layout{flex:1;display:grid;grid-template-columns:clamp(240px,var(--side-w,310px),100% - 560px) 0 minmax(0,1fr);min-height:0}
 aside{border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0;background:var(--panel)}
+/* drag handles: list | video column | text, and the bar under the video (sizes in --side-w, --player-w, --video-h) */
+.split{position:relative;z-index:3;align-self:stretch;cursor:col-resize;touch-action:none;outline:none}
+.split::before{content:"";position:absolute;top:0;bottom:0;left:50%;width:2px;margin-left:-1px;transition:background .15s}
+.split::after{content:"";display:block;width:4px;height:40px;border-radius:2px;background:var(--line);transition:background .15s}
+.split[data-split="side"]{margin:0 -6px 0 -2px}
+.split[data-split="side"]::before{left:1px;margin-left:0}
+.split[data-split="side"]::after{position:absolute;top:50%;left:0;margin-top:-20px}
+.split[data-split="player"]::after{position:sticky;top:calc(50vh - 45px);margin:0 auto}
+.vsplit{position:relative;height:12px;margin:-10px 0 -8px;cursor:row-resize;touch-action:none;outline:none}
+.vsplit::before{content:"";position:absolute;left:0;right:0;top:50%;height:2px;margin-top:-1px;transition:background .15s}
+.vsplit::after{content:"";position:absolute;top:50%;left:50%;width:40px;height:4px;margin:-2px 0 0 -20px;border-radius:2px;background:var(--line);transition:background .15s}
+:is(.split,.vsplit):is(:hover,.on,:focus-visible)::before,:is(.split,.vsplit):is(:hover,.on,:focus-visible)::after{background:var(--accent)}
+body.resizing-x,body.resizing-x *{cursor:col-resize!important;user-select:none}
+body.resizing-y,body.resizing-y *{cursor:row-resize!important;user-select:none}
 .runbox{padding:12px;border-bottom:1px solid var(--line);display:flex;flex-direction:column;gap:8px}
 .runbox textarea{width:100%;height:70px;resize:vertical;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:8px;font-size:12px}
 .runbox .row{display:flex;gap:8px;align-items:center}
@@ -1319,11 +1333,11 @@ aside{border-right:1px solid var(--line);display:flex;flex-direction:column;min-
 .item .fc{color:var(--star)}
 main{overflow:auto;min-height:0}
 .empty{padding:60px;text-align:center;color:var(--muted)}
-.detail{padding:16px;display:grid;grid-template-columns:minmax(260px,360px) 1fr;gap:16px;align-items:start}
+.detail{padding:16px;display:grid;grid-template-columns:clamp(240px,var(--player-w,360px),100% - 296px) 16px minmax(0,1fr);gap:16px 0;align-items:start}
 .player{position:sticky;top:16px;display:flex;flex-direction:column;gap:10px;
   max-height:calc(100vh - 100px);overflow-y:auto;overflow-x:hidden;padding-right:4px;scrollbar-width:thin}
 .player > *{flex-shrink:0}
-video{width:100%;max-height:min(68vh, calc(100vh - 330px));min-height:180px;background:#000;border-radius:var(--radius)}
+video{width:100%;max-height:min(var(--video-h, min(68vh, calc(100vh - 330px))), calc(100vh - 120px));min-height:180px;background:#000;border-radius:var(--radius)}
 .nav{display:flex;gap:8px;align-items:center}
 .nav .pos{flex:1;text-align:center;color:var(--muted);font-size:12px}
 .meta{font-size:12px;color:var(--muted)}
@@ -1537,6 +1551,7 @@ kbd{background:var(--panel2);border:1px solid var(--line);border-bottom-width:2p
 }
 @media (max-width:900px){
   .layout{grid-template-columns:1fr}
+  .split{display:none}
   aside{max-height:45vh;border-right:0;border-bottom:1px solid var(--line)}
   .detail{grid-template-columns:1fr}
   .player{position:static}
@@ -1598,6 +1613,7 @@ body:has(#bulkbar.show) #log{bottom:84px}
     <div id="filters"></div>
     <div id="list"></div>
   </aside>
+  <div class="split" data-split="side" role="separator" aria-orientation="vertical" aria-label="Width of the list" tabindex="0" title="Drag to change the width · double-click for the standard width"></div>
   <main id="main"><div class="empty">No reels yet. Paste links on the left and press Run.</div></main>
 </div>
 
@@ -2133,7 +2149,8 @@ function render(r){
   $("#main").innerHTML = `
   <div class="detail">
     <div class="player">
-      ${r.video ? `<video id="vid" controls playsinline preload="metadata" src="${media(r.id, r.video)}"></video>` : `<div class="empty">No video file</div>`}
+      ${r.video ? `<video id="vid" controls playsinline preload="metadata" src="${media(r.id, r.video)}"></video>
+      <div class="vsplit" data-split="video" role="separator" aria-orientation="horizontal" aria-label="Height of the video" tabindex="0" title="Drag to make the video taller or shorter · double-click for the standard height"></div>` : `<div class="empty">No video file</div>`}
       <div class="nav">
         <button class="btn" id="prev">&larr; Prev</button>
         <span class="pos" id="pos"></span>
@@ -2149,6 +2166,7 @@ function render(r){
       <div class="meta">${r.obsidian && r.obsidian.uri ? `Obsidian note: <a href="${esc(r.obsidian.uri)}" title="${esc(r.obsidian.path || "")}">${esc(r.obsidian.name)}</a>` : (r.obsidian && r.obsidian.error ? esc(r.obsidian.error) : "")}
         ${r.transcript.length ? ` · <button class="link" id="copyai" title="Copies your Obsidian AI prompt with this transcript - paste it into ChatGPT or Claude">Copy AI prompt</button>` : ""}</div>
     </div>
+    <div class="split" data-split="player" role="separator" aria-orientation="vertical" aria-label="Width of the video column" tabindex="0" title="Drag to change the width · double-click for the standard width"></div>
     <div class="right">
       <div class="card">
         <div class="tabs">${tabs.map(([k,l,n]) => `<div class="tab ${tab===k?"active":""}" data-tab="${k}">${l}${n!==""?`<span class="n">${n}</span>`:""}</div>`).join("")}</div>
@@ -2522,6 +2540,68 @@ function move(d){
   if (i >= 0 && i < L.length) select(L[i].id);
 }
 
+/* ---------- resizable panels: drag the edge between list, video and text, or the bar under the video ---------- */
+const SPLIT = {                      // handle -> CSS variable on <html>, direction, smallest size in px
+  side:   {v: "--side-w",   x: true,  min: 240},
+  player: {v: "--player-w", x: true,  min: 240},
+  video:  {v: "--video-h",  x: false, min: 180}
+};
+let panelPx = {}, splitDrag = null;
+try { panelPx = JSON.parse(localStorage.getItem("rh-panels") || "{}"); } catch (e) {}
+if (!panelPx || typeof panelPx !== "object" || Array.isArray(panelPx)) panelPx = {};
+function setPanel(name, px){         // px null: back to the standard size
+  if (px == null || !Number.isFinite(px)) { delete panelPx[name]; document.documentElement.style.removeProperty(SPLIT[name].v); }
+  else { panelPx[name] = Math.round(px); document.documentElement.style.setProperty(SPLIT[name].v, panelPx[name] + "px"); }
+}
+function savePanels(){ try { localStorage.setItem("rh-panels", JSON.stringify(panelPx)); } catch (e) {} }
+Object.keys(panelPx).forEach(n => { if (!SPLIT[n]) delete panelPx[n]; });
+Object.keys(SPLIT).forEach(n => setPanel(n, panelPx[n]));
+function panelBox(name){             // the element a handle resizes and the most room it may take (same limits as the CSS)
+  if (name === "side") return {el: $("aside"), max: $(".layout").clientWidth - 560};
+  if (name === "player") {
+    const d = $(".detail"); if (!d) return null;
+    const s = getComputedStyle(d);
+    return {el: $(".player"), max: d.clientWidth - parseFloat(s.paddingLeft) - parseFloat(s.paddingRight) - 296};
+  }
+  if (name === "video") return $("#vid") ? {el: $("#vid"), max: innerHeight - 120} : null;
+  return null;
+}
+function resizePanel(name, px, box){ const m = SPLIT[name].min; setPanel(name, Math.max(m, Math.min(Math.max(m, box.max), px))); }
+document.addEventListener("pointerdown", e => {
+  const h = e.target.closest && e.target.closest("[data-split]");
+  if (!h || e.button !== 0 || !SPLIT[h.dataset.split]) return;
+  const box = panelBox(h.dataset.split); if (!box || !box.el) return;
+  e.preventDefault();
+  const x = SPLIT[h.dataset.split].x, r = box.el.getBoundingClientRect();
+  splitDrag = {name: h.dataset.split, h, box, x, from: x ? e.clientX : e.clientY, size: x ? r.width : r.height};
+  try { h.setPointerCapture(e.pointerId); } catch (err) {}
+  h.classList.add("on"); document.body.classList.add(x ? "resizing-x" : "resizing-y");
+});
+window.addEventListener("pointermove", e => {
+  const d = splitDrag; if (!d) return;
+  resizePanel(d.name, d.size + (d.x ? e.clientX : e.clientY) - d.from, d.box);
+});
+function endSplit(){
+  const d = splitDrag; if (!d) return;
+  splitDrag = null; d.h.classList.remove("on"); d.h.blur();         // so the arrow keys switch reels again
+  document.body.classList.remove("resizing-x", "resizing-y"); savePanels();
+}
+window.addEventListener("pointerup", endSplit);
+window.addEventListener("pointercancel", endSplit);
+document.addEventListener("dblclick", e => {
+  const h = e.target.closest && e.target.closest("[data-split]");
+  if (h && SPLIT[h.dataset.split]) { setPanel(h.dataset.split, null); savePanels(); }
+});
+function splitKey(e, h){             // a handle reached with Tab: arrow keys resize, 20 px a step (Shift: 80)
+  const name = h.dataset.split; if (!SPLIT[name]) return false;
+  const x = SPLIT[name].x, d = (x ? {ArrowLeft: -1, ArrowRight: 1} : {ArrowUp: -1, ArrowDown: 1})[e.key];
+  if (!d || e.ctrlKey || e.metaKey || e.altKey) return false;
+  e.preventDefault();
+  const box = panelBox(name);
+  if (box && box.el) { const r = box.el.getBoundingClientRect(); resizePanel(name, (x ? r.width : r.height) + d * (e.shiftKey ? 80 : 20), box); savePanels(); }
+  return true;
+}
+
 /* ---------- events ---------- */
 document.addEventListener("click", async e => {
   const t = e.target, c = sel => t.closest(sel);
@@ -2719,6 +2799,8 @@ document.addEventListener("keydown", e => {
     return;
   }
   if ($("#confirm").classList.contains("show") && e.key !== "Enter" && e.key !== "Escape" && e.key !== "Tab") { e.preventDefault(); return; }
+  const sp = document.activeElement && document.activeElement.closest && document.activeElement.closest("[data-split]");
+  if (sp && splitKey(e, sp)) return;
   if (e.key === "Enter" && document.activeElement && document.activeElement.classList.contains("gcard")) { e.preventDefault(); return select(document.activeElement.dataset.open); }
   const mod = e.ctrlKey || e.metaKey || e.altKey;
   if ($("#lightbox").classList.contains("show") && !mod && (e.key === "e" || e.key === "E") && !/TEXTAREA|INPUT|SELECT/.test(document.activeElement.tagName)) { e.preventDefault(); return openEditor(lb.list[lb.i]); }
