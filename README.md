@@ -5,11 +5,15 @@ Turn Instagram reels, TikTok videos, YouTube videos/Shorts and X posts (or anyth
 For each reel it saves:
 - the video and caption
 - a timestamped transcript of what is said (Whisper, runs locally)
-- dense snapshots: one every 2 s plus every scene cut (choose 60-400 per video; longer videos are spread out). Delete the ones you don't need, keep your favorites
+- snapshots: **Auto** by default - a frame every 2 s for short videos, gradually wider for longer ones (about 5 s at 6 min, 12 s at 36 min, 20 s from 1.5 h), plus every scene cut, up to 400 (very long videos get a wider gap to stay under that). Or pick a fixed maximum in the app (60-400), which is never exceeded. Delete the ones you don't need, keep your favorites
 - on-screen text read from the snapshots (OCR)
 - a Markdown note per reel, ready for Obsidian
 
-The **Reels Hub** web app (local only) lets you paste links and run them, browse reels by category, star snapshots as favorites, reorder them, correct the text under each one, print them on A4, and send them to an Obsidian vault.
+The **Reels Hub** web app (local only) lets you paste links and run them, browse reels grouped by category or source and sorted by date posted, date added or title, star snapshots as favorites, reorder them, correct the text under each one, print them on A4, and send them to an Obsidian vault.
+
+While watching, **📸 Snapshot** (or the S key; Shift+S also stars it) captures the current frame; it slots into the snapshots in time order. Every time shown on a snapshot, favorite or on-screen text is clickable and plays the video from that moment (P in the enlarged view).
+
+Snapshots can be edited inside the app (crop, rotate, draw, arrows, boxes, text, blur, undo) or opened in Paint; the original is always kept for **Reset to original**. Images and video links can be copied to paste into chat apps.
 
 ## Setup (Windows)
 
@@ -42,9 +46,11 @@ python reels2notes.py -f links.txt
 | What | Default location | Change with |
 |---|---|---|
 | Videos, snapshots, notes, favorites, categories | `Downloads/reels` | `--out PATH` |
-| Obsidian notes | `<vault>/Instagram`, `/TikTok`, `/YouTube`, `/X` (one note per video, images in `<Platform>/attachments`) | `--vault PATH` |
+| Obsidian notes | new notes in `<vault>/YouTube`, `/TikTok`, `/Instagram`, `/X` - move or rename them freely, the app finds them again; favorite images in `910_Attachments/ReelsHub` | `--vault PATH` |
 
 The default vault path is `Documents/Obsidian Vault` under OneDrive. If it is not found, Obsidian sync is switched off.
+
+Notes follow the vault's video template: date and time, Title, Source, Tags, Related (MOC links), Creator; then the AI sections (Obsidian Tags, Summary, Main Takeaways, Key Concepts, Reflective Questions, Actionable Insights, Compare and Contrast) left ready to fill, Favorites, My notes, Description, Content (transcript in paragraphs) and Original text (with timestamps). YouTube notes start with `'` and TikTok notes with a backtick, like the templates. **Copy AI prompt** in the app copies the vault's `$Obsidian AI prompts` with the transcript, for ChatGPT or Claude.
 
 ## If a download needs login
 
@@ -62,8 +68,9 @@ In the app: save the file as `cookies.txt` next to `reels_hub.py` and press Run 
 
 ## Notes
 
-- Everything runs on your own machine. The app listens on 127.0.0.1 only.
-- Long videos: snapshots are capped per video (`--max-shots`, default 200; set it next to Run in the app), on-screen text is read from at most 60 of them, and transcription on CPU takes roughly a quarter to a half of the video's length.
+- Everything runs on your own machine. The app listens on 127.0.0.1 only and ignores requests from other websites.
+- My notes and favorite text save automatically. Re-processing a video keeps your notes; its favorites are cleared only if the run succeeds, and the video's controls pause while it runs.
+- Long videos: snapshots are capped per video (`--max-shots auto` or a number; set it next to Run in the app), on-screen text is read from at most 60 of them, and transcription on CPU takes roughly a quarter to a half of the video's length.
 - Running a link that is already done asks what to do: **New version** (a separate copy, v2, v3... - the original and its favorites stay) or **Skip**. On a reel, **+ New version** does the same and **Re-process** replaces that version. Both reuse the downloaded video.
 - If memory is low, transcription falls back to smaller Whisper models (base, then tiny).
 - For personal reference only: respect creators' rights and each platform's terms.

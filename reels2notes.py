@@ -18,7 +18,8 @@ Options:
     --cookies cookies.txt           login cookies (Netscape format) - use if a download needs login
     --browser firefox|edge|chrome   read login cookies straight from a browser (default: none)
     --scene 0.3                     scene-change sensitivity for snapshots (lower = more frames)
-    --max-shots 200                 max snapshots per video: one every 2 s plus scene cuts (long videos: spread out)
+    --max-shots auto                Auto (default): count from video length and editing pace,
+                                    or a number: at most that many (one every 2 s plus scene cuts)
     --ocr-max 60                    read on-screen text from at most this many snapshots
     --redo                          re-process videos that were already done (replaces transcript and snapshots)
     --new-version                   process already-done videos again as a separate copy (_v2, _v3, ...)
@@ -95,7 +96,8 @@ class Progress:
     def plan(self, duration, nshots=None):
         st = self.stats
         d = max(duration or 0, 1)
-        n = nshots if nshots is not None else min(self.max_shots, max(3, int(d / 2)))
+        cap = self.max_shots or AUTO_CAP
+        n = nshots if nshots is not None else min(cap, max(3, int(d / min(20.0, max(2.0, 2.0 * (d / 60) ** 0.5)))))
         self.est["snapshots"] = 2 + d * st["shot_factor"]
         self.est["transcribe"] = st["model_load"] + d * st["tx_factor"]
         self.est["ocr"] = (st["ocr_load"] * (_ocr is None) + min(n, 60) * st["ocr_per_img"]) if self.do_ocr else 0
@@ -256,16 +258,49 @@ def _grid(video, outdir, interval):
     return list(zip(times, files))
 
 
+AUTO_CAP = 400
+
+
+def auto_plan(dur, n_cuts):
+    """Auto snapshot plan from video length and editing pace.
+    Base gap grows with length: 2 s for a 1-min reel, ~5 s at 6 min, ~12 s at 36 min, max 20 s.
+    Every scene cut is added on top (new content), but very fast cutting is held back (flicker, music videos).
+    Returns (interval, cut_budget, explanation)."""
+    mins = max(dur, 1) / 60
+    interval = min(20.0, max(2.0, 2.0 * mins ** 0.5))
+    grid_n = int(dur / interval) + 1
+    pace = n_cuts / mins                                  # scene cuts per minute
+    if pace > 30:                                         # flicker / rapid montage: cap cut frames
+        budget = grid_n // 2
+    else:
+        budget = n_cuts
+    budget = max(0, min(budget, AUTO_CAP - grid_n))
+    if grid_n > AUTO_CAP:                                 # extremely long: widen the gap instead
+        interval = dur / (AUTO_CAP - 1); grid_n = AUTO_CAP; budget = 0
+    why = f"{int(dur)//60}:{int(dur)%60:02d} video, {pace:.0f} cuts/min -> every {interval:.0f} s + up to {budget} scene cuts"
+    return interval, budget, why
+
+
 def snapshots(video, workdir, scene, max_shots=200, speech=(), prog=None):
-    """Dense snapshots: a frame every 2 s (spread out more for long videos) plus every scene cut."""
+    """Dense snapshots: a frame every `interval` seconds plus scene cuts.
+    max_shots=0 means Auto (see auto_plan); otherwise at most max_shots, every 2 s or spread out."""
     shots = workdir / "shots"
     shots.mkdir(exist_ok=True)
     dur = video_duration(video)
-    interval = max(2.0, dur / max_shots) if dur else 2.0
+    all_cuts = scene_cuts(video, scene) if dur else []
+    if prog:
+        prog.update(0.4)
+    if max_shots <= 0:
+        interval, budget, why = auto_plan(dur, len(all_cuts))
+        print(f"  Auto snapshots: {why}")
+    else:                                                    # a real maximum: grid + cuts never exceed it
+        budget = min(max(1, max_shots // 4), len(all_cuts))
+        grid_n = max(1, max_shots - budget)
+        interval = max(2.0, dur / grid_n) if dur else 2.0
     grid = _grid(video, shots, interval)
     if prog:
-        prog.update(0.6)
-    cuts = _spread(scene_cuts(video, scene), max(1, max_shots // 4), dur) if dur else []
+        prog.update(0.7)
+    cuts = _spread(all_cuts, budget, dur) if dur and budget else []
     extra = []
     for t, _ in cuts:
         t = min(t + 0.2, max(0.0, dur - 0.1))
@@ -277,13 +312,24 @@ def snapshots(video, workdir, scene, max_shots=200, speech=(), prog=None):
                 extra.append((t, out))
     if prog:
         prog.update(0.95)
+    if max_shots > 0 and len(grid) + len(extra) > max_shots:  # trim to the limit: extra cuts first, then thin the grid
+        keep_extra = max(0, max_shots - len(grid))
+        for _, f in extra[keep_extra:]:
+            f.unlink(missing_ok=True)
+        extra = extra[:keep_extra]
+        if len(grid) > max_shots:
+            idx = {round(i * (len(grid) - 1) / (max_shots - 1)) for i in range(max_shots)} if max_shots > 1 else {0}
+            for i, (_, f) in enumerate(grid):
+                if i not in idx:
+                    f.unlink(missing_ok=True)
+            grid = [g for i, g in enumerate(grid) if i in idx]
     frames = sorted(grid + extra, key=lambda x: x[0])
     files, times = [], []
     for k, (t, f) in enumerate(frames, 1):                   # rename in time order: shot_001.jpg ...
         dest = shots / f"shot_{k:03d}.jpg"
         f.replace(dest)
         files.append(dest); times.append(round(t, 2))
-    print(f"  {len(files)} snapshots (every {interval:.0f} s + {len(extra)} scene cuts)")
+    print(f"  {len(files)} snapshots (every {interval:.0f} s + {len(extra)} scene cuts of {len(all_cuts)} found)")
     (workdir / "shots.json").write_text(json.dumps(dict(zip([f.name for f in files], times)), indent=1),
                                         encoding="utf-8")
     return files
@@ -363,6 +409,22 @@ def ocr(images, prog=None, outdir=None):
     return out
 
 
+NOTES_S, NOTES_E = "<!-- reels-hub:notes start -->", "<!-- reels-hub:notes end -->"
+
+
+def old_notes(note):
+    """The user's 'My notes' from an existing note.md, so Re-process keeps them."""
+    if not note.exists():
+        return ""
+    t = note.read_text(encoding="utf-8", errors="replace")
+    if NOTES_S in t and NOTES_E in t and t.find(NOTES_S) < t.find(NOTES_E):
+        return t[t.find(NOTES_S) + len(NOTES_S):t.find(NOTES_E)].strip("\n")
+    if "\n## My notes" in t:                                  # older notes: last section
+        txt = t.split("\n## My notes", 1)[1].split("\n", 1)[1] if "\n" in t.split("\n## My notes", 1)[1] else ""
+        return "" if txt.strip() == "-" else txt.strip("\n")
+    return ""
+
+
 def write_note(workdir, url, info, shots, transcript, lang, ocr_lines):
     author = info.get("uploader") or info.get("channel") or "unknown"
     caption = (info.get("description") or "").strip()
@@ -387,10 +449,12 @@ def write_note(workdir, url, info, shots, transcript, lang, ocr_lines):
     ]
     if ocr_lines is not None:
         md += ["## On-screen text", *(f"- `{n}`: {t}" for n, t in ocr_lines or [("-", "_none_")]), ""]
-    md += ["## Snapshots", *(f"![[{workdir.name}/shots/{s.name}]]" for s in shots), "",
-           "## My notes", "- "]
     note = workdir / "note.md"
-    note.write_text("\n".join(md), encoding="utf-8")
+    md += ["## Snapshots", *(f"![[{workdir.name}/shots/{s.name}]]" for s in shots), "",
+           "## My notes", NOTES_S, old_notes(note), NOTES_E, ""]
+    tmp = note.with_name(".note.md.tmp")
+    tmp.write_text("\n".join(md), encoding="utf-8")
+    os.replace(tmp, note)
     return note
 
 
@@ -481,7 +545,8 @@ def _process(url, args, i=1, n=1, stats=None):
         video = workdir / video.name
     shots_dir = workdir / "shots"
     if shots_dir.exists():
-        shutil.rmtree(shots_dir)
+        shutil.rmtree(shots_dir)                             # also removes edited originals in shots/_orig
+    (workdir / "shots_manual.json").unlink(missing_ok=True)  # your own snapshots are gone with the old set
     print(f"  platform: {platform_of(url, info)} - {info.get('title') or info.get('id')}")
     dur = video_duration(video) or float(info.get("duration") or 0)
     prog.plan(dur)
@@ -512,7 +577,7 @@ def main():
     ap.add_argument("--browser", default="none")
     ap.add_argument("--cookies", help="cookies.txt exported from your browser")
     ap.add_argument("--scene", type=float, default=0.3)
-    ap.add_argument("--max-shots", type=int, default=200)
+    ap.add_argument("--max-shots", default="auto", help="'auto' or a number")
     ap.add_argument("--ocr-max", type=int, default=60)
     ap.add_argument("--model", default="small")
     ap.add_argument("--lang", default=None)
@@ -522,10 +587,12 @@ def main():
     ap.add_argument("--target", help="reel folder name to use (with --redo or --new-version)")
     ap.add_argument("--out", default=str(Path.home() / "Downloads" / "reels"))
     args = ap.parse_args()
+    ms = str(args.max_shots).strip().lower()
+    args.max_shots = 0 if ms in ("auto", "0", "") else max(10, int(ms))   # 0 = Auto
 
     urls = list(args.urls)
     if args.file:
-        urls += [l.strip() for l in Path(args.file).read_text().splitlines() if l.strip().startswith("http")]
+        urls += [l.strip() for l in Path(args.file).read_text(encoding="utf-8-sig", errors="replace").splitlines() if l.strip().startswith("http")]
     if not urls:
         ap.error("give at least one URL or -f links.txt")
 
@@ -539,8 +606,10 @@ def main():
         if i < len(urls) - 1:
             time.sleep(5)  # be gentle with the sites
     if failed:
-        Path(args.out, "failed.txt").write_text("\n".join(failed))
+        Path(args.out, "failed.txt").write_text("\n".join(failed), encoding="utf-8")
         print(f"\n{len(failed)} failed - see {args.out}/failed.txt")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
