@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+
+# Never commit login cookies or downloaded content
+cookies.txt
+*cookies*.txt
+reels/
+*.mp4
+*.webm
+*.info.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
