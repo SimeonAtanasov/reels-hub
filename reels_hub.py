@@ -372,6 +372,48 @@ def recategorize(old, new):
                 f.write_text(json.dumps(s, indent=1, ensure_ascii=False), encoding="utf-8")
 
 
+def _unique(dest):
+    if not dest.exists():
+        return dest
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return dest.with_name(f"{dest.stem} ({stamp}){dest.suffix}")
+
+
+def delete_reels(ids, with_obsidian):
+    """Move reels to <out>/_trash (and optionally their vault notes to Obsidian's .trash)."""
+    import shutil
+    if JOB["running"]:
+        raise ValueError("Wait for the current run to finish before deleting")
+    done, errors = [], []
+    trash = OUT / "_trash"
+    for rid in ids:
+        try:
+            folder = safe_path(str(rid))
+            if folder.parent != OUT.resolve() or folder.name.startswith("_") or not folder.is_dir():
+                raise ValueError("not a reel folder")
+            if with_obsidian and vault_ok():
+                r = parse_note(folder)
+                st = read_state(folder)
+                if r and st["note_name"]:
+                    d = vault_dir(r["platform"])
+                    vtrash = VAULT / ".trash"
+                    note = VAULT / d / f"{st['note_name']}.md"
+                    att = VAULT / d / "attachments" / folder.name
+                    if note.exists():
+                        vtrash.mkdir(exist_ok=True)
+                        shutil.move(str(note), str(_unique(vtrash / note.name)))
+                    if att.exists():
+                        vtrash.mkdir(exist_ok=True)
+                        shutil.move(str(att), str(_unique(vtrash / f"attachments {folder.name}")))
+            trash.mkdir(exist_ok=True)
+            with DATA_LOCK:
+                shutil.move(str(folder), str(_unique(trash / folder.name)))
+            done.append(rid)
+        except Exception as e:
+            errors.append(f"{rid}: {e}")
+    return {"deleted": done, "errors": errors}
+
+
 def change_cats(body):
     action = body.get("action")
     name = str(body.get("name", "")).strip()[:100]
@@ -488,6 +530,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "state": save_state(body["id"], body.get("state", {}))})
             elif path == "/api/obsidian":
                 self.send_json({"ok": True, **send_to_obsidian(body["id"])})
+            elif path == "/api/delete":
+                ids = body.get("ids") or []
+                if not isinstance(ids, list) or not ids:
+                    raise ValueError("Nothing to delete")
+                self.send_json({"ok": True, **delete_reels(ids, bool(body.get("obsidian")))})
             elif path == "/api/categories":
                 self.send_json({"ok": True, "categories": change_cats(body)})
             else:
@@ -658,7 +705,35 @@ textarea.notes{width:100%;min-height:200px;background:var(--bg);border:1px solid
 .gsec{margin-bottom:26px}
 .gsec h3{font-size:13px;font-weight:600;letter-spacing:.6px;text-transform:uppercase;color:var(--muted);margin:0 0 10px;display:flex;gap:8px;align-items:center}
 .ggrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:14px}
-.gcard{cursor:pointer;border-radius:10px;padding:6px;border:1px solid transparent}
+.gcard{cursor:pointer;border-radius:10px;padding:6px;border:1px solid transparent;position:relative;user-select:none}
+.gcard .tick{position:absolute;top:12px;left:12px;z-index:2;width:22px;height:22px;border-radius:50%;background:var(--accent);color:var(--accent-ink);font-size:13px;font-weight:700;display:none;align-items:center;justify-content:center}
+.gcard.sel{border-color:var(--accent);background:#1a2a28}
+.gcard.sel .tick{display:flex}
+.gcard.sel .gthumb{outline:2px solid var(--accent)}
+.item.sel{background:#1a2a28;outline:1px solid var(--accent)}
+.item{user-select:none}
+.dragging{opacity:.45}
+.gsec{border-radius:12px;padding:6px 8px;margin-left:-8px;margin-right:-8px;border:1px dashed transparent}
+.gsec.drop{border-color:var(--accent);background:rgba(95,208,196,.06)}
+.gdrop{grid-column:1/-1;border:1px dashed var(--line);border-radius:10px;padding:22px;text-align:center;color:var(--muted);font-size:13px}
+.ghint{font-size:12px;color:var(--muted);margin-bottom:14px}
+#bulkbar{position:fixed;left:50%;bottom:18px;transform:translate(-50%,120px);display:flex;gap:10px;align-items:center;background:var(--panel);border:1px solid var(--accent);border-radius:12px;padding:8px 12px;box-shadow:0 8px 30px rgba(0,0,0,.5);z-index:12;transition:transform .2s;max-width:calc(100vw - 24px);flex-wrap:wrap}
+#bulkbar.show{transform:translate(-50%,0)}
+#bulkcount{font-weight:600;font-size:13px}
+#bulkcat{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:5px 8px}
+.btn.danger{color:#ef6f6c;border-color:#5a2c2b}
+.btn.danger:hover{border-color:#ef6f6c}
+.btn.danger.solid{background:#c94a47;color:#fff;border-color:#c94a47;font-weight:600}
+#confirm{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:50;padding:16px}
+#confirm.show{display:flex}
+.cbox{width:min(460px,100%);padding:18px 20px}
+.cbox h3{margin:0 0 8px;font-size:16px}
+.cbox p{margin:0 0 14px;white-space:pre-wrap;color:var(--muted);font-size:13px}
+.cchk{display:flex;gap:8px;align-items:center;font-size:13px;margin-bottom:16px}
+.cbtns{display:flex;gap:8px;justify-content:flex-end}
+#toast{position:fixed;left:50%;top:70px;transform:translateX(-50%);background:var(--accent);color:var(--accent-ink);font-weight:600;padding:7px 14px;border-radius:10px;opacity:0;pointer-events:none;transition:opacity .2s;z-index:40}
+#toast.show{opacity:1}
+#dragghost{position:fixed;top:-100px;left:-100px;background:var(--accent);color:var(--accent-ink);font-weight:700;padding:5px 12px;border-radius:14px;font-size:13px}
 .gcard:hover,.gcard:focus{background:var(--panel);border-color:var(--line);outline:none}
 .gcard.active{border-color:#2f5551;background:#1a2423}
 .gthumb{position:relative;aspect-ratio:9/16;border-radius:8px;overflow:hidden;background:var(--panel2)}
@@ -753,6 +828,21 @@ kbd{background:var(--panel2);border:1px solid var(--line);border-bottom-width:2p
   <main id="main"><div class="empty">No reels yet. Paste links on the left and press Run.</div></main>
 </div>
 
+<div id="bulkbar">
+  <span id="bulkcount"></span>
+  <select id="bulkcat"></select>
+  <button class="btn small" id="bulkall">Select all shown</button>
+  <button class="btn small danger" id="bulkdel">Delete</button>
+  <button class="btn small" id="bulkclear">Clear</button>
+</div>
+<div id="toast"></div>
+<div id="confirm"><div class="cbox card">
+  <h3 id="ctitle"></h3>
+  <p id="cmsg"></p>
+  <label class="cchk"><input type="checkbox" id="cobs"> Also delete their Obsidian notes and images</label>
+  <div class="cbtns"><button class="btn" id="cno">Cancel</button><button class="btn danger solid" id="cyes">Delete</button></div>
+</div></div>
+<div id="dragghost"></div>
 <div id="log" class="card">
   <div class="head"><span id="logtitle">Run log</span><button class="btn small" id="closelog">Close</button></div>
   <pre id="logtext"></pre>
@@ -874,7 +964,7 @@ function renderList(){
                   <button class="ico" data-delcat title="Delete category">&#10005;</button>` : ""}
     </div>`;
     if (!closed) html += items.length ? items.map(r => `
-      <div class="item ${current && current.id===r.id?"active":""}" data-id="${esc(r.id)}" draggable="true">
+      <div class="item ${current && current.id===r.id?"active":""} ${selected.has(r.id)?"sel":""}" data-id="${esc(r.id)}" draggable="true">
         ${r.shots[0] ? `<img loading="lazy" src="${media(r.id,"shots/"+r.shots[0])}" alt="">` : `<img alt="">`}
         <div><div class="t">${esc(r.label)}</div>
         <div class="s">${pbadge(r)} ${esc(r.author)} · ${esc(r.date)}${r.state.favorites.length?` · <span class="fc">&#9733; ${r.state.favorites.length}</span>`:""}</div></div>
@@ -882,6 +972,80 @@ function renderList(){
   });
   $("#list").innerHTML = html || `<div class="empty">No matches</div>`;
   if (view === "gallery") renderGallery();
+}
+
+/* ---------- multi-select + bulk move ---------- */
+let selected = new Set(), anchor = null;
+function pick(id, e){
+  if (e.shiftKey && anchor) {
+    const ids = filtered.map(r => r.id), a = ids.indexOf(anchor), b = ids.indexOf(id);
+    if (a >= 0 && b >= 0) { const [lo, hi] = a < b ? [a, b] : [b, a]; ids.slice(lo, hi + 1).forEach(x => selected.add(x)); }
+    else selected.add(id);
+  } else {
+    selected.has(id) ? selected.delete(id) : selected.add(id);
+    anchor = id;
+  }
+  refreshSel();
+}
+function clearSel(){ selected.clear(); anchor = null; refreshSel(); }
+function refreshSel(){
+  document.querySelectorAll(".item,[data-open]").forEach(el => el.classList.toggle("sel", selected.has(el.dataset.id || el.dataset.open)));
+  const n = selected.size, bar = $("#bulkbar");
+  bar.classList.toggle("show", n > 0);
+  if (!n) return;
+  $("#bulkcount").textContent = `${n} selected`;
+  $("#bulkcat").innerHTML = `<option value="" disabled selected>Move to category...</option>`
+    + ["", ...cats].map(c => `<option value="cat:${esc(c)}">${c ? esc(c) : "Unassigned"}</option>`).join("")
+    + `<option value="new">+ New category...</option>`;
+}
+function moveReels(ids, cat){
+  const rs = ids.map(id => reels.find(r => r.id === id)).filter(r => r && catOf(r) !== cat);
+  rs.forEach(r => { r.state.category = cat; saveState(r, true); });
+  if (current && $("#catsel") && rs.includes(current)) $("#catsel").value = cat;
+  renderList(); refreshSel(); if (current) updateNavSafe();
+  toast(rs.length ? `Moved ${rs.length} reel${rs.length>1?"s":""} to ${cat || "Unassigned"}` : `Already in ${cat || "Unassigned"}`);
+}
+function updateNavSafe(){ if ($("#pos")) updateNav(); }
+let toastTimer;
+function toast(msg){ const t = $("#toast"); t.textContent = msg; t.classList.add("show"); clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove("show"), 2200); }
+
+/* ---------- delete ---------- */
+function askDelete(rs){
+  return new Promise(res => {
+    const names = rs.slice(0, 4).map(r => "• " + r.label).join("\n") + (rs.length > 4 ? `\n• and ${rs.length - 4} more` : "");
+    $("#ctitle").textContent = rs.length > 1 ? `Delete ${rs.length} reels?` : "Delete this reel?";
+    $("#cmsg").textContent = names + "\n\nVideo, snapshots, transcript, favorites and notes move to Downloads\\reels\\_trash, so you can still restore them.";
+    const hasNotes = rs.some(r => r.obsidian && r.obsidian.name);
+    $("#cobs").checked = false; $("#cobs").closest("label").hidden = !hasNotes || !vault.ok;
+    $("#confirm").classList.add("show");
+    const done = v => { $("#confirm").classList.remove("show"); $("#cyes").onclick = $("#cno").onclick = null; res(v); };
+    $("#cyes").onclick = () => done({ok: true, obsidian: $("#cobs").checked});
+    $("#cno").onclick = () => done({ok: false});
+  });
+}
+async function deleteReels(ids){
+  const rs = ids.map(id => reels.find(r => r.id === id)).filter(Boolean);
+  if (!rs.length) return;
+  const ans = await askDelete(rs);
+  if (!ans.ok) return;
+  const v = $("#vid"); if (v && rs.includes(current)) { v.pause(); v.removeAttribute("src"); v.load(); }   // release the file
+  let j;
+  try { j = await api("/api/delete", {ids: rs.map(r => r.id), obsidian: ans.obsidian}); }
+  catch (e) { return alert("Could not delete: " + e.message); }
+  const gone = new Set(j.deleted);
+  const idx = filtered.findIndex(r => current && r.id === current.id);
+  reels = reels.filter(r => !gone.has(r.id));
+  gone.forEach(id => selected.delete(id));
+  $("#count").textContent = reels.length ? `${reels.length} reel${reels.length>1?"s":""}` : "";
+  if (current && gone.has(current.id)) current = null;
+  renderList(); refreshSel();
+  if (!current) {
+    const next = filtered[Math.min(Math.max(idx, 0), filtered.length - 1)];
+    if (next) select(next.id, true, true);
+    else if (view !== "gallery") $("#main").innerHTML = `<div class="empty">No reels left. Paste links on the left and press Run.</div>`;
+  }
+  toast(`Deleted ${gone.size} reel${gone.size===1?"":"s"}` + (ans.obsidian ? " and their Obsidian notes" : ""));
+  if (j.errors.length) alert("Some reels could not be deleted (close any program using them and try again):\n\n" + j.errors.join("\n"));
 }
 
 /* ---------- gallery ---------- */
@@ -900,18 +1064,18 @@ function renderGallery(){
   for (const g of groups) {
     if (!catShown(g)) continue;
     const items = reels.filter(r => catOf(r) === g && matches(r, q));
-    if (!items.length && (!g || q || fPlat.size)) continue;
-    html += `<section class="gsec"><h3>${g ? esc(g) : "Unassigned"} <span class="gcount">${items.length}</span></h3>
+    html += `<section class="gsec" data-cat="${esc(g)}"><h3>${g ? esc(g) : "Unassigned"} <span class="gcount">${items.length}</span></h3>
       <div class="ggrid">${items.length ? items.map(r => `
-        <div class="gcard ${current && current.id===r.id?"active":""}" data-open="${esc(r.id)}" tabindex="0">
+        <div class="gcard ${current && current.id===r.id?"active":""} ${selected.has(r.id)?"sel":""}" data-open="${esc(r.id)}" tabindex="0" draggable="true">
+          <span class="tick">&#10003;</span>
           <div class="gthumb">${cover(r) ? `<img loading="lazy" src="${media(r.id,"shots/"+cover(r))}" alt="">` : ""}
             ${r.state.favorites.length ? `<span class="gstar">&#9733; ${r.state.favorites.length}</span>` : ""}
             ${r.duration ? `<span class="gdur">${mmss(+r.duration)}</span>` : ""}</div>
           <div class="gtitle">${esc(r.label)}</div>
           <div class="s">${pbadge(r)} ${esc(r.author)} · ${esc(r.date)}</div>
-        </div>`).join("") : `<div class="meta">Empty: drag reels onto this category in the sidebar, or pick it on a reel.</div>`}</div></section>`;
+        </div>`).join("") : `<div class="gdrop">Drop reels here</div>`}</div></section>`;
   }
-  $("#main").innerHTML = `<div class="gallery">${html || `<div class="empty">No reels match.</div>`}</div>`;
+  $("#main").innerHTML = `<div class="gallery"><div class="ghint">Click to open · <kbd>Ctrl</kbd>+click or <kbd>Shift</kbd>+click to select several · drag onto a category to move</div>${html || `<div class="empty">No reels match.</div>`}</div>`;
 }
 
 function select(id, scroll=true, keepView=false){
@@ -967,6 +1131,7 @@ function render(r){
         <button class="btn" id="next">Next &rarr;</button>
       </div>
       <label class="catsel">Category ${catSelect(r)}</label>
+      <div><button class="btn small danger" id="delone">Delete this reel</button></div>
       <div class="meta">${esc(r.author)} · ${esc(r.date)}${r.duration?` · ${Math.round(r.duration)}s`:""}${r.url?` · <a href="${esc(r.url)}" target="_blank" rel="noopener">Open on ${esc(r.platform)}</a>`:""}</div>
       <div class="meta">${r.obsidian && r.obsidian.uri ? `Obsidian note: <a href="${esc(r.obsidian.uri)}">${esc(r.obsidian.name)}</a>` : (r.obsidian && r.obsidian.error ? esc(r.obsidian.error) : "")}</div>
     </div>
@@ -1108,7 +1273,7 @@ document.addEventListener("click", async e => {
   let el;
   if ((el = c("[data-star]"))) return toggleFav(current, el.dataset.star);
   if ((el = c("[data-unfav]"))) return toggleFav(current, el.dataset.unfav);
-  if ((el = c("[data-open]"))) return select(el.dataset.open);
+  if ((el = c("[data-open]"))) { if (e.ctrlKey || e.metaKey || e.shiftKey) { e.preventDefault(); return pick(el.dataset.open, e); } clearSel(); return select(el.dataset.open); }
   if ((el = c("[data-fplat]"))) { const v = el.dataset.fplat; fPlat.has(v) ? fPlat.delete(v) : fPlat.add(v); saveFilters(); return renderList(); }
   if ((el = c("[data-fcat]"))) { const v = el.dataset.fcat; fCat.has(v) ? fCat.delete(v) : fCat.add(v); saveFilters(); return renderList(); }
   if (t.id === "fclear") { fPlat.clear(); fCat.clear(); saveFilters(); return renderList(); }
@@ -1121,7 +1286,11 @@ document.addEventListener("click", async e => {
   if ((el = c("[data-catmove]"))) return catAction({action:"move", name: el.closest(".group").dataset.cat, dir: +el.dataset.catmove});
   if ((el = c("[data-toggle]"))) { const g = el.closest(".group").dataset.label; collapsed.has(g) ? collapsed.delete(g) : collapsed.add(g);
     try { localStorage.setItem("rh-collapsed", JSON.stringify([...collapsed])); } catch (err) {} return renderList(); }
-  if ((el = c(".item"))) return select(el.dataset.id, false);
+  if ((el = c(".item"))) { if (e.ctrlKey || e.metaKey || e.shiftKey) { e.preventDefault(); return pick(el.dataset.id, e); } clearSel(); return select(el.dataset.id, false); }
+  if (t.id === "bulkclear") return clearSel();
+  if (t.id === "bulkdel") return deleteReels([...selected]);
+  if (t.id === "delone") return deleteReels([current.id]);
+  if (t.id === "bulkall") { filtered.forEach(r => selected.add(r.id)); return refreshSel(); }
   if ((el = c(".tab"))) { tab = el.dataset.tab;
     document.querySelectorAll(".tab").forEach(x => x.classList.toggle("active", x===el));
     document.querySelectorAll(".pane").forEach(x => x.classList.toggle("active", x.dataset.pane===tab)); return; }
@@ -1165,7 +1334,15 @@ document.addEventListener("input", e => {
     saveState(current);
   }
 });
-document.addEventListener("change", e => {
+document.addEventListener("change", async e => {
+  if (e.target.id === "bulkcat") {
+    const v = e.target.value; let cat;
+    if (v === "new") {
+      const n = prompt("New category name"); if (!n || !n.trim()) return refreshSel();
+      await catAction({action: "add", name: n.trim()}); if (!cats.includes(n.trim())) return refreshSel(); cat = n.trim();
+    } else cat = v.slice(4);
+    moveReels([...selected], cat); return clearSel();
+  }
   if (e.target.id === "catsel") setCategory(current, e.target.value);
   if (["pcols","ptitle","pnums"].includes(e.target.id)) renderPaper();
 });
@@ -1174,15 +1351,26 @@ document.addEventListener("change", e => {
 document.addEventListener("dragstart", e => {
   const h = e.target.closest && e.target.closest(".favimg");
   if (h) { dragFav = +h.closest(".fav").dataset.i; h.closest(".fav").classList.add("dragging"); e.dataTransfer.setData("text/plain", "fav"); e.dataTransfer.effectAllowed = "move"; return; }
-  const it = e.target.closest && e.target.closest(".item");
-  if (it) { e.dataTransfer.setData("text/plain", "reel:" + it.dataset.id); e.dataTransfer.effectAllowed = "move"; }
+  const it = e.target.closest && (e.target.closest(".item") || e.target.closest(".gcard"));
+  if (it) {
+    const id = it.dataset.id || it.dataset.open;
+    const ids = selected.has(id) ? [...selected] : [id];
+    e.dataTransfer.setData("text/plain", "reels:" + JSON.stringify(ids)); e.dataTransfer.effectAllowed = "move";
+    if (ids.length > 1) {   // custom drag image: "N reels"
+      const g = $("#dragghost"); g.textContent = `${ids.length} reels`; e.dataTransfer.setDragImage(g, 20, 14);
+    }
+    ids.forEach(x => document.querySelectorAll(`[data-id="${CSS.escape(x)}"],[data-open="${CSS.escape(x)}"]`).forEach(el => el.classList.add("dragging")));
+  }
 });
 document.addEventListener("dragend", () => { dragFav = null; document.querySelectorAll(".dragging,.over,.drop").forEach(x => x.classList.remove("dragging","over","drop")); });
 document.addEventListener("dragover", e => {
   const fav = e.target.closest && e.target.closest(".fav");
   if (fav && dragFav !== null) { e.preventDefault(); document.querySelectorAll(".fav.over").forEach(x => x !== fav && x.classList.remove("over")); fav.classList.add("over"); return; }
+  if (dragFav !== null) return;
+  const sec = e.target.closest && e.target.closest(".gsec");
   const g = e.target.closest && (e.target.closest(".group") || e.target.closest(".item") || e.target.closest(".gempty"));
-  if (g && dragFav === null) { e.preventDefault(); const grp = groupFor(g); document.querySelectorAll(".group.drop").forEach(x => x !== grp && x.classList.remove("drop")); grp && grp.classList.add("drop"); }
+  const target = sec || (g && groupFor(g));
+  if (target) { e.preventDefault(); document.querySelectorAll(".drop").forEach(x => x !== target && x.classList.remove("drop")); target.classList.add("drop"); }
 });
 function groupFor(el){ // the category header that a list element sits under
   if (el.classList.contains("group")) return el;
@@ -1197,11 +1385,14 @@ document.addEventListener("drop", e => {
     dragFav = null; return;
   }
   const data = e.dataTransfer.getData("text/plain");
+  const sec = e.target.closest && e.target.closest(".gsec");
   const g = e.target.closest && (e.target.closest(".group") || e.target.closest(".item") || e.target.closest(".gempty"));
-  if (g && data.startsWith("reel:")) {
+  const target = sec || (g && groupFor(g));
+  if (target && data.startsWith("reels:")) {
     e.preventDefault();
-    const r = reels.find(x => x.id === data.slice(5)), grp = groupFor(g);
-    if (r && grp) setCategory(r, grp.dataset.cat);
+    let ids = []; try { ids = JSON.parse(data.slice(6)); } catch (err) {}
+    moveReels(ids, target.dataset.cat);
+    if (ids.length > 1) clearSel();
   }
   document.querySelectorAll(".drop").forEach(x => x.classList.remove("drop"));
 });
@@ -1211,6 +1402,9 @@ document.addEventListener("keydown", e => {
   if ($("#printsheet").classList.contains("show")) { if (e.key === "Escape") $("#printsheet").classList.remove("show"); return; }
   const open = $("#lightbox").classList.contains("show");
   if (e.key === "Escape" && !open && favFull) return toggleFull(false);
+  if ($("#confirm").classList.contains("show")) { if (e.key === "Escape") $("#cno").click(); if (e.key === "Enter") $("#cyes").click(); return; }
+  if (e.key === "Escape" && !open && selected.size) return clearSel();
+  if (e.key === "Delete" && !open && selected.size) return deleteReels([...selected]);
   if (e.key === "Escape") $("#lightbox").classList.remove("show");
   if (view === "gallery" && !open) return;
   if (open && (e.key === "f" || e.key === "F")) toggleFav(current, lb.list[lb.i]);
