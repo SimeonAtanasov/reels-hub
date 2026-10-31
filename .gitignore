@@ -9,6 +9,21 @@ reels/
 *.mp4
 *.webm
 *.info.json
+*.mkv
+*.m4a
+*.part
+
+# Reel data, in case --out points inside this folder
+_tmp/
+_categories.json
+hub.json
+shots.json
+shots/
+note.md
+failed.txt
+
+# Link lists
+links*.txt
 
 # OS / editor
 .DS_Store

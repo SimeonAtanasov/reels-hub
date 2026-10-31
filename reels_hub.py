@@ -576,6 +576,14 @@ aside{border-right:1px solid var(--line);display:flex;flex-direction:column;min-
 .status{font-size:12px;color:var(--muted)}
 .status.on{color:var(--warn)}
 .listtools{display:flex;gap:8px;padding:10px 12px 6px;align-items:center}
+#filters{padding:0 12px 6px;display:flex;flex-direction:column;gap:5px;border-bottom:1px solid var(--line)}
+#filters:empty{display:none}
+.frow{display:flex;flex-wrap:wrap;gap:5px;align-items:center}
+.fl{font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;width:100%}
+.chip{display:inline-flex;align-items:center;gap:5px;font-size:12px;padding:2px 9px;border-radius:14px;border:1px solid var(--line);background:var(--panel2);cursor:pointer;color:var(--muted)}
+.chip:hover{border-color:var(--accent)}
+.chip.on{background:#1f2c2b;border-color:var(--accent);color:var(--text)}
+.chip .cn{font-size:10.5px;opacity:.7}
 #search{flex:1;min-width:0;padding:6px 10px;background:var(--bg);border:1px solid var(--line);border-radius:8px}
 #list{overflow:auto;flex:1;padding:0 6px 12px}
 .group{display:flex;align-items:center;gap:4px;padding:10px 6px 4px;margin-top:4px;border-radius:6px;user-select:none}
@@ -739,6 +747,7 @@ kbd{background:var(--panel2);border:1px solid var(--line);border-bottom-width:2p
       <input id="search" placeholder="Search">
       <button class="btn small" id="addcat">+ Category</button>
     </div>
+    <div id="filters"></div>
     <div id="list"></div>
   </aside>
   <main id="main"><div class="empty">No reels yet. Paste links on the left and press Run.</div></main>
@@ -818,7 +827,28 @@ function saveState(r, now){
 }
 
 /* ---------- sidebar ---------- */
+/* filters: empty set = show all */
+let fPlat = new Set(), fCat = new Set();
+try { const f = JSON.parse(localStorage.getItem("rh-filters") || "{}"); fPlat = new Set(f.p || []); fCat = new Set(f.c || []); } catch (e) {}
+function saveFilters(){ try { localStorage.setItem("rh-filters", JSON.stringify({p: [...fPlat], c: [...fCat]})); } catch (e) {} }
+const catShown = name => !fCat.size || fCat.has(name);
+function renderFilters(){
+  const plats = [...new Set(reels.map(r => r.platform))].sort();
+  [...fPlat].forEach(p => plats.includes(p) || fPlat.delete(p));
+  [...fCat].forEach(c => (c === "" || cats.includes(c)) || fCat.delete(c));
+  const count = (pred) => reels.filter(pred).length;
+  const chip = (attr, val, label, on, n, extra="") => `<button class="chip ${on?"on":""}" ${attr}="${esc(val)}" ${extra}>${label}<span class="cn">${n}</span></button>`;
+  const active = fPlat.size + fCat.size;
+  $("#filters").innerHTML = (plats.length > 1 || fPlat.size ? `<div class="frow"><span class="fl">Source</span>${plats.map(p =>
+      chip("data-fplat", p, pbadge({platform: p}) + " " + esc(p), fPlat.has(p), count(r => r.platform === p))).join("")}</div>` : "")
+    + `<div class="frow"><span class="fl">Category</span>${[...cats, ""].map(c =>
+      chip("data-fcat", c, c ? esc(c) : "Unassigned", fCat.has(c), count(r => catOf(r) === c))).join("")}</div>`
+    + (active ? `<div class="frow"><button class="link" id="fclear">Clear filters (${active})</button></div>` : "");
+}
+
 function matches(r, q){
+  if (fPlat.size && !fPlat.has(r.platform)) return false;
+  if (fCat.size && !fCat.has(catOf(r))) return false;
   if (!q) return true;
   return [r.label, r.platform, r.caption, r.author, r.notes, ...r.transcript.map(x=>x.text), ...r.ocr.map(x=>x.text),
           ...r.state.favorites.map(f=>f.text)].join(" ").toLowerCase().includes(q);
@@ -828,10 +858,12 @@ function renderList(){
   const groups = [...cats.map(c => ({name: c, label: c})), {name: "", label: "Unassigned"}];
   filtered = [];
   let html = "";
+  renderFilters();
   groups.forEach((g, gi) => {
+    if (!catShown(g.name)) return;
     const items = reels.filter(r => catOf(r) === g.name && matches(r, q));
     filtered.push(...items);
-    if (!g.name && !items.length && cats.length && q) return;
+    if (!g.name && !items.length && cats.length && (q || fPlat.size)) return;
     const closed = collapsed.has(g.label);
     html += `<div class="group ${closed?"closed":""}" data-cat="${esc(g.name)}" data-label="${esc(g.label)}">
       <span class="gname" data-toggle><span class="caret">&#9662;</span>${esc(g.label)}</span>
@@ -866,8 +898,9 @@ function renderGallery(){
   const groups = [...cats, ""];
   let html = "";
   for (const g of groups) {
+    if (!catShown(g)) continue;
     const items = reels.filter(r => catOf(r) === g && matches(r, q));
-    if (!items.length && (!g || q)) continue;
+    if (!items.length && (!g || q || fPlat.size)) continue;
     html += `<section class="gsec"><h3>${g ? esc(g) : "Unassigned"} <span class="gcount">${items.length}</span></h3>
       <div class="ggrid">${items.length ? items.map(r => `
         <div class="gcard ${current && current.id===r.id?"active":""}" data-open="${esc(r.id)}" tabindex="0">
@@ -905,6 +938,7 @@ async function catAction(body){
   try { cats = (await api("/api/categories", body)).categories; }
   catch (e) { return alert(e.message); }
   if (body.action === "rename") reels.forEach(r => { if (r.state.category === body.name) r.state.category = body.new; });
+  if (body.action === "rename" && fCat.delete(body.name)) { fCat.add(body.new); saveFilters(); }
   if (body.action === "delete") reels.forEach(r => { if (r.state.category === body.name) r.state.category = ""; });
   renderList();
   if (current && $("#catsel")) { $("#catsel").outerHTML = catSelect(current); updateNav(); }
@@ -1075,6 +1109,9 @@ document.addEventListener("click", async e => {
   if ((el = c("[data-star]"))) return toggleFav(current, el.dataset.star);
   if ((el = c("[data-unfav]"))) return toggleFav(current, el.dataset.unfav);
   if ((el = c("[data-open]"))) return select(el.dataset.open);
+  if ((el = c("[data-fplat]"))) { const v = el.dataset.fplat; fPlat.has(v) ? fPlat.delete(v) : fPlat.add(v); saveFilters(); return renderList(); }
+  if ((el = c("[data-fcat]"))) { const v = el.dataset.fcat; fCat.has(v) ? fCat.delete(v) : fCat.add(v); saveFilters(); return renderList(); }
+  if (t.id === "fclear") { fPlat.clear(); fCat.clear(); saveFilters(); return renderList(); }
   if ((el = c("[data-mv]"))) { const [i, d] = el.dataset.mv.split(":").map(Number), favs = current.state.favorites, j = i + d;
     if (j >= 0 && j < favs.length) { favs.splice(j, 0, favs.splice(i, 1)[0]); saveState(current, true); renderFavs(current);
       const card = document.querySelector(`.fav[data-i="${j}"]`); card && card.scrollIntoView({block:"nearest", inline:"nearest"}); } return; }
