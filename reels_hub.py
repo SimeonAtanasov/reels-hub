@@ -7,7 +7,8 @@ Keep this file next to reels2notes.py (e.g. in GitHub/reels-hub) and run:
 Downloaded reels are stored in Downloads/reels (change with --out).
 It opens http://127.0.0.1:8765 in your browser.
 
-- Paste Instagram links (one per line) and press Run: reels2notes.py processes them, with a live log
+- Paste Instagram, TikTok or YouTube (incl. Shorts) links, one per line, and press Run: reels2notes.py
+  processes them, with a live log
 - Categories in the sidebar: create your own (e.g. Training), assign reels by dropdown or drag;
   reels without a category stay under Unassigned at the bottom
 - Per reel: video, caption, transcript (click a line to jump there), on-screen text, snapshots, notes
@@ -18,8 +19,9 @@ It opens http://127.0.0.1:8765 in your browser.
 Data: favorites and category live in reels/<reel>/hub.json, categories in reels/_categories.json,
 and favorites are also written into each note.md (## Favorites) for Obsidian.
 
-Obsidian: each reel gets a note in <vault>/Instagram named after the reel (caption, transcript);
-"Send to Obsidian" copies starred images to Instagram/attachments and writes them with their text.
+Obsidian: each reel gets a note in <vault>/Instagram, /TikTok or /YouTube named after the reel
+(caption, transcript); "Send to Obsidian" copies starred images to <Platform>/attachments and
+writes them with their text.
 
 Options:  --port 8765   --out PATH   --vault PATH   --no-browser
 Uses only the Python standard library. Listens on 127.0.0.1 only (not reachable from other devices).
@@ -33,7 +35,7 @@ HERE = Path(__file__).resolve().parent
 SCRIPT = HERE / "reels2notes.py"
 OUT = Path.home() / "Downloads" / "reels"   # downloaded videos, snapshots and notes
 VAULT = Path.home() / "OneDrive" / "Documents" / "Obsidian Vault"   # Obsidian vault
-VAULT_DIR = "Instagram"                                             # folder inside the vault
+PLATFORM_DIRS = ("Instagram", "TikTok", "YouTube")                  # one vault folder per platform
 FAV_START, FAV_END = "<!-- reels-hub:favorites start -->", "<!-- reels-hub:favorites end -->"
 
 JOB = {"running": False, "log": [], "started": None, "finished": None, "urls": []}
@@ -90,12 +92,15 @@ def parse_note(folder):
         notes = ""
 
     shots = sorted(p.name for p in (folder / "shots").glob("*.jpg")) if (folder / "shots").exists() else []
-    videos = [p.name for p in folder.glob("video.*") if p.suffix not in (".json", ".part")]
+    videos = [p.name for p in folder.glob("video.*") if p.suffix.lower() in (".mp4", ".webm", ".mkv", ".mov", ".m4v")]
+    url = meta.get("source", "")
+    platform = meta.get("platform") or platform_of(url)
     if caption == "_none_":
         caption = ""
-    label = (caption.splitlines()[0] if caption else title)[:80]
+    generic = not title or title.startswith("Video by") or title.startswith("Post by") or title in folder.name
+    label = ((caption.splitlines()[0] if caption else title) if generic else title)[:80]
     return {
-        "id": folder.name, "title": title, "label": label or folder.name,
+        "id": folder.name, "title": title, "label": label or folder.name, "platform": platform,
         "url": meta.get("source", ""), "author": meta.get("author", ""),
         "date": meta.get("date", ""), "duration": meta.get("duration_s", ""),
         "caption": caption, "lang": lang.group(1) if lang else "",
@@ -147,14 +152,29 @@ def list_reels():
     return sorted(items, key=lambda r: (r["date"], r["id"]), reverse=True)
 
 
+def platform_of(url):
+    u = (url or "").lower()
+    if "tiktok.com" in u:
+        return "TikTok"
+    if "youtube.com" in u or "youtu.be" in u:
+        return "YouTube"
+    if "instagram.com" in u:
+        return "Instagram"
+    return "Web"
+
+
 # ---------------------------------------------------------------- Obsidian
+def vault_dir(platform):
+    return platform if platform in PLATFORM_DIRS else "Videos"
+
+
 def vault_ok():
     return VAULT.is_dir()
 
 
-def obsidian_uri(name):
+def obsidian_uri(folder_name, name):
     from urllib.parse import quote
-    return f"obsidian://open?vault={quote(VAULT.name)}&file={quote(VAULT_DIR + '/' + name)}"
+    return f"obsidian://open?vault={quote(VAULT.name)}&file={quote(folder_name + '/' + name)}"
 
 
 def clean_name(text, fallback):
@@ -164,11 +184,12 @@ def clean_name(text, fallback):
 
 
 def ensure_vault_note(folder, r):
-    """Create Instagram/<reel name>.md in the vault once (caption + transcript); never overwrite it."""
+    """Create <Platform>/<reel name>.md in the vault once (caption + transcript); never overwrite it."""
     if not vault_ok():
         return {"error": f"Vault not found: {VAULT}"}
     state = read_state(folder)
-    vdir = VAULT / VAULT_DIR
+    dname = vault_dir(r["platform"])
+    vdir = VAULT / dname
     name = state["note_name"]
     if not name:
         name = clean_name(r["label"], r["id"])
@@ -180,7 +201,7 @@ def ensure_vault_note(folder, r):
     if not path.exists():
         vdir.mkdir(parents=True, exist_ok=True)
         path.write_text(vault_note_text(r, state), encoding="utf-8")
-    return {"name": name, "uri": obsidian_uri(name), "sent": state["sent"]}
+    return {"name": name, "folder": dname, "uri": obsidian_uri(dname, name), "sent": state["sent"]}
 
 
 def vault_note_text(r, state):
@@ -188,9 +209,9 @@ def vault_note_text(r, state):
     lines = ["---",
              f"source: {r['url']}", f"author: {yaml(r['author'])}", f"date: {r['date']}",
              f"category: {yaml(state['category'])}", f"reel_id: {r['id']}",
-             "tags: [instagram, reel]", "---",
+             f"platform: {r['platform']}", f"tags: [{r['platform'].lower()}, reel]", "---",
              f"# {r['label']}", "",
-             f"[Open on Instagram]({r['url']})" if r["url"] else "", "",
+             f"[Open on {r['platform']}]({r['url']})" if r["url"] else "", "",
              "## Caption", r["caption"] or "_none_", "",
              f"## Transcript{' (' + r['lang'] + ')' if r['lang'] else ''}"]
     lines += [f"- **{mmss(x['t'])}** {x['text']}" for x in r["transcript"]] or ["_no speech detected_"]
@@ -212,9 +233,11 @@ def send_to_obsidian(reel_id):
     if not r:
         raise ValueError("unknown reel")
     info = ensure_vault_note(folder, r)
+    if "error" in info:
+        raise ValueError(info["error"])
     state = read_state(folder)
     favs = state["favorites"]
-    att_rel = f"{VAULT_DIR}/attachments/{reel_id}"
+    att_rel = f"{info['folder']}/attachments/{reel_id}"
     att = VAULT / att_rel
     att.mkdir(parents=True, exist_ok=True)
     keep = set()
@@ -237,7 +260,7 @@ def send_to_obsidian(reel_id):
         block = ["_No starred images._"]
     block = "\n".join(block).rstrip("\n")
 
-    path = VAULT / VAULT_DIR / f"{info['name']}.md"
+    path = VAULT / info["folder"] / f"{info['name']}.md"
     with DATA_LOCK:
         text = path.read_text(encoding="utf-8")
         if FAV_START in text and FAV_END in text:
@@ -249,7 +272,7 @@ def send_to_obsidian(reel_id):
         text = re.sub(r'^category:.*$', f'category: "{cat}"', text, count=1, flags=re.M)
         path.write_text(text, encoding="utf-8")
         st = read_state(folder); st["sent"] = time.strftime("%Y-%m-%d %H:%M"); write_state(folder, st)
-    return {"name": info["name"], "uri": obsidian_uri(info["name"]), "count": len(favs), "sent": st["sent"]}
+    return {"name": info["name"], "uri": info["uri"], "count": len(favs), "sent": st["sent"]}
 
 
 def safe_path(rel):
@@ -432,7 +455,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
         elif path == "/api/reels":
             self.send_json({"reels": list_reels(), "categories": read_cats(),
-                            "vault": {"path": str(VAULT / VAULT_DIR), "ok": vault_ok()}})
+                            "vault": {"path": str(VAULT), "ok": vault_ok()}})
         elif path == "/api/status":
             self.send_json({"running": JOB["running"], "log": JOB["log"][-300:], "urls": JOB["urls"],
                             "finished": JOB["finished"]})
@@ -605,7 +628,7 @@ textarea.notes{width:100%;min-height:200px;background:var(--bg);border:1px solid
 .fav.dragging{opacity:.4}
 .fav.over{outline:2px solid var(--accent)}
 .favimg{position:relative;cursor:grab}
-.favimg img{width:100%;display:block;aspect-ratio:9/16;object-fit:cover}
+.favimg img{width:100%;display:block;max-height:440px;object-fit:contain;background:#000}
 .favimg .num{position:absolute;top:6px;left:6px;background:rgba(0,0,0,.7);border-radius:10px;padding:0 7px;font-size:11px}
 .favimg .tb{position:absolute;bottom:6px;left:6px;background:rgba(0,0,0,.7);color:var(--accent);border-radius:6px;padding:0 6px;font-size:11px;font-variant-numeric:tabular-nums}
 .favimg .rm{position:absolute;top:4px;right:4px;background:rgba(0,0,0,.7);color:#fff;opacity:.85}
@@ -622,6 +645,7 @@ textarea.notes{width:100%;min-height:200px;background:var(--bg);border:1px solid
 .favzone.full .shots{grid-template-columns:repeat(auto-fill,minmax(90px,1fr))}
 .favzone.full{padding:20px 24px 40px}
 #viewbtn.on{border-color:var(--accent);color:var(--accent)}
+.pb{display:inline-block;font-size:9.5px;font-weight:700;letter-spacing:.4px;padding:0 4px;border-radius:4px;color:var(--pc);border:1px solid var(--pc);line-height:14px;vertical-align:1px}
 .gallery{padding:16px 20px 40px}
 .gsec{margin-bottom:26px}
 .gsec h3{font-size:13px;font-weight:600;letter-spacing:.6px;text-transform:uppercase;color:var(--muted);margin:0 0 10px;display:flex;gap:8px;align-items:center}
@@ -705,7 +729,7 @@ kbd{background:var(--panel2);border:1px solid var(--line);border-bottom-width:2p
 <div class="layout">
   <aside>
     <div class="runbox">
-      <textarea id="urls" placeholder="Paste Instagram links, one per line"></textarea>
+      <textarea id="urls" placeholder="Paste Instagram, TikTok or YouTube links, one per line"></textarea>
       <div class="row">
         <button class="btn primary" id="run">Run</button>
         <span class="status" id="status">Idle</span>
@@ -754,6 +778,8 @@ try { collapsed = new Set(JSON.parse(localStorage.getItem("rh-collapsed") || "[]
 const media = (id, f) => `/media/${encodeURIComponent(id)}/${f.split("/").map(encodeURIComponent).join("/")}`;
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const mmss = t => { t = Math.round(t || 0); return `${String(Math.floor(t/60)).padStart(2,"0")}:${String(t%60).padStart(2,"0")}`; };
+const PB = {Instagram: ["IG", "#e1306c"], TikTok: ["TT", "#25f4ee"], YouTube: ["YT", "#ff4e45"]};
+const pbadge = r => { const [t, c] = PB[r.platform] || [String(r.platform||"").slice(0,3), "#8b949b"]; return `<span class="pb" style="--pc:${c}" title="${esc(r.platform)}">${t}</span>`; };
 const catOf = r => cats.includes(r.state.category) ? r.state.category : "";
 const isFav = (r, shot) => r.state.favorites.some(f => f.shot === shot);
 
@@ -780,8 +806,8 @@ async function loadReels(keepId){
   $("#count").textContent = reels.length ? `${reels.length} reel${reels.length>1?"s":""}` : "";
   renderList();
   const id = keepId || decodeURIComponent(location.hash.slice(1)) || (filtered[0] && filtered[0].id);
-  if (id && reels.some(r => r.id === id)) select(id, false);
-  else if (filtered[0]) select(filtered[0].id, false);
+  if (id && reels.some(r => r.id === id)) select(id, false, true);
+  else if (filtered[0]) select(filtered[0].id, false, true);
 }
 
 const saveTimers = {};
@@ -794,7 +820,7 @@ function saveState(r, now){
 /* ---------- sidebar ---------- */
 function matches(r, q){
   if (!q) return true;
-  return [r.label, r.caption, r.author, r.notes, ...r.transcript.map(x=>x.text), ...r.ocr.map(x=>x.text),
+  return [r.label, r.platform, r.caption, r.author, r.notes, ...r.transcript.map(x=>x.text), ...r.ocr.map(x=>x.text),
           ...r.state.favorites.map(f=>f.text)].join(" ").toLowerCase().includes(q);
 }
 function renderList(){
@@ -819,7 +845,7 @@ function renderList(){
       <div class="item ${current && current.id===r.id?"active":""}" data-id="${esc(r.id)}" draggable="true">
         ${r.shots[0] ? `<img loading="lazy" src="${media(r.id,"shots/"+r.shots[0])}" alt="">` : `<img alt="">`}
         <div><div class="t">${esc(r.label)}</div>
-        <div class="s">${esc(r.author)} · ${esc(r.date)}${r.state.favorites.length?` · <span class="fc">&#9733; ${r.state.favorites.length}</span>`:""}</div></div>
+        <div class="s">${pbadge(r)} ${esc(r.author)} · ${esc(r.date)}${r.state.favorites.length?` · <span class="fc">&#9733; ${r.state.favorites.length}</span>`:""}</div></div>
       </div>`).join("") : `<div class="gempty">${g.name ? "Drag reels here or pick this category on a reel" : "Nothing here"}</div>`;
   });
   $("#list").innerHTML = html || `<div class="empty">No matches</div>`;
@@ -849,14 +875,18 @@ function renderGallery(){
             ${r.state.favorites.length ? `<span class="gstar">&#9733; ${r.state.favorites.length}</span>` : ""}
             ${r.duration ? `<span class="gdur">${mmss(+r.duration)}</span>` : ""}</div>
           <div class="gtitle">${esc(r.label)}</div>
-          <div class="s">${esc(r.author)} · ${esc(r.date)}</div>
+          <div class="s">${pbadge(r)} ${esc(r.author)} · ${esc(r.date)}</div>
         </div>`).join("") : `<div class="meta">Empty: drag reels onto this category in the sidebar, or pick it on a reel.</div>`}</div></section>`;
   }
   $("#main").innerHTML = `<div class="gallery">${html || `<div class="empty">No reels match.</div>`}</div>`;
 }
 
-function select(id, scroll=true){
+function select(id, scroll=true, keepView=false){
   const r = reels.find(x => x.id === id); if (!r) return;
+  if (keepView && view === "gallery") {   // remember the reel without leaving the gallery
+    current = r; document.querySelectorAll(".item").forEach(el => el.classList.toggle("active", el.dataset.id === id));
+    return renderGallery();
+  }
   current = r; history.replaceState(null, "", "#" + encodeURIComponent(id));
   document.querySelectorAll(".item").forEach(el => el.classList.toggle("active", el.dataset.id === id));
   if (scroll) { const el = document.querySelector(`.item[data-id="${CSS.escape(id)}"]`); el && el.scrollIntoView({block:"nearest"}); }
@@ -903,7 +933,7 @@ function render(r){
         <button class="btn" id="next">Next &rarr;</button>
       </div>
       <label class="catsel">Category ${catSelect(r)}</label>
-      <div class="meta">${esc(r.author)} · ${esc(r.date)}${r.duration?` · ${Math.round(r.duration)}s`:""}${r.url?` · <a href="${esc(r.url)}" target="_blank" rel="noopener">Open on Instagram</a>`:""}</div>
+      <div class="meta">${esc(r.author)} · ${esc(r.date)}${r.duration?` · ${Math.round(r.duration)}s`:""}${r.url?` · <a href="${esc(r.url)}" target="_blank" rel="noopener">Open on ${esc(r.platform)}</a>`:""}</div>
       <div class="meta">${r.obsidian && r.obsidian.uri ? `Obsidian note: <a href="${esc(r.obsidian.uri)}">${esc(r.obsidian.name)}</a>` : (r.obsidian && r.obsidian.error ? esc(r.obsidian.error) : "")}</div>
     </div>
     <div class="right">
@@ -1170,11 +1200,11 @@ async function refreshQuiet(){
     const known = new Map(reels.map(r => [r.id, r]));
     reels = j.reels.map(r => known.get(r.id) || r);
     $("#count").textContent = `${reels.length} reels`; renderList();
-    if (!current && reels[0]) select(reels[0].id);
+    if (!current && reels[0]) select(reels[0].id, true, true);
   }
 }
 
-loadReels().then(() => { if (view === "gallery") setView("gallery"); poll(); });
+loadReels().then(() => { setView(view); poll(); });
 </script>
 </body>
 </html>
@@ -1186,7 +1216,7 @@ def main():
     ap = argparse.ArgumentParser(description="Local web app for reels2notes.py")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--out", default=str(OUT))
-    ap.add_argument("--vault", default=str(VAULT), help="Obsidian vault folder (notes go into its Instagram folder)")
+    ap.add_argument("--vault", default=str(VAULT), help="Obsidian vault folder (notes go into Instagram/TikTok/YouTube folders)")
     ap.add_argument("--no-browser", action="store_true")
     args = ap.parse_args()
     OUT = Path(args.out).resolve()

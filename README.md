@@ -1,6 +1,6 @@
 # Reels Hub
 
-Turn Instagram reels (or anything yt-dlp can download) into searchable, printable notes - built for saving training videos like kettlebell drills.
+Turn Instagram reels, TikTok videos and YouTube videos/Shorts (or anything yt-dlp can download) into searchable, printable notes - built for saving training videos like kettlebell drills.
 
 For each reel it saves:
 - the video and caption
@@ -42,13 +42,13 @@ python reels2notes.py -f links.txt
 | What | Default location | Change with |
 |---|---|---|
 | Videos, snapshots, notes, favorites, categories | `Downloads/reels` | `--out PATH` |
-| Obsidian notes | `<vault>/Instagram` (one note per reel, images in `Instagram/attachments`) | `--vault PATH` |
+| Obsidian notes | `<vault>/Instagram`, `/TikTok`, `/YouTube` (one note per video, images in `<Platform>/attachments`) | `--vault PATH` |
 
 The default vault path is `Documents/Obsidian Vault` under OneDrive. If it is not found, Obsidian sync is switched off.
 
 ## If a download needs login
 
-Public reels usually download without login. If one fails, export your Instagram cookies with the "Get cookies.txt LOCALLY" browser extension and run:
+Public videos usually download without login. If one fails, export that site's cookies with the "Get cookies.txt LOCALLY" browser extension and run:
 
 ```
 python reels2notes.py --cookies cookies.txt <link>
@@ -59,5 +59,6 @@ Keep `cookies.txt` private and delete it afterwards. It is excluded by `.gitigno
 ## Notes
 
 - Everything runs on your own machine. The app listens on 127.0.0.1 only.
-- For personal reference only: respect creators' rights and Instagram's terms.
-- Instagram changes often. If downloads break, update yt-dlp: `python -m yt_dlp -U`
+- Long videos: snapshots are capped at 60 per video (`--max-shots`), and transcription on CPU takes roughly a quarter to a half of the video's length.
+- For personal reference only: respect creators' rights and each platform's terms.
+- The sites change often. If downloads break, update yt-dlp: `python -m yt_dlp -U`
