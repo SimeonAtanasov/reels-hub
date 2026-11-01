@@ -15,6 +15,8 @@ reels/
 
 # Reel data, in case --out points inside this folder
 _tmp/
+_inbox/
+_trash/
 _categories.json
 hub.json
 shots.json
@@ -34,3 +36,12 @@ Thumbs.db
 PROMPT.md
 CLAUDE.md
 to-do/
+
+# Sharing inbox (cloud/): Cloudflare settings stay on this PC. wrangler.toml holds the project name
+# (the private address) and the database id; .dev.vars local test settings; DEPLOY.md the setup steps
+# with the real names and emails.
+cloud/wrangler.toml
+cloud/.dev.vars
+cloud/node_modules/
+cloud/.wrangler/
+DEPLOY.md

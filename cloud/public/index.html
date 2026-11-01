@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Reels Hub inbox</title>
+<style>
+:root{--bg:#0f1214;--panel:#171b1e;--line:#2a3035;--text:#e6e8ea;--muted:#8b949b;--accent:#5fd0c4;--warn:#f0b35a}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{width:min(520px,100%);background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:22px 24px}
+h1{font-size:18px;margin:0 0 10px}
+p{margin:0 0 10px;color:var(--muted)}
+#who{color:var(--accent);font-weight:600}
+#err{color:var(--warn)}
+</style>
+</head>
+<body>
+<main>
+  <h1>Reels Hub inbox</h1>
+  <p id="state">Checking...</p>
+  <p>Shares wait here until the other laptop's Reels Hub picks them up, then they are deleted. There is nothing else to do on this page.</p>
+  <p id="err" hidden></p>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>

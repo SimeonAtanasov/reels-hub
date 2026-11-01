@@ -1,0 +1,13 @@
+# Cloudflare Pages project for the Reels Hub inbox, read by wrangler (deploy, secrets, migrations).
+# Copy this file to wrangler.toml (git-ignored: the project name is the private address) and fill in
+# the project name and the database_id. Only public/ and functions/ are published.
+name = "rh-CHANGE-ME"
+pages_build_output_dir = "public"
+compatibility_date = "2026-09-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "reels-hub"
+# Replace with the id printed by: npx wrangler d1 create reels-hub --jurisdiction eu
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"

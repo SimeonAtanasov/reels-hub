@@ -539,6 +539,7 @@ def _process(url, args, i=1, n=1, stats=None):
             print(f"  already downloaded, making a new version: {workdir.name}")
         elif (workdir / "note.md").exists() and not args.redo:
             print("  already done, skipping (use New version or Re-process to run it again)")
+            print("@@DONE " + json.dumps({"url": url, "folder": workdir.name, "skipped": True}), flush=True)
             return
         else:
             print("  already downloaded, re-processing" if args.redo else "  already downloaded, resuming")
@@ -577,6 +578,8 @@ def _process(url, args, i=1, n=1, stats=None):
         ocr_lines = ocr(shots[::step], prog, args.out)
     note = write_note(workdir, url, info, shots, transcript, lang, ocr_lines, args.owner)
     print(f"  done in {fmt_dur(time.time() - prog.t0)} -> {note}")
+    # for Reels Hub: which folder this link went to (an Add from the inbox fills in that reel next)
+    print("@@DONE " + json.dumps({"url": url, "folder": workdir.name}), flush=True)
 
 
 def main():

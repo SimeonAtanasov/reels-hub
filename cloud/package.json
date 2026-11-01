@@ -1,0 +1,15 @@
+{
+  "name": "reels-hub-inbox",
+  "version": "1.0.0",
+  "description": "Reels Hub sharing inbox: Cloudflare Pages Functions + D1 behind Cloudflare Access.",
+  "scripts": {
+    "dev": "wrangler pages dev --port 8788 --ip 127.0.0.1",
+    "db:local": "wrangler d1 migrations apply DB --local",
+    "db:remote": "wrangler d1 migrations apply DB --remote",
+    "deploy": "wrangler pages deploy --branch main --commit-dirty=true"
+  },
+  "devDependencies": {
+    "wrangler": "^4.156.0"
+  },
+  "private": true
+}

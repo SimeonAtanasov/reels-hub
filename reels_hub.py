@@ -24,10 +24,16 @@ Obsidian: each reel gets a note in <vault>/Instagram, /TikTok, /YouTube or /X na
 (caption, transcript); "Send to Obsidian" copies starred images to 910_Attachments/ReelsHub and
 writes them with their text. Notes can be moved or renamed in the vault; the app finds them by their id line.
 
+Sharing (optional): "Share with <name>" sends the link, your favorites (times, text, the images you
+edited), My notes and the category to a private Cloudflare inbox (the cloud/ folder). The other laptop
+picks it up, shows it in its Inbox, and Add downloads and processes the video there. Settings holds the
+inbox address and this laptop's service token (in the ReelsHub folder in %APPDATA%, never here).
+
 Options:  --port 8765   --out PATH   --vault PATH   --no-browser
 Uses only the Python standard library. Listens on 127.0.0.1 only (not reachable from other devices).
 """
-import argparse, json, mimetypes, os, re, subprocess, sys, threading, time, webbrowser
+import argparse, base64, json, mimetypes, os, re, shutil, subprocess, sys, tempfile, threading, time, webbrowser
+import urllib.error, urllib.request
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse, unquote
@@ -102,35 +108,124 @@ def save_config(body):
             raise ValueError("That Obsidian vault folder doesn't exist - check the path, or leave it empty")
         if not (vp / ".obsidian").is_dir():
             warn = "Note: that folder has no .obsidian folder - make sure it's the vault itself"
-    cfg = {"name": name, "person": person_id(name), "out": str(out_p.resolve()), "vault": vault,
-           "saved": time.strftime("%Y-%m-%d %H:%M")}
-    p = config_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write(p, json.dumps(cfg, indent=1, ensure_ascii=False))
-    apply_config(cfg)
+    with CONFIG_LOCK:
+        old = load_config() or {}
+        cloud, changed = cloud_from_form(body, old.get("cloud") or {})
+        cfg = {"name": name, "person": person_id(name), "out": str(out_p.resolve()), "vault": vault,
+               "saved": time.strftime("%Y-%m-%d %H:%M")}
+        if "can_delete" in old:
+            cfg["can_delete"] = old["can_delete"]        # set by the Cloudflare inbox (PEOPLE), not by this form
+        if cloud:
+            cfg["cloud"] = cloud
+        p = config_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(p, json.dumps(cfg, indent=1, ensure_ascii=False))
+        apply_config(cfg)
     MISS.clear()
-    return {"config": cfg, "warning": warn}
+    test = None
+    if cloud and (changed or not cloud.get("person")):  # new address or token: ask the inbox who this laptop is
+        try:
+            remember_cloud(cloud_whoami())
+            test = {"ok": True}
+        except CloudError as e:
+            test = {"ok": False, "error": str(e)}
+    with INBOX_LOCK:
+        INBOX.update(error="", whoami_at=time.time() if test and test["ok"] else 0, force=bool(cloud))
+    INBOX_WAKE.set()
+    return {"config": public_config(), "warning": warn, "cloud_test": test}
+
+
+def cloud_from_form(body, old):
+    """Sharing settings from the Settings form: inbox address, Client ID, Client Secret.
+    An empty secret keeps the saved one; all three empty switches sharing off."""
+    url = str(body.get("cloud_url") or "").strip().strip('"')
+    cid = str(body.get("cloud_id") or "").strip().strip('"')
+    sec = str(body.get("cloud_secret") or "").strip().strip('"')
+    pasted = f"{cid}\n{sec}"                      # the dashboard's "CF-Access-Client-Id: ..." lines work too
+    m = re.search(r"(?im)cf-access-client-id\s*:\s*(\S+)", pasted)
+    cid = m.group(1) if m else cid
+    m = re.search(r"(?im)cf-access-client-secret\s*:\s*(\S+)", pasted)
+    sec = m.group(1) if m else sec
+    if not (url or cid or sec):
+        return None, bool(old)
+    if not re.match(r"^[a-z][a-z0-9+.-]*://", url, re.I):
+        url = "https://" + url
+    u = urlparse(url)
+    if not cloud_url_ok(url) or "@" in u.netloc:
+        raise ValueError("The Cloudflare address must start with https://, for example https://name.pages.dev")
+    url = f"{u.scheme}://{u.netloc}"
+    if not cid:
+        raise ValueError("Please enter this laptop's Client ID (from the service token in Cloudflare)")
+    if not sec and cid == old.get("id"):
+        sec = old.get("secret", "")
+    if not sec:
+        raise ValueError("Please enter this laptop's Client Secret (from the service token in Cloudflare)")
+    if len(cid) > 200 or len(sec) > 500 or re.search(r"\s", cid + sec):
+        raise ValueError("The Client ID or Client Secret contains spaces: copy it again from Cloudflare")
+    new = {"url": url, "id": cid, "secret": sec}
+    changed = (url, cid, sec) != (old.get("url"), old.get("id"), old.get("secret"))
+    if not changed:                               # keep what the inbox said last time
+        new.update({k: old[k] for k in ("person", "name", "people", "checked") if k in old})
+    return new, changed
+
+
+def public_config():
+    """The settings for the page: everything except the Client Secret."""
+    c = {k: v for k, v in CONFIG.items() if k != "cloud"}
+    cl = CONFIG.get("cloud")
+    if isinstance(cl, dict):
+        c["cloud"] = {**{k: v for k, v in cl.items() if k != "secret"}, "has_secret": bool(cl.get("secret"))}
+    return c
 
 
 def config_info():
-    return {"configured": bool(CONFIG.get("name")), "config": CONFIG, "defaults": default_config(),
+    return {"configured": bool(CONFIG.get("name")), "config": public_config(), "defaults": default_config(),
             "path": str(config_path()), "effective": {"out": str(OUT), "vault": str(VAULT) if vault_ok() else ""},
             "overrides": sorted(OVERRIDES)}
+
+
+def can_delete():
+    """Deleting videos is off for a person whose PEOPLE entry in the Cloudflare inbox says "delete": false
+    (remembered in config.json, so it stays off while offline or without a token)."""
+    return CONFIG.get("can_delete") is not False
 PLATFORM_DIRS = ("Instagram", "TikTok", "YouTube", "X")             # one vault folder per platform
 FAV_START, FAV_END = "<!-- reels-hub:favorites start -->", "<!-- reels-hub:favorites end -->"
 
-JOB = {"running": False, "log": [], "started": None, "finished": None, "urls": [], "progress": None, "busy": set()}
+JOB = {"running": False, "log": [], "started": None, "finished": None, "urls": [], "progress": None, "busy": set(),
+       "share": None}                    # share: id of the inbox item being added
 JOB_LOCK = threading.Lock()
 DATA_LOCK = threading.RLock()            # re-entrant: helpers that already hold it can call each other
 PORT = 8765
 NOTES_S, NOTES_E = "<!-- reels-hub:notes start -->", "<!-- reels-hub:notes end -->"
 LFAV_S, LFAV_E = "<!-- reels-hub:local-favorites start -->", "<!-- reels-hub:local-favorites end -->"
+VIDEO_EXT = (".mp4", ".webm", ".mkv", ".mov", ".m4v")
+CONFIG_LOCK = threading.RLock()          # config.json is written by Settings and by the inbox worker
+
+# Sharing through the Cloudflare inbox (see the "sharing" section)
+SHARE_IMG_MAX = 1_300_000                # bytes per edited image sent (the inbox takes about 1.35 MB)
+SHARE_FAVS_MAX, SHARE_IMGS_MAX = 200, 40  # per video: favorites, edited images (the inbox's limits)
+PLATFORMS = ("Instagram", "TikTok", "YouTube", "X", "Web")
+PICKUP_EVERY = 90                        # seconds between inbox checks while the app runs
+WHOAMI_EVERY = 1800                      # how often to ask the inbox again who this laptop is
+SHARE_ID_RE = re.compile(r"[A-Za-z0-9-]{8,64}")
+INBOX = {"checked": "", "error": "", "busy": False, "queue": [], "adding": None, "errors": {}, "force": True,
+         "whoami_at": 0.0, "last": None, "partial": {}}   # partial: share id -> reel downloaded but not filled in
+INBOX_LOCK = threading.RLock()
+INBOX_WAKE = threading.Event()
+CHANGED = {"seq": 0, "list": []}         # reels an inbox Add filled in [{seq, folder}]: the page reloads them
+BOOT = os.urandom(6).hex()               # a new count each start: an open page notices the restart
+
+
+def mark_changed(name):
+    with INBOX_LOCK:
+        CHANGED["seq"] += 1
+        CHANGED["list"] = CHANGED["list"][-49:] + [{"seq": CHANGED["seq"], "folder": name}]
 
 
 def busy_check(rid):
-    """Refuse changes to a reel while a run is replacing its transcript and snapshots."""
+    """Refuse changes to a reel while a run is replacing its transcript and snapshots (or filling in a share)."""
     if JOB["running"] and rid in JOB.get("busy", ()):
-        raise ValueError("This video is being re-processed - wait until the run finishes")
+        raise ValueError("This video is being processed - wait until the run finishes")
 
 
 def atomic_write(path, text):
@@ -276,7 +371,13 @@ def capture_shot(reel_id, t):
     if not (folder / "note.md").exists():
         raise ValueError("unknown reel")
     busy_check(folder.name)
-    vids = [p for p in folder.glob("video.*") if p.suffix.lower() in (".mp4", ".webm", ".mkv", ".mov", ".m4v")]
+    return _capture(folder, t)
+
+
+def _capture(folder, t, manual=True):
+    """Grab the frame at t into shots/ (or reuse a snapshot already within 0.05 s of it).
+    manual=False: a favorite re-captured from a share, not marked as taken by hand."""
+    vids = [p for p in folder.glob("video.*") if p.suffix.lower() in VIDEO_EXT]
     if not vids:
         raise ValueError("no video file")
     t = max(0.0, float(t))
@@ -303,8 +404,9 @@ def capture_shot(reel_id, t):
             d = {}
         d[name] = round(t, 3)
         atomic_write(sj, json.dumps(d, indent=1))
-        man = manual_shots(folder) + [name]
-        atomic_write((folder / "shots_manual.json"), json.dumps(man))
+        if manual:
+            man = manual_shots(folder) + [name]
+            atomic_write((folder / "shots_manual.json"), json.dumps(man))
         note = folder / "note.md"                        # list it in the note's Snapshots section too
         lines = note.read_text(encoding="utf-8", errors="replace").split("\n")
         emb = [i for i, l in enumerate(lines) if l.startswith(f"![[{folder.name}/shots/")]
@@ -337,14 +439,17 @@ def read_state(folder):
         except (ValueError, OSError):
             s, bad = {}, True                     # unreadable: never treat it as "no note yet"
     out = {"category": s.get("category", "") or "", "favorites": s.get("favorites", []) or [],
-           "note_name": s.get("note_name", "") or "", "note_path": s.get("note_path", "") or "", "sent": s.get("sent", "") or ""}
+           "note_name": s.get("note_name", "") or "", "note_path": s.get("note_path", "") or "", "sent": s.get("sent", "") or "",
+           # sharing: who shared this video with you {person, name, at}; whom you shared it with [{to, name, at}]
+           "shared_by": s["shared_by"] if isinstance(s.get("shared_by"), dict) else None,
+           "shared": [x for x in s["shared"] if isinstance(x, dict)][-10:] if isinstance(s.get("shared"), list) else []}
     if bad:
         out["_bad"] = True
     return out
 
 
 def write_state(folder, state):
-    state = {k: v for k, v in state.items() if not k.startswith("_")}
+    state = {k: v for k, v in state.items() if not k.startswith("_") and not (k in ("shared_by", "shared") and not v)}
     atomic_write(folder / "hub.json", json.dumps(state, indent=1, ensure_ascii=False))
 
 
@@ -475,6 +580,10 @@ def _ensure_vault_note(folder, r):
     if not rel:
         if state.get("note_path") or state["note_name"]:
             return {"missing": True, "error": "Obsidian note not found (deleted?) - Send to Obsidian creates a new one"}
+        with INBOX_LOCK:
+            waiting = folder.name in INBOX["partial"].values()       # downloaded, fill-in to be tried again
+        if waiting or (JOB["running"] and JOB.get("share") and r.get("url") in (JOB.get("urls") or [])):
+            return {"pending": True}       # a video being added from the inbox: its note waits for the share's notes
         dname = vault_dir(r["platform"])
         base = NOTE_PREFIX.get(r["platform"], "") + clean_name(r["label"], r["id"]) + (f" (v{r['version']})" if r["version"] > 1 else "")
         name, k = base, 2
@@ -565,6 +674,8 @@ def send_to_obsidian(reel_id):
             st = read_state(folder); st["note_path"] = ""; st["note_name"] = ""; write_state(folder, st)
         MISS.pop(reel_id, None)
         info = ensure_vault_note(folder, r)
+    if info.get("pending"):
+        raise ValueError("This video is still being added from the inbox - send it when it is ready")
     if "error" in info:
         raise ValueError(info["error"])
     state = read_state(folder)
@@ -664,9 +775,22 @@ def mmss(t):
 
 
 # ---------------------------------------------------------------- saving
-def save_notes(reel_id, notes):
+def _share_guard(old, page_at):
+    """A page that still shows a reel as it was before a share filled it in must not overwrite it."""
+    sb = old.get("shared_by")
+    if sb and str(sb.get("at") or "") != str(page_at or ""):
+        raise ValueError("This video was just filled in from a share: it reloads now, then make your change again")
+
+
+def save_notes(reel_id, notes, page_at=None):
     folder = reel_dir(reel_id)
     busy_check(folder.name)
+    with DATA_LOCK:
+        _share_guard(read_state(folder), page_at)
+        _write_notes(folder, notes)
+
+
+def _write_notes(folder, notes):
     body = str(notes).replace(NOTES_E, "").strip()
     with DATA_LOCK:
         note = folder / "note.md"
@@ -699,9 +823,12 @@ def save_state(reel_id, state):
             favs.append({"shot": shot, "text": str(f.get("text", ""))[:2000],
                          "corrected": bool(f.get("corrected"))})
     with DATA_LOCK:
-        old = read_state(folder)                     # keep server-owned fields (vault note name, last send)
+        old = read_state(folder)                     # keep server-owned fields (vault note name, last send, sharing)
+        page_sb = state.get("shared_by")
+        _share_guard(old, page_sb.get("at") if isinstance(page_sb, dict) else None)
         clean = {"category": str(state.get("category", ""))[:100], "favorites": favs,
-                 "note_name": old["note_name"], "note_path": old["note_path"], "sent": old["sent"]}
+                 "note_name": old["note_name"], "note_path": old["note_path"], "sent": old["sent"],
+                 "shared_by": old["shared_by"], "shared": old["shared"]}
         write_state(folder, clean)
         write_note_favorites(folder, favs)
     return clean
@@ -891,7 +1018,8 @@ def _unique(dest):
 
 def delete_reels(ids, with_obsidian):
     """Move reels to <out>/_trash (and optionally their vault notes to Obsidian's .trash)."""
-    import shutil
+    if not can_delete():
+        raise PermissionError("Deleting videos is turned off for you on this laptop (set in the Cloudflare inbox)")
     if JOB["running"]:
         raise ValueError("Wait for the current run to finish before deleting")
     done, errors = [], []
@@ -967,6 +1095,671 @@ def change_cats(body):
         return cats
 
 
+# ---------------------------------------------------------------- sharing (Cloudflare inbox)
+# "Share with <name>" sends the link, the favorites (time, text, Corrected mark, and the image only where you
+# edited it), My notes and the category to the private Cloudflare inbox (cloud/ in this folder). The other
+# laptop's Reels Hub picks it up into <reels>/_inbox (and deletes it from Cloudflare), shows it in its Inbox,
+# and Add downloads and processes the video on that laptop, re-captures the favorites at the same times and
+# fills in the rest. The video itself never travels. Each laptop signs in with its own Access service token.
+class CloudError(ValueError):
+    def __init__(self, msg, fatal=True):           # fatal: the inbox can't be used right now (offline, token)
+        super().__init__(msg)
+        self.fatal = fatal
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Access answers a refused token with a redirect to its login page: report it instead of following it."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def cloud_url_ok(url):
+    u = urlparse(url)
+    if u.scheme == "https" and u.hostname:
+        return True
+    return u.scheme == "http" and u.hostname in ("127.0.0.1", "localhost")    # the workspace tests only
+
+
+def cloud_settings(c=None):
+    c = CONFIG.get("cloud") if c is None else c
+    return c if isinstance(c, dict) and c.get("url") and c.get("id") and c.get("secret") else None
+
+
+def cloud_call(method, path, body=None, c=None, raw=False, timeout=30):
+    """One request to the Cloudflare inbox, signed in with this laptop's service token."""
+    c = cloud_settings(c)
+    if not c:
+        raise CloudError("Sharing is not set up: add the Cloudflare address and this laptop's token in Settings")
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(c["url"].rstrip("/") + path, data=data, method=method)
+    req.add_header("CF-Access-Client-Id", c["id"])
+    req.add_header("CF-Access-Client-Secret", c["secret"])
+    req.add_header("User-Agent", "ReelsHub")
+    req.add_header("Accept", "application/json")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    host = urlparse(c["url"]).hostname or c["url"]
+    try:
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout) as res:
+            payload, ctype = res.read(40_000_000), res.headers.get("Content-Type", "")
+    except urllib.error.HTTPError as e:
+        if 300 <= e.code < 400:
+            raise CloudError("Cloudflare Access did not accept this laptop's token: check the Client ID and Client Secret in Settings")
+        try:
+            msg = json.loads(e.read(20000).decode("utf-8", "replace")).get("error")
+        except (ValueError, AttributeError, OSError):
+            msg = None
+        if not msg and e.code in (401, 403):
+            raise CloudError("Cloudflare Access refused this laptop's token: check the Client ID and Client Secret in Settings")
+        raise CloudError(f"{msg or e.reason} ({e.code})", fatal=e.code >= 500 or e.code in (401, 403, 429))
+    except urllib.error.URLError as e:
+        raise CloudError(f"Can't reach {host}: {getattr(e, 'reason', e)}")
+    except OSError as e:                            # timeouts, dropped connections
+        raise CloudError(f"Can't reach {host}: {e}")
+    if raw:
+        return payload
+    if "json" not in ctype.lower():
+        raise CloudError("The Cloudflare address answered with a web page, not the inbox: check the address in Settings")
+    try:
+        return json.loads(payload.decode("utf-8"))
+    except ValueError:
+        raise CloudError("The inbox answered with something that is not JSON")
+
+
+def _defuse(s):
+    """Text from the other laptop must not carry Reels Hub's own markers into note.md or the vault note."""
+    s = re.sub(r"(?i)<!--(\s*reels-hub)", r"<!- -\1", str(s or ""))
+    return re.sub(r"(?im)^(\s*)reel_id:", r"\1reel_id :", s)
+
+
+def _plain(s, n):
+    """One line of text from the other laptop: no control characters or line breaks, no markers."""
+    return _defuse(re.sub(r"[\s\x00-\x1f\x7f]+", " ", str(s or ""))).strip()[:n]
+
+
+def cloud_whoami(c=None):
+    """Who this laptop is in the inbox, whom it can share with, and whether this person may delete videos."""
+    c = cloud_settings(c)
+    j = cloud_call("GET", "/api/whoami", c=c, timeout=20)
+    person = str(j.get("person") or "")
+    if not person:
+        raise CloudError("The inbox did not say who this laptop is")
+    people = [{"person": str(p["person"]), "name": _plain(p.get("name") or p["person"], 60)}
+              for p in (j.get("people") or []) if isinstance(p, dict) and p.get("person") and p.get("person") != person]
+    return {"person": person, "name": _plain(j.get("name") or person, 60), "people": people,
+            "can_delete": j.get("can_delete") is not False, "token": (c or {}).get("id"), "inbox": (c or {}).get("url")}
+
+
+def remember_cloud(info):
+    """Keep the inbox's answer in config.json: who this laptop is, whom it can share with, the delete right.
+    An answer for a token or address that Settings has replaced in the meantime is dropped."""
+    with CONFIG_LOCK:
+        cfg = load_config()
+        if not cfg or not cloud_settings(cfg.get("cloud") or {}):
+            return
+        if (cfg["cloud"].get("id"), cfg["cloud"].get("url")) != (info.get("token"), info.get("inbox")):
+            return
+        cfg["cloud"] = {**cfg["cloud"], "person": info["person"], "name": info["name"], "people": info["people"],
+                        "checked": time.strftime("%Y-%m-%d %H:%M")}
+        cfg["can_delete"] = info["can_delete"]
+        atomic_write(config_path(), json.dumps(cfg, indent=1, ensure_ascii=False))
+        CONFIG["cloud"] = cfg["cloud"]
+        CONFIG["can_delete"] = cfg["can_delete"]
+
+
+def cloud_test(body):
+    """Settings, Test connection: try the address and token typed in the form (nothing is saved)."""
+    c, _ = cloud_from_form(body, CONFIG.get("cloud") or {})
+    if not c:
+        raise ValueError("Fill in the Cloudflare address, Client ID and Client Secret first")
+    info = cloud_whoami(c)
+    return {k: info[k] for k in ("person", "name", "people", "can_delete")}
+
+
+def _probe_duration(video):
+    try:
+        r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1",
+                            str(video)], capture_output=True, text=True, timeout=60)
+        return float(r.stdout.strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 0.0
+
+
+def _smaller_jpeg(p):
+    """A smaller JPEG copy of an image (ffmpeg), for an edited favorite that is too large to send."""
+    fd, tmp = tempfile.mkstemp(suffix=".jpg")
+    os.close(fd)
+    try:
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(p), "-vf", "scale='min(1280,iw)':-2",
+                        "-q:v", "5", tmp], capture_output=True, timeout=60)
+        return Path(tmp).read_bytes()
+    except (OSError, subprocess.SubprocessError):
+        return b""
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _share_image(folder, shot):
+    """The edited favorite image to send (JPEG bytes); None when it was not edited, b"" when too large."""
+    p, o = folder / "shots" / shot, folder / "shots" / "_orig" / shot
+    if not (p.is_file() and o.is_file()):
+        return None
+    raw = p.read_bytes()
+    if raw == o.read_bytes():                       # opened in Paint but not changed
+        return None
+    if len(raw) > SHARE_IMG_MAX or not raw.startswith(b"\xff\xd8\xff"):
+        raw = _smaller_jpeg(p)
+    return raw if raw.startswith(b"\xff\xd8\xff") and len(raw) <= SHARE_IMG_MAX else b""
+
+
+def build_share(folder, r, to):
+    """What goes to the inbox for one reel, plus the edited images (uploaded one by one after it).
+    Nothing else: no video, snapshots, transcript or vault note."""
+    st = read_state(folder)
+    allf, favs, images, notes, big = st["favorites"], [], [], [], 0
+    if len(allf) > SHARE_FAVS_MAX:
+        notes.append(f"only the first {SHARE_FAVS_MAX} of its {len(allf)} favorites went")
+    for f in allf[:SHARE_FAVS_MAX]:
+        item = {"t": round(float(r["times"].get(f["shot"], 0)), 3), "text": f["text"], "corrected": bool(f["corrected"]),
+                "image": False}
+        img = _share_image(folder, f["shot"]) if len(images) < SHARE_IMGS_MAX else None
+        if img:
+            item["image"] = True
+            images.append(img)
+        elif img == b"":
+            big += 1
+        favs.append(item)
+    if big:
+        notes.append(f"{big} edited image{'s were' if big > 1 else ' was'} too large and went as plain favorite{'s' if big > 1 else ''}")
+    over = sum(1 for f in allf[:SHARE_FAVS_MAX] if f["shot"] in (r.get("edited") or [])) - SHARE_IMGS_MAX
+    if over > 0:
+        notes.append(f"{over} more edited images went as plain favorites (at most {SHARE_IMGS_MAX} per video)")
+    cat = st["category"] if st["category"] in read_cats() else ""
+    meta = {"to": to, "url": r["url"], "title": (r["label"] or r["title"] or "")[:300], "platform": (r["platform"] or "")[:40],
+            "category": cat, "notes": (r["notes"] or "")[:100000], "favorites": favs}
+    return meta, images, notes
+
+
+def _send_share(meta, images):
+    """Create the share, upload its edited images one per request, then mark it ready for the other person.
+    If anything fails on the way, the half-sent share is dropped again."""
+    res = cloud_call("POST", "/api/shares", meta, timeout=60)
+    sid = str(res.get("id") or "")
+    if not images:
+        return sid
+    if not SHARE_ID_RE.fullmatch(sid):
+        raise CloudError("The inbox gave back no share id", fatal=False)
+    try:
+        for n, raw in enumerate(images):
+            cloud_call("PUT", f"/api/shares/{sid}/image/{n}", {"data": base64.b64encode(raw).decode("ascii")}, timeout=120)
+        cloud_call("POST", f"/api/shares/{sid}/ready", {}, timeout=30)
+    except Exception:
+        try:
+            cloud_call("DELETE", f"/api/shares/{sid}", timeout=20)
+        except Exception:
+            pass                                    # the inbox drops unfinished shares after a day anyway
+        raise
+    return sid
+
+
+def share_reels(ids, to):
+    """Send reels to another person's inbox. Returns what was sent and why anything was not."""
+    if not cloud_settings():
+        raise ValueError("Sharing is not set up: add the Cloudflare address and this laptop's token in Settings")
+    if not isinstance(ids, list) or not ids:
+        raise ValueError("Nothing to share")
+    if len(ids) > 200:
+        raise ValueError("Share at most 200 reels at a time")
+    people = {p["person"]: p for p in (CONFIG.get("cloud") or {}).get("people") or []}
+    if to not in people:                            # the list may be old: ask the inbox once
+        remember_cloud(cloud_whoami())
+        people = {p["person"]: p for p in (CONFIG.get("cloud") or {}).get("people") or []}
+        if to not in people:
+            raise ValueError("That person is not in the inbox's PEOPLE list")
+    name = people[to]["name"]
+    done, errors, notes = [], [], []
+    for k, rid in enumerate(ids):
+        label = str(rid)
+        try:
+            folder = reel_dir(rid)
+            busy_check(folder.name)
+            r = parse_note(folder)
+            if not r:
+                raise ValueError("unknown reel")
+            label = r["label"]
+            if not r["url"]:
+                raise ValueError("it has no source link")
+            meta, images, extra = build_share(folder, r, to)
+            _send_share(meta, images)
+            with DATA_LOCK:
+                st = read_state(folder)
+                if not st.get("_bad"):
+                    st["shared"] = st["shared"][-9:] + [{"to": to, "name": name, "at": time.strftime("%Y-%m-%d %H:%M")}]
+                    write_state(folder, st)
+            done.append({"id": folder.name, "shared": st["shared"]})
+            notes += [f"{label}: {x}" for x in extra]
+        except CloudError as e:
+            errors.append(f"{label}: {e}")
+            if e.fatal:                             # offline or token refused: don't wait for each of the others
+                if len(ids) - k - 1:
+                    errors.append(f"{len(ids) - k - 1} more not sent")
+                break
+        except Exception as e:
+            errors.append(f"{label}: {e}")
+    return {"shared": done, "errors": errors, "notes": notes, "name": name}
+
+
+def inbox_dir():
+    return OUT / "_inbox"
+
+
+def _seen():
+    """Shares already picked up (id -> time), so one that was added or dismissed never comes back."""
+    try:
+        d = json.loads((inbox_dir() / "_seen.json").read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _mark_seen(sid):
+    d = _seen()
+    d[sid] = int(time.time())
+    if len(d) > 1000:
+        d = dict(sorted(d.items(), key=lambda kv: kv[1])[-1000:])
+    inbox_dir().mkdir(parents=True, exist_ok=True)
+    atomic_write(inbox_dir() / "_seen.json", json.dumps(d))
+
+
+def _fetch_image(sid, n):
+    """An edited image of a share (JPEG bytes), or b"" if it can't be had: that favorite is then re-captured."""
+    try:
+        raw = cloud_call("GET", f"/api/inbox/{sid}/image/{n}", raw=True, timeout=60)
+        data = base64.b64decode(raw.strip(), validate=True)
+    except CloudError as e:
+        if e.fatal:
+            raise
+        return b""
+    except ValueError:                              # not base64
+        return b""
+    return data if data[:3] == b"\xff\xd8\xff" and len(data) <= 2_000_000 else b""
+
+
+def _save_share(s, sid):
+    """Keep one share in <reels>/_inbox/<id>/ (share.json + the edited images). False if it can't be used.
+    Everything from the other laptop is cleaned on the way in: markers, control characters, lengths."""
+    url = str(s.get("url") or "").strip()
+    if not re.fullmatch(r"https?://\S{3,2000}", url):
+        return False
+    tmp = inbox_dir() / f".tmp-{sid}"
+    if tmp.exists():
+        shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    favs, lost = [], 0
+    for i, f in enumerate((s.get("favorites") or [])[:SHARE_FAVS_MAX]):
+        if not isinstance(f, dict):
+            continue
+        try:
+            t = float(f.get("t") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not 0 <= t <= 86400:
+            continue
+        img, n = "", f.get("image")
+        if isinstance(n, int) and not isinstance(n, bool) and 0 <= n < 100:
+            raw = _fetch_image(sid, n)
+            if raw:
+                img = f"img_{i:03d}.jpg"
+                (tmp / img).write_bytes(raw)
+            else:
+                lost += 1
+        favs.append({"t": round(t, 3), "text": _defuse(f.get("text"))[:2000], "corrected": bool(f.get("corrected")), "image": img})
+    plat = str(s.get("platform") or "")
+    item = {"id": sid, "from": _plain(s.get("from"), 40), "from_name": _plain(s.get("from_name") or s.get("from"), 60),
+            "sent": _plain(s.get("created"), 40), "received": time.strftime("%Y-%m-%d %H:%M"), "url": url,
+            "title": _plain(s.get("title"), 300), "platform": plat if plat in PLATFORMS else platform_of(url),
+            "category": _plain(s.get("category"), 100), "notes": _defuse(s.get("notes"))[:100000],
+            "favorites": favs, "lost_images": lost}
+    atomic_write(tmp / "share.json", json.dumps(item, indent=1, ensure_ascii=False))
+    os.replace(tmp, inbox_dir() / sid)
+    return True
+
+
+def pickup():
+    """Fetch the shares waiting for this laptop into <reels>/_inbox, then delete them from Cloudflare.
+    Each share on its own: one that fails waits for the next round without holding up the others."""
+    shares = cloud_call("GET", "/api/inbox").get("shares") or []
+    seen, problems = _seen(), []
+    for s in shares:
+        sid = str((s or {}).get("id") or "")
+        if not SHARE_ID_RE.fullmatch(sid):
+            continue
+        try:
+            if sid not in seen and not (inbox_dir() / sid).exists():
+                _save_share(s, sid)
+            _mark_seen(sid)
+            cloud_call("DELETE", f"/api/inbox/{sid}")    # picked up: no longer kept in Cloudflare
+        except CloudError as e:
+            if e.fatal:                                 # offline or token refused: try again next round
+                raise
+            problems.append(str(e))
+        except Exception as e:
+            problems.append(f"a share from {_plain((s or {}).get('from_name'), 60) or 'someone'} could not be saved ({e})")
+    if problems:
+        raise ValueError("; ".join(problems[:3]))
+
+
+def _load_item(sid):
+    if not isinstance(sid, str) or not SHARE_ID_RE.fullmatch(sid):
+        raise ValueError("bad share id")
+    try:
+        it = json.loads((inbox_dir() / sid / "share.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise ValueError("That share is no longer in the inbox")
+    if not isinstance(it, dict) or it.get("id") != sid or not isinstance(it.get("favorites"), list):
+        raise ValueError("That share is damaged")
+    return it
+
+
+def inbox_status():
+    items, d = [], inbox_dir()
+    if d.is_dir():
+        for p in d.iterdir():
+            if p.is_dir() and SHARE_ID_RE.fullmatch(p.name):
+                try:
+                    items.append(_load_item(p.name))
+                except ValueError:
+                    continue
+    items.sort(key=lambda x: str(x.get("sent") or x.get("received") or ""))
+    have = {}                                       # videos you already have, by folder name (<date>_<video id>)
+    if items:
+        names = [p.name for p in OUT.iterdir() if p.is_dir() and "_" in p.name and not p.name.startswith(("_", "."))]
+        for it in items:
+            u = str(it.get("url") or "")
+            for name in names:
+                vid = re.sub(r"_v\d+$", "", name.split("_", 1)[1])
+                if len(vid) >= 4 and vid in u and (OUT / name / "note.md").exists():
+                    have.setdefault(it["id"], []).append(name)
+    with INBOX_LOCK:
+        queued = [q["id"] for q in INBOX["queue"]]
+        for it in items:
+            it["status"] = "adding" if INBOX["adding"] == it["id"] else ("queued" if it["id"] in queued else "")
+            it["error"] = INBOX["errors"].get(it["id"], "")
+            it["have"] = sorted(have.get(it["id"], []))
+        return {"on": bool(cloud_settings()), "items": items, "checked": INBOX["checked"], "error": INBOX["error"],
+                "busy": INBOX["busy"], "last": INBOX["last"], "as": (CONFIG.get("cloud") or {}).get("name", ""),
+                "running": JOB["running"], "changed": CHANGED["list"], "boot": BOOT}
+
+
+def inbox_add(body):
+    """Add (queue) a share: its video is downloaded and processed on this laptop, then filled in."""
+    sid = str(body.get("id") or "")
+    item = _load_item(sid)
+    with INBOX_LOCK:
+        if INBOX["adding"] == sid or any(q["id"] == sid for q in INBOX["queue"]):
+            raise ValueError("It is already being added")
+        part = INBOX["partial"].get(sid)
+    category = _plain(body.get("category"), 100)
+    if category.lower() == "unassigned":
+        category = ""
+    ms = str(body.get("max_shots") or "auto").lower()
+    try:
+        max_shots = "auto" if ms == "auto" else str(max(10, min(1000, int(ms))))
+    except ValueError:
+        max_shots = "auto"
+    task = {"id": sid, "category": category, "new": False, "max_shots": max_shots}
+    fill = None
+    if part:                                        # downloaded before, but the fill-in failed: only fill in now
+        try:
+            fill = reel_dir(part)
+        except (PermissionError, ValueError):
+            fill = None
+        if fill is not None and ((not (fill / "note.md").exists()) or read_state(fill).get("shared_by")):
+            fill = None
+    if fill is not None:
+        task["fill"] = fill.name
+    else:
+        mode = body.get("existing")
+        if mode is None:
+            hits = find_done(item["url"])
+            if hits:                                # you have this video already: ask first (new version or open yours)
+                return {"existing": [{"id": f.name, "label": (parse_note(f) or {}).get("label", f.name)} for f in hits[:6]],
+                        "total": 1}
+        elif mode != "new":
+            raise ValueError("Bad choice")
+        task["new"] = mode == "new"
+    with INBOX_LOCK:
+        INBOX["errors"].pop(sid, None)
+        INBOX["queue"].append(task)
+        n = len(INBOX["queue"]) + bool(JOB["running"])
+    INBOX_WAKE.set()
+    return {"queued": n}
+
+
+def inbox_dismiss(body):
+    """Dismiss a share: it moves to <reels>/_trash/_inbox (not added; can be restored by hand)."""
+    sid = str(body.get("id") or "")
+    _load_item(sid)
+    with INBOX_LOCK:
+        if INBOX["adding"] == sid:
+            raise ValueError("It is being added right now - wait until it finishes")
+        INBOX["queue"] = [q for q in INBOX["queue"] if q["id"] != sid]
+        INBOX["errors"].pop(sid, None)
+        INBOX["partial"].pop(sid, None)
+        trash = OUT / "_trash" / "_inbox"
+        trash.mkdir(parents=True, exist_ok=True)
+        os.replace(inbox_dir() / sid, _unique(trash / sid))
+    return {"dismissed": sid}
+
+
+def start_next_add():
+    """Start the next queued Add when the run slot is free (one run at a time, like Run)."""
+    with INBOX_LOCK:
+        if not INBOX["queue"] or JOB["running"]:
+            return
+        with JOB_LOCK:
+            if JOB["running"]:
+                return
+            JOB["running"] = True
+            JOB["busy"] = set()
+        task = INBOX["queue"].pop(0)
+        try:
+            item = _load_item(task["id"])
+        except ValueError as e:
+            INBOX["errors"][task["id"]] = str(e)
+            JOB["running"] = False
+            return
+        INBOX["adding"] = task["id"]
+    task = {**task, "item": item}
+    if task.get("fill"):
+        threading.Thread(target=run_fill, args=(task,), daemon=True).start()
+        return
+    flags = ["--new-version"] if task["new"] else []
+    threading.Thread(target=run_job, args=([item["url"]], task["max_shots"], False, flags, None, task), daemon=True).start()
+
+
+def run_fill(task):
+    """Add again after a failed fill-in: the video is already here, so only the share is filled in."""
+    JOB.update(log=[f"-- filling in {task['item'].get('from_name') or 'the'}'s share again (the video is already here)"],
+               started=time.time(), finished=None, urls=[task["item"]["url"]], progress=None, busy={task["fill"]},
+               share=task["id"])
+    try:
+        _finish_add(task, 0, [{"url": task["item"]["url"], "folder": task["fill"]}])
+        JOB["log"].append("-- finished")
+    except Exception as e:
+        JOB["log"].append(f"-- could not fill in: {e}")
+    finally:
+        with INBOX_LOCK:
+            INBOX["adding"] = None
+        JOB.update(running=False, finished=time.time(), progress=None, busy=set(), share=None)
+        INBOX_WAKE.set()
+
+
+def atomic_write_bytes(path, raw):
+    """Like atomic_write, for an image: temp file + rename, retried while Windows has the file open."""
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_bytes(raw)
+    for i in range(40):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            time.sleep(0.05)
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+    raise PermissionError(f"could not write {path.name} (open in another program?)")
+
+
+def apply_share(folder, item, category):
+    """Fill a freshly processed reel from a share: the favorites re-captured at the sender's times (with the
+    sender's edited image where there is one), their text and Corrected mark, My notes, the category, and who
+    shared it. One favorite that fails does not stop the others."""
+    vids = [p for p in folder.glob("video.*") if p.suffix.lower() in VIDEO_EXT]
+    if not vids:
+        raise ValueError("no video file")
+    dur = _probe_duration(vids[0])
+    src = inbox_dir() / item["id"]
+    favs, seen, missed, frames = [], set(), 0, 0
+    for f in item.get("favorites") or []:          # _capture takes DATA_LOCK for each frame, not for all of them
+        try:
+            t = float(f.get("t") or 0)
+            tries = [t] + ([max(0.0, dur - 0.3)] if dur and t > dur - 0.3 else [])   # this copy may be a bit shorter
+            shot = None
+            for tt in tries:
+                try:
+                    shot = _capture(folder, tt, manual=False)["shot"]
+                    break
+                except ValueError:
+                    continue
+            if not shot:
+                missed += 1
+                continue
+            if shot in seen:
+                continue
+            seen.add(shot)
+            img = src / f["image"] if f.get("image") else None
+            if img and img.is_file():
+                raw = img.read_bytes()
+                if raw[:3] == b"\xff\xd8\xff":
+                    p = folder / "shots" / shot
+                    try:
+                        with DATA_LOCK:
+                            _backup(p)              # the re-captured frame stays as the original (Reset to original)
+                            atomic_write_bytes(p, raw)
+                    except OSError:
+                        frames += 1                 # file in use: the re-captured frame stays instead
+            favs.append({"shot": shot, "text": _defuse(f.get("text"))[:2000], "corrected": bool(f.get("corrected"))})
+        except Exception:
+            missed += 1
+    cat = _plain(category, 100)
+    with DATA_LOCK:
+        if cat:
+            try:
+                cats = read_cats()
+                same = next((c for c in cats if c.lower() == cat.lower()), None)
+                if same:
+                    cat = same
+                else:
+                    cats.append(cat)
+                    write_cats(cats)
+            except OSError:
+                cat = ""
+        st = read_state(folder)
+        st["favorites"] = favs
+        if cat:
+            st["category"] = cat
+        st["shared_by"] = {"person": _plain(item.get("from"), 40), "name": _plain(item.get("from_name"), 60),
+                           "at": time.strftime("%Y-%m-%d %H:%M"), "share": item["id"]}
+        write_state(folder, st)
+        write_note_favorites(folder, favs)
+        if str(item.get("notes") or "").strip():
+            _write_notes(folder, _defuse(item["notes"]))
+    return {"favorites": len(favs), "missed": missed, "frames": frames, "category": cat}
+
+
+def _finish_add(task, code, done):
+    """After the run of an Add: fill in the share, or keep it in the inbox with the reason it failed."""
+    item, sid = task["item"], task["id"]
+    folder = None
+    for d in done:
+        if not d.get("skipped") and isinstance(d.get("folder"), str):
+            try:
+                folder = reel_dir(d["folder"])
+            except (PermissionError, ValueError):
+                folder = None
+    if code != 0 or folder is None or not (folder / "note.md").exists():
+        if any(d.get("skipped") for d in done):
+            msg = "This video is already in your library: press Add again and choose New version"
+        else:                                       # "Downloading failed: <the site's error>", not the whole command
+            fail = next((l.split("FAILED:", 1)[1].strip() for l in reversed(JOB["log"]) if "FAILED:" in l), "")
+            err = next((l.strip()[6:].strip() for l in reversed(JOB["log"]) if l.strip().startswith("ERROR:")), "")
+            fail = fail.split(" - Command '", 1)[0]
+            msg = ((f"{fail}: {err}" if fail and err else fail or err) or "The run did not finish (see Log)")[:400]
+        with INBOX_LOCK:
+            INBOX["errors"][sid] = msg
+        JOB["log"].append(f"-- not added from the inbox: {msg}")
+        return
+    try:
+        res = apply_share(folder, item, task["category"])
+    except Exception as e:
+        with INBOX_LOCK:
+            INBOX["errors"][sid] = (f"The video is in your library ({folder.name}), but the favorites could not be "
+                                    f"filled in: {e}. Press Add to try the fill-in again.")[:500]
+            INBOX["partial"][sid] = folder.name
+        JOB["log"].append(f"-- the share could not be filled in: {e}")
+        mark_changed(folder.name)
+        return
+    shutil.rmtree(inbox_dir() / sid, ignore_errors=True)    # everything it held is in the reel now
+    mark_changed(folder.name)
+    with INBOX_LOCK:
+        INBOX["partial"].pop(sid, None)
+        INBOX["last"] = {"id": sid, "folder": folder.name, "title": item.get("title", ""),
+                         "from_name": item.get("from_name", ""), "at": time.time()}
+    n = res["favorites"]
+    JOB["log"].append(f"-- added {item.get('from_name') or 'the'}'s share: {n} favorite{'' if n == 1 else 's'}"
+                      + (", notes" if str(item.get("notes") or "").strip() else "")
+                      + (f", category {res['category']}" if res["category"] else "")
+                      + (f" ({res['missed']} favorite time{'s' if res['missed'] > 1 else ''} could not be captured)" if res["missed"] else "")
+                      + (f" ({res['frames']} edited image{'s' if res['frames'] > 1 else ''} in use: the plain frame was kept)" if res["frames"] else ""))
+
+
+def inbox_worker():
+    """Background: pick up shares from Cloudflare now and then (or when asked), and start queued Adds."""
+    last = 0.0
+    while True:
+        INBOX_WAKE.wait(5)
+        INBOX_WAKE.clear()
+        with INBOX_LOCK:
+            force, INBOX["force"] = INBOX["force"], False
+        if CONFIG.get("name") and cloud_settings() and (force or time.time() - last >= PICKUP_EVERY):
+            last = time.time()
+            with INBOX_LOCK:
+                INBOX["busy"] = True
+            try:
+                if time.time() - INBOX["whoami_at"] >= WHOAMI_EVERY:
+                    remember_cloud(cloud_whoami())
+                    INBOX["whoami_at"] = time.time()
+                pickup()
+                with INBOX_LOCK:
+                    INBOX.update(checked=time.strftime("%H:%M"), error="")
+            except Exception as e:
+                with INBOX_LOCK:
+                    INBOX.update(checked=time.strftime("%H:%M"), error=str(e))
+            finally:
+                with INBOX_LOCK:
+                    INBOX["busy"] = False
+        try:
+            start_next_add()
+        except Exception as e:
+            print(f"  inbox: {e}")
+
+
 # ---------------------------------------------------------------- job runner
 def find_done(url):
     """Reel folders that already hold a finished copy of this link (same video id or same page)."""
@@ -985,9 +1778,24 @@ def find_done(url):
     return hits
 
 
-def run_job(urls, max_shots="auto", redo=False, flags=(), target=None):
-    # JOB["running"] was already claimed under JOB_LOCK by the request handler
-    JOB.update(log=[], started=time.time(), finished=None, urls=urls, progress=None, busy={target} if target else set())
+def run_job(urls, max_shots="auto", redo=False, flags=(), target=None, share=None):
+    # JOB["running"] was already claimed under JOB_LOCK (by the request handler, or start_next_add for a share)
+    JOB.update(log=[], started=time.time(), finished=None, urls=urls, progress=None, busy={target} if target else set(),
+               share=share["id"] if share else None)
+    if share:
+        JOB["log"].append(f"-- adding {share['item'].get('from_name') or 'a'}'s share from the inbox")
+    done = []                                   # @@DONE lines from reels2notes: which folder each link went to
+    try:
+        _run_job(urls, max_shots, redo, flags, target, share, done)
+    finally:
+        with INBOX_LOCK:
+            if share:
+                INBOX["adding"] = None
+        JOB.update(running=False, finished=time.time(), progress=None, busy=set(), share=None)
+        INBOX_WAKE.set()                        # the next queued Add can start
+
+
+def _run_job(urls, max_shots, redo, flags, target, share, done):
     env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
     cmd = [sys.executable, "-u", str(SCRIPT), "--out", str(OUT), "--max-shots", str(max_shots)]
     if CONFIG.get("person"):
@@ -1011,9 +1819,21 @@ def run_job(urls, max_shots="auto", redo=False, flags=(), target=None):
                 except ValueError:
                     pass
                 continue
+            if line.startswith("@@DONE "):
+                try:
+                    d = json.loads(line[7:])
+                except ValueError:
+                    continue
+                if isinstance(d, dict):
+                    done.append(d)
+                    if share and not d.get("skipped") and isinstance(d.get("folder"), str):
+                        JOB["busy"].add(d["folder"])   # no edits from the page until the share is filled in
+                continue
             if line and "warnings.warn" not in line:
                 JOB["log"].append(line)
         proc.wait()
+        if share:
+            _finish_add(share, proc.returncode, done)
         if redo and target and proc.returncode == 0:   # snapshots were replaced: old favorites no longer apply
             with DATA_LOCK:
                 folder = OUT / target
@@ -1026,7 +1846,9 @@ def run_job(urls, max_shots="auto", redo=False, flags=(), target=None):
         JOB["log"].append(f"-- finished (exit code {proc.returncode})")
     except Exception as e:
         JOB["log"].append(f"-- could not start: {e}")
-    JOB.update(running=False, finished=time.time(), progress=None, busy=set())
+        if share:
+            with INBOX_LOCK:
+                INBOX["errors"][share["id"]] = f"Could not start: {e}"
 
 
 # ---------------------------------------------------------------- HTTP
@@ -1081,16 +1903,25 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/config":
             self.send_json(config_info())
         elif path == "/api/reels":
+            cl = CONFIG.get("cloud") or {}
+            seq = CHANGED["seq"]                     # read before listing: later fill-ins count as changed
             self.send_json({"reels": list_reels() if CONFIG.get("name") else [], "categories": read_cats(),
-                            "me": {"name": CONFIG.get("name", ""), "person": CONFIG.get("person", "")},
+                            "boot": BOOT, "changed_seq": seq,
+                            "me": {"name": CONFIG.get("name", ""), "person": CONFIG.get("person", ""),
+                                   "can_delete": can_delete(),
+                                   "share": {"on": bool(cloud_settings()), "people": cl.get("people") or [],
+                                             "as": cl.get("name", "")}},
                             "vault": {"path": str(VAULT), "ok": vault_ok()}})
+        elif path == "/api/inbox":
+            self.send_json(inbox_status())
         elif path == "/api/status":
             prog = JOB["progress"]
             if prog:   # age the ETA by the time since the last update
                 prog = {**prog, "eta": None if prog.get("eta") is None else max(0, prog["eta"] - (time.time() - prog["at"])),
                         "elapsed": prog["elapsed"] + (time.time() - prog["at"])}
             self.send_json({"running": JOB["running"], "log": JOB["log"][-300:], "urls": JOB["urls"],
-                            "finished": JOB["finished"], "progress": prog,
+                            "finished": JOB["finished"], "progress": prog, "share": JOB["share"],
+                            "changed": CHANGED["list"], "boot": BOOT,
                             "total_elapsed": time.time() - JOB["started"] if JOB["started"] else 0})
         elif path.startswith("/media/"):
             self.serve_file(path[len("/media/"):])
@@ -1157,7 +1988,7 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/config":
                 self.send_json({"ok": True, **save_config(body), **config_info()})
             elif path == "/api/notes":
-                save_notes(body["id"], body.get("notes", ""))
+                save_notes(body["id"], body.get("notes", ""), body.get("sb"))
                 self.send_json({"ok": True})
             elif path == "/api/state":
                 self.send_json({"ok": True, "state": save_state(body["id"], body.get("state", {}))})
@@ -1183,8 +2014,23 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, **delete_reels(ids, bool(body.get("obsidian")))})
             elif path == "/api/categories":
                 self.send_json({"ok": True, "categories": change_cats(body)})
+            elif path == "/api/share":
+                self.send_json({"ok": True, **share_reels(body.get("ids"), str(body.get("to") or ""))})
+            elif path == "/api/inbox/check":
+                with INBOX_LOCK:
+                    INBOX["force"] = True
+                INBOX_WAKE.set()
+                self.send_json({"ok": True})
+            elif path == "/api/inbox/add":
+                self.send_json({"ok": True, **inbox_add(body)})
+            elif path == "/api/inbox/dismiss":
+                self.send_json({"ok": True, **inbox_dismiss(body)})
+            elif path == "/api/cloud/test":
+                self.send_json({"ok": True, **cloud_test(body)})
             else:
                 self.send_error(404)
+        except PermissionError as e:
+            self.send_json({"error": str(e) or "Not allowed"}, 403)
         except (ValueError, KeyError, TypeError, OSError) as e:
             self.send_json({"error": str(e)}, 400)
         except Exception as e:
@@ -1443,7 +2289,7 @@ video.seekflash{animation:seekflash 1s}
 .cbox p{margin:0 0 14px;white-space:pre-wrap;color:var(--muted);font-size:13px}
 .cchk{display:flex;gap:8px;align-items:center;font-size:13px;margin-bottom:16px}
 .cbtns{display:flex;gap:8px;justify-content:flex-end}
-#toast{position:fixed;left:50%;top:70px;transform:translateX(-50%);background:var(--accent);color:var(--accent-ink);font-weight:600;padding:7px 14px;border-radius:10px;opacity:0;pointer-events:none;transition:opacity .2s;z-index:40}
+#toast{position:fixed;left:50%;top:70px;transform:translateX(-50%);background:var(--accent);color:var(--accent-ink);font-weight:600;padding:7px 14px;border-radius:10px;opacity:0;pointer-events:none;transition:opacity .2s;z-index:70;max-width:calc(100vw - 32px);text-align:center}
 #toast.show{opacity:1}
 #dragghost{position:fixed;top:-100px;left:-100px;background:var(--accent);color:var(--accent-ink);font-weight:700;padding:5px 12px;border-radius:14px;font-size:13px}
 .gcard:hover,.gcard:focus{background:var(--panel);border-color:var(--line);outline:none}
@@ -1549,6 +2395,10 @@ kbd{background:var(--panel2);border:1px solid var(--line);border-bottom-width:2p
   .ptools{display:none}
   .paper{width:auto;min-height:0;margin:0;padding:0;box-shadow:none}
 }
+@media (max-width:700px){
+  header{flex-wrap:wrap;row-gap:8px}
+  header > .status{display:none}
+}
 @media (max-width:900px){
   .layout{grid-template-columns:1fr}
   .split{display:none}
@@ -1570,6 +2420,42 @@ kbd{background:var(--panel2);border:1px solid var(--line);border-bottom-width:2p
 body:has(#bulkbar.show) #log{bottom:84px}
 #main.busy #notes,#main.busy .favtext,#main.busy .favs,#main.busy .shots,#main.busy .capbar,#main.busy #favs + *,#main.busy .rowbtns{opacity:.45;pointer-events:none}
 #main.busy .detail::before{content:"Re-processing this video... favorites and snapshots are paused until it finishes";grid-column:1/-1;background:#2a2412;border:1px solid var(--warn);color:var(--warn);border-radius:8px;padding:8px 12px;font-size:13px}
+
+/* sharing: share buttons, inbox, shared-by marks, Settings section */
+#inboxbtn .ib{display:inline-block;min-width:18px;margin-left:6px;padding:0 6px;border-radius:9px;background:var(--accent);color:var(--accent-ink);font-size:11px;font-weight:700;line-height:17px;text-align:center}
+#inbox{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:flex-start;justify-content:center;z-index:45;padding:60px 16px 16px;overflow:auto}
+#inbox.show{display:flex}
+.ibox{width:min(660px,100%);padding:16px 18px;display:flex;flex-direction:column;gap:10px}
+.ihead{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.ihead h3{margin:0;font-size:16px}
+.ihead .spacer{flex:1}
+.iitem{border:1px solid var(--line);border-radius:10px;padding:10px 12px;background:var(--panel2);display:flex;flex-direction:column;gap:4px}
+.ititle{font-weight:600;overflow-wrap:anywhere}
+.imeta{font-size:12px;color:var(--muted)}
+.imeta b{color:var(--text);font-weight:600}
+.imeta a{color:var(--accent)}
+.inotes{font-size:12px;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px 8px;white-space:pre-wrap;max-height:96px;overflow:auto;overflow-wrap:anywhere}
+.irow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:4px}
+.irow .spacer{flex:1}
+.irow select{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:4px 8px;font-size:12px;max-width:230px}
+.istate{font-size:12px;color:var(--warn)}
+.ierr{font-size:12px;color:#ef6f6c;overflow-wrap:anywhere}
+.iempty{color:var(--muted);padding:22px 6px;text-align:center;font-size:13px}
+.ifoot{font-size:11.5px;color:var(--muted)}
+.ifoot b{color:var(--text);font-weight:600}
+.ifoot .ierr{display:block;margin-top:3px}
+.from{color:var(--accent);white-space:nowrap}
+.shline{line-height:1.6}
+.shline b{color:var(--text);font-weight:600}
+.setbox{max-height:calc(100vh - 32px);overflow:auto}
+.stshare{border-top:1px solid var(--line);padding-top:12px;display:flex;flex-direction:column;gap:10px}
+.stshare h4{margin:0;font-size:14px}
+.strow{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.st2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+@media (max-width:600px){ .st2{grid-template-columns:1fr} }
+#sttestres{font-size:12px}
+#sttestres.ok{color:var(--accent)}
+#sttestres.bad{color:#ef6f6c}
 </style>
 </head>
 <body>
@@ -1579,6 +2465,7 @@ body:has(#bulkbar.show) #log{bottom:84px}
   <span class="spacer"></span>
   <span class="status"><kbd>&larr;</kbd> <kbd>&rarr;</kbd> switch reels</span>
   <button class="btn" id="viewbtn" title="Show all reels as a gallery">&#9638; Gallery</button>
+  <button class="btn" id="inboxbtn" hidden title="Videos shared with you">&#128229; Inbox<span class="ib" id="inboxcount" hidden></span></button>
   <button class="btn" id="setbtn" title="Your name and folders">&#9881; Settings</button>
   <button class="btn" id="showlog">Log</button>
 </header>
@@ -1621,6 +2508,7 @@ body:has(#bulkbar.show) #log{bottom:84px}
   <span id="bulkcount"></span>
   <select id="bulkcat"></select>
   <button class="btn small" id="bulkall">Select all shown</button>
+  <span id="bulkshare" style="display:contents"></span>
   <button class="btn small danger" id="bulkdel">Delete</button>
   <button class="btn small" id="bulkclear">Clear</button>
 </div>
@@ -1654,12 +2542,23 @@ body:has(#bulkbar.show) #log{bottom:84px}
 <div id="setup"><div class="cbox card setbox">
   <h3 id="sttitle">Welcome to Reels Hub</h3>
   <p class="meta" id="stintro">Tell the app who you are and where to keep things. You can change this later under Settings.</p>
-  <label class="fld">Your name<input id="stname" autocomplete="off" placeholder="e.g. Stela"></label>
+  <label class="fld">Your name<input id="stname" autocomplete="off" placeholder="e.g. Anna"></label>
   <label class="fld">Reels folder <span class="meta">- videos, snapshots and notes are saved here</span>
     <input id="stout" autocomplete="off" spellcheck="false"></label>
   <label class="fld">Obsidian vault <span class="meta">- optional; leave empty if you don't use Obsidian</span>
     <input id="stvault" autocomplete="off" spellcheck="false" placeholder="C:\Users\you\Documents\Obsidian Vault"></label>
   <p class="meta sthelp">Tip: in File Explorer, open the folder, click the address bar and copy the path.</p>
+  <div class="stshare">
+    <h4>Sharing with another Reels Hub <span class="meta">(optional: leave empty if you don't share)</span></h4>
+    <label class="fld">Cloudflare address<input id="stcurl" autocomplete="off" spellcheck="false" placeholder="https://name.pages.dev"></label>
+    <div class="st2">
+      <label class="fld">Client ID <span class="meta">of this laptop's service token</span>
+        <input id="stcid" autocomplete="off" spellcheck="false" placeholder="ends with .access"></label>
+      <label class="fld">Client Secret <span class="meta">stays on this computer</span>
+        <input id="stcsec" type="password" autocomplete="new-password" spellcheck="false"></label>
+    </div>
+    <div class="strow"><button class="btn small" id="sttest" type="button">Test connection</button><span class="meta" id="sttestres"></span></div>
+  </div>
   <p class="sterr" id="sterr" hidden></p>
   <div class="cbtns"><button class="btn" id="stcancel" hidden>Cancel</button><button class="btn primary" id="stsave">Save and start</button></div>
   <p class="meta stpath" id="stpath"></p>
@@ -1667,10 +2566,16 @@ body:has(#bulkbar.show) #log{bottom:84px}
 <div id="choice" class="modal"><div class="cbox card">
   <h3 id="chtitle"></h3>
   <ul id="chlist" class="chlist"></ul>
-  <p>Run them again as a <b>new version</b>? The current one and its favorites stay. The downloaded video is reused.</p>
+  <p id="chtext">Run them again as a <b>new version</b>? The current one and its favorites stay. The downloaded video is reused.</p>
   <p id="chnote" class="meta"></p>
   <div class="cbtns"><button class="btn" id="chcancel">Cancel</button><button class="btn" id="chopen">Open it</button>
     <button class="btn" id="chskip">Skip</button><button class="btn primary" id="chnew">New version</button></div>
+</div></div>
+<div id="inbox"><div class="cbox card ibox" role="dialog" aria-label="Inbox">
+  <div class="ihead"><h3>Inbox</h3><span class="meta" id="inboxsub"></span><span class="spacer"></span>
+    <button class="btn small" id="inboxcheck" title="Look for new shares now">Check now</button><button class="btn small" id="inboxclose">Close</button></div>
+  <div id="inboxlist"></div>
+  <div class="ifoot" id="inboxfoot"></div>
 </div></div>
 <div id="confirm"><div class="cbox card">
   <h3 id="ctitle"></h3>
@@ -1725,10 +2630,14 @@ const media = (id, f) => `/media/${encodeURIComponent(id)}/${f.split("/").map(en
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const mmss = t => { t = Math.round(t || 0); return `${String(Math.floor(t/60)).padStart(2,"0")}:${String(t%60).padStart(2,"0")}`; };
 const PB = {Instagram: ["IG", "#e1306c"], TikTok: ["TT", "#25f4ee"], YouTube: ["YT", "#ff4e45"], X: ["X", "#e7e9ea"]};
-const pbadge = r => { const [t, c] = PB[r.platform] || [String(r.platform||"").slice(0,3), "#8b949b"]; return `<span class="pb" style="--pc:${c}" title="${esc(r.platform)}">${esc(t)}</span>`; };
+const pbadge = r => { const [t, c] = Object.prototype.hasOwnProperty.call(PB, r.platform) ? PB[r.platform] : [String(r.platform||"").slice(0,3), "#8b949b"]; return `<span class="pb" style="--pc:${c}" title="${esc(r.platform)}">${esc(t)}</span>`; };
 const vtag = r => r.version > 1 ? ` <span class="vtag" title="Version ${r.version}">v${r.version}</span>` : "";
 const catOf = r => cats.includes(r.state.category) ? r.state.category : "";
 const isFav = (r, shot) => r.state.favorites.some(f => f.shot === shot);
+const shareTargets = () => (me.share && me.share.on ? me.share.people || [] : []);   // whom you can share with
+const mayDelete = () => me.can_delete !== false;                                     // off for a person in the inbox's PEOPLE
+const fromName = r => r.state.shared_by ? (r.state.shared_by.name || r.state.shared_by.person || "") : "";
+const fromBadge = r => r.state.shared_by ? ` · <span class="from" title="Shared with you by ${esc(fromName(r))}">&#8600; ${esc(fromName(r))}</span>` : "";
 
 async function api(path, body){
   const res = await fetch(path, body ? {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)} : {});
@@ -1757,7 +2666,9 @@ async function loadReels(keepId, changedIds){
     return r;
   });
   cats = j.categories; vault = j.vault || vault; me = j.me || me;
-  $("#who").textContent = me.name || "";
+  if (changedSeq === null) { changedSeq = j.changed_seq || 0; bootId = j.boot; }
+  else if (j.boot && j.boot !== bootId) { bootId = j.boot; changedSeq = 0; }
+  applyMe();
   if (changedIds && current && !changedIds.has(current.id) && reels.some(r => r.id === current.id)) {
     current = reels.find(r => r.id === current.id);      // same reel still open: don't redraw (keeps video + typing)
     $("#count").textContent = reels.length ? `${reels.length} reel${reels.length>1?"s":""}` : "";
@@ -1780,7 +2691,7 @@ function isBusy(r, quiet){
 function saveState(r, now){
   if (isBusy(r)) return;
   clearTimeout(saveTimers[r.id]);
-  const go = () => { delete pending[r.id]; return api("/api/state", {id: r.id, state: r.state}).catch(e => alert("Could not save: " + e.message)); };
+  const go = () => { delete pending[r.id]; return api("/api/state", {id: r.id, state: r.state}).catch(e => saveFailed(r, e)); };
   pending[r.id] = {url: "/api/state", body: () => ({id: r.id, state: r.state}), go};
   if (now) go(); else saveTimers[r.id] = setTimeout(go, 500);
 }
@@ -1790,10 +2701,18 @@ function notesChanged(r, text){
   r.notesDraft = text;
   clearTimeout(notesTimers[r.id]);
   const go = () => { delete pending["n:" + r.id];
-    return api("/api/notes", {id: r.id, notes: text}).then(() => { r.notes = text; delete r.notesDraft; const sv = $("#saved"); if (sv && current === r) { sv.textContent = "Saved"; sv.hidden = false; } })
-      .catch(e => alert("Could not save notes: " + e.message)); };
-  pending["n:" + r.id] = {url: "/api/notes", body: () => ({id: r.id, notes: text}), go};
+    return api("/api/notes", {id: r.id, notes: text, sb: sbAt(r)}).then(() => { r.notes = text; delete r.notesDraft; const sv = $("#saved"); if (sv && current === r) { sv.textContent = "Saved"; sv.hidden = false; } })
+      .catch(e => saveFailed(r, e, "notes")); };
+  pending["n:" + r.id] = {url: "/api/notes", body: () => ({id: r.id, notes: text, sb: sbAt(r)}), go};
   notesTimers[r.id] = setTimeout(go, 800);
+}
+const sbAt = r => (r.state && r.state.shared_by ? r.state.shared_by.at || "" : "");   // which fill-in this copy shows
+function saveFailed(r, e, what){
+  if (/filled in from a share/.test(e.message)) {   // this page had the reel from before a share filled it in
+    delete r.notesDraft; toast(e.message);
+    return loadReels(current && current.id, new Set([r.id])).catch(() => {});
+  }
+  alert(`Could not save${what ? " " + what : ""}: ` + e.message);
 }
 async function flushSaves(){               // write anything typed but not yet saved
   for (const k of Object.keys(pending)) { clearTimeout(saveTimers[k]); clearTimeout(notesTimers[k.replace(/^n:/, "")]); }
@@ -1829,7 +2748,7 @@ function matches(r, q){
   if (fPlat.size && !fPlat.has(r.platform)) return false;
   if (fCat.size && !fCat.has(catOf(r))) return false;
   if (!q) return true;
-  return [r.label, r.platform, r.caption, r.author, r.notes, ...r.transcript.map(x=>x.text), ...r.ocr.map(x=>x.text),
+  return [r.label, r.platform, r.caption, r.author, r.notes, fromName(r), ...r.transcript.map(x=>x.text), ...r.ocr.map(x=>x.text),
           ...r.state.favorites.map(f=>f.text)].join(" ").toLowerCase().includes(q);
 }
 let groupBy = "category", sortBy = "posted-new", shown = [];
@@ -1879,7 +2798,7 @@ function renderList(){
       <div class="item ${current && current.id===r.id?"active":""} ${selected.has(r.id)?"sel":""}" data-id="${esc(r.id)}" draggable="true">
         ${r.shots[0] ? `<img loading="lazy" src="${shotUrl(r, r.shots[0])}" alt="">` : `<img alt="">`}
         <div><div class="t">${esc(r.label)}</div>
-        <div class="s">${pbadge(r)}${vtag(r)} ${esc(r.author)} · ${esc(r.date)}${r.state.favorites.length?` · <span class="fc">&#9733; ${r.state.favorites.length}</span>`:""}</div></div>
+        <div class="s">${pbadge(r)}${vtag(r)} ${esc(r.author)} · ${esc(r.date)}${r.state.favorites.length?` · <span class="fc">&#9733; ${r.state.favorites.length}</span>`:""}${fromBadge(r)}</div></div>
       </div>`).join("") : `<div class="gempty">${name ? "Drag reels here or pick this category on a reel" : "Nothing here"}</div>`;
   });
   $("#list").innerHTML = html || `<div class="empty">No matches</div>`;
@@ -1906,6 +2825,8 @@ function refreshSel(){
   bar.classList.toggle("show", n > 0);
   if (!n) return;
   $("#bulkcount").textContent = `${n} selected`;
+  $("#bulkshare").innerHTML = shareTargets().map(p => `<button class="btn small" data-bulkshare="${esc(p.person)}" title="Send the links, your favorites, notes and categories to ${esc(p.name)}'s Reels Hub">&#8599; Share with ${esc(p.name)}</button>`).join("");
+  $("#bulkdel").hidden = !mayDelete();
   $("#bulkcat").innerHTML = `<option value="" disabled selected>Move to category...</option>`
     + ["", ...cats].map(c => `<option value="cat:${esc(c)}">${c ? esc(c) : "Unassigned"}</option>`).join("")
     + `<option value="new">+ New category...</option>`;
@@ -1935,6 +2856,7 @@ function seekTo(t){
 function goHome(){
   if (ed) { if (ed.dirty && !confirm("Discard your image edits?")) return; closeEditor(); }
   $("#lightbox").classList.remove("show"); $("#printsheet").classList.remove("show"); $("#log").classList.remove("show");
+  closeInbox();
   if (favFull) toggleFull(false);
   clearSel();
   view = "detail"; try { localStorage.setItem("rh-view", view); } catch (e) {} $("#viewbtn").classList.remove("on");
@@ -2008,12 +2930,15 @@ async function newVersion(r){
   try { await api("/api/run", {target: r.id, action: "new", max_shots: n}); } catch (e) { return alert(e.message); }
   lastRunTargets = new Set(); $("#log").classList.add("show"); poll();
 }
-function chooseExisting(list, total){
+function chooseExisting(list, total, share){      // share: an inbox item (Add of a video you already have)
   return new Promise(res => {
     const box = $("#choice");
-    $("#chtitle").textContent = list.length === 1 ? "Already in your library" : `${list.length} of ${total} links are already in your library`;
+    $("#chtitle").textContent = share ? "You already have this video" : list.length === 1 ? "Already in your library" : `${list.length} of ${total} links are already in your library`;
     $("#chlist").innerHTML = list.slice(0, 6).map(x => `<li>${esc(x.label)}</li>`).join("") + (list.length > 6 ? `<li>and ${list.length - 6} more</li>` : "");
-    $("#chnote").textContent = total > list.length ? "The other links run normally either way." : "";
+    $("#chtext").innerHTML = share ? `Add it as a <b>new version</b> with ${esc(share.from_name || share.from)}'s favorites and notes? Your copy and its favorites stay. The downloaded video is reused.`
+      : "Run them again as a <b>new version</b>? The current one and its favorites stay. The downloaded video is reused.";
+    $("#chskip").hidden = !!share; $("#chopen").textContent = share ? "Open mine" : "Open it";
+    $("#chnote").textContent = !share && total > list.length ? "The other links run normally either way." : "";
     box.classList.add("show");
     if (document.activeElement) document.activeElement.blur();
     setTimeout(() => $("#chnew").focus(), 0);
@@ -2042,6 +2967,7 @@ function askDelete(rs){
 }
 let deleting = false;
 async function deleteReels(ids){
+  if (!mayDelete()) return toast("Deleting videos is turned off for you on this laptop");
   const rs = ids.map(id => reels.find(r => r.id === id)).filter(Boolean);
   if (!rs.length || deleting || $("#confirm").classList.contains("show")) return;
   deleting = true;
@@ -2095,7 +3021,7 @@ function renderGallery(){
             ${r.state.favorites.length ? `<span class="gstar">&#9733; ${r.state.favorites.length}</span>` : ""}
             ${r.duration ? `<span class="gdur">${mmss(+r.duration)}</span>` : ""}</div>
           <div class="gtitle">${esc(r.label)}</div>
-          <div class="s">${pbadge(r)}${vtag(r)} ${esc(r.author)} · ${esc(r.date)}</div>
+          <div class="s">${pbadge(r)}${vtag(r)} ${esc(r.author)} · ${esc(r.date)}${fromBadge(r)}</div>
         </div>`).join("") : `<div class="gdrop">Drop reels here</div>`}</div></section>`;
   }
   $("#main").innerHTML = `<div class="gallery"><div class="ghint">Click to open · <kbd>Ctrl</kbd>+click or <kbd>Shift</kbd>+click to select several · ${groupBy === "category" ? "drag onto a category to move" : "group by Category to move reels by dragging"}</div>${html || `<div class="empty">No reels match.</div>`}</div>`;
@@ -2159,9 +3085,11 @@ function render(r){
       ${r.video ? `<div class="capbar"><button class="btn" id="capbtn" title="Take a snapshot of what's on screen now (S)">&#128248; Snapshot <span id="captime">00:00</span></button>
         <button class="btn" id="capstar" title="Snapshot and add it to favorites (Shift+S)">&#128248; + &#9733;</button></div>` : ""}
       <label class="catsel">Category ${catSelect(r)}</label>
-      <div class="rowbtns"><button class="btn small" id="redo" title="Transcribe and take snapshots again, replacing this version">&#8635; Re-process</button>
+      <div class="rowbtns">${shareTargets().map(p => `<button class="btn small" data-share="${esc(p.person)}" ${r.url ? "" : "disabled"} title="${r.url ? `Send the link, your favorites (times, text, edited images), notes and category to ${esc(p.name)}'s Reels Hub` : "This reel has no source link"}">&#8599; Share with ${esc(p.name)}</button>`).join("")}
+        <button class="btn small" id="redo" title="Transcribe and take snapshots again, replacing this version">&#8635; Re-process</button>
         <button class="btn small" id="newver" title="Process the video again as a separate copy; this version and its favorites stay">+ New version</button>
-        <button class="btn small danger" id="delone">Delete this reel</button></div>
+        ${mayDelete() ? `<button class="btn small danger" id="delone">Delete this reel</button>` : ""}</div>
+      <div class="meta shline" id="shline" hidden></div>
       <div class="meta">${esc(r.author)} · ${esc(r.date)}${r.duration?` · ${Math.round(r.duration)}s`:""}${r.url?` · <a href="${esc(r.url)}" target="_blank" rel="noopener">Open on ${esc(r.platform)}</a> · <button class="link" id="copylink" title="${esc(r.url)}">Copy link</button>`:""}</div>
       <div class="meta">${r.obsidian && r.obsidian.uri ? `Obsidian note: <a href="${esc(r.obsidian.uri)}" title="${esc(r.obsidian.path || "")}">${esc(r.obsidian.name)}</a>` : (r.obsidian && r.obsidian.error ? esc(r.obsidian.error) : "")}
         ${r.transcript.length ? ` · <button class="link" id="copyai" title="Copies your Obsidian AI prompt with this transcript - paste it into ChatGPT or Claude">Copy AI prompt</button>` : ""}</div>
@@ -2199,6 +3127,7 @@ function render(r){
   updateNav();
   renderFavs(r);
   showObsLine(r);
+  showShareLine(r);
   const v = $("#vid");
   if (v) v.addEventListener("timeupdate", () => { const ct = $("#captime"); if (ct) ct.textContent = mmss(Math.floor(v.currentTime)); });
   if (v) v.addEventListener("timeupdate", () => {
@@ -2607,6 +3536,12 @@ document.addEventListener("click", async e => {
   const t = e.target, c = sel => t.closest(sel);
   let el;
   if ((el = c("[data-seek]"))) { e.preventDefault(); e.stopPropagation(); return seekTo(+el.dataset.seek); }
+  if (c("#inboxbtn")) return openInbox();
+  if (c("#capbtn")) return capture(false);
+  if ((el = c("[data-share]"))) return current && shareReels([current.id], el.dataset.share);
+  if ((el = c("[data-bulkshare]"))) return shareReels([...selected], el.dataset.bulkshare);
+  if ((el = c("[data-iadd]"))) return inboxAdd(el.dataset.iadd);
+  if ((el = c("[data-idismiss]"))) return inboxDismiss(el.dataset.idismiss);
   if ((el = c("[data-star]"))) return toggleFav(current, el.dataset.star);
   if ((el = c("[data-unfav]"))) return toggleFav(current, el.dataset.unfav);
   if ((el = c("[data-open]"))) { if (e.ctrlKey || e.metaKey || e.shiftKey) { e.preventDefault(); return pick(el.dataset.open, e); } clearSel(); return select(el.dataset.open); }
@@ -2650,12 +3585,14 @@ document.addEventListener("click", async e => {
     case "lbcopy": return copyImage(lb.list[lb.i]);
     case "lbedit": return openEditor(lb.list[lb.i]);
     case "home": return goHome();
+    case "inboxclose": case "inbox": return closeInbox();
+    case "inboxcheck": return inboxCheck();
+    case "sttest": return testCloud();
     case "setbtn": return openSetup(false);
     case "stcancel": return $("#setup").classList.remove("show");
     case "stsave": return saveSetup();
     case "copyai": { try { const j = await api("/api/aiprompt", {id: current.id}); copyText(j.text, "AI prompt + transcript copied - paste it into ChatGPT or Claude"); } catch (err) { alert(err.message); } return; }
     case "lbplay": return seekTo(current.times[lb.list[lb.i]]);
-    case "capbtn": return capture(false);
     case "capstar": return capture(true);
     case "edrotl": return rotate(-1);
     case "edrotr": return rotate(1);
@@ -2677,8 +3614,8 @@ document.addEventListener("click", async e => {
     case "savenotes": {
       clearTimeout(notesTimers[current.id]); delete pending["n:" + current.id];
       if (isBusy(current)) return;
-      try { await api("/api/notes", {id: current.id, notes: $("#notes").value}); current.notes = $("#notes").value; delete current.notesDraft; $("#saved").textContent = "Saved into note.md"; $("#saved").hidden = false; }
-      catch (err) { alert(err.message); } return;
+      try { await api("/api/notes", {id: current.id, notes: $("#notes").value, sb: sbAt(current)}); current.notes = $("#notes").value; delete current.notesDraft; $("#saved").textContent = "Saved into note.md"; $("#saved").hidden = false; }
+      catch (err) { saveFailed(current, err, "notes"); } return;
     }
     case "run": {
       if (runBusy) return;
@@ -2731,6 +3668,7 @@ document.addEventListener("change", async e => {
     moveReels([...selected], cat); return clearSel();
   }
   if (e.target.id === "catsel") setCategory(current, e.target.value);
+  if (e.target.matches && e.target.matches("[data-icat]")) { const it = e.target.closest("[data-iid]"); if (it) inboxCat[it.dataset.iid] = e.target.value; }
   if (["pcols","ptitle","pnums"].includes(e.target.id)) renderPaper();
 });
 
@@ -2798,6 +3736,10 @@ document.addEventListener("keydown", e => {
     else if (e.key !== "Tab") e.preventDefault();
     return;
   }
+  if ($("#inbox").classList.contains("show") && !$("#confirm").classList.contains("show")) {
+    if (e.key === "Escape") { e.preventDefault(); closeInbox(); }
+    return;
+  }
   if ($("#confirm").classList.contains("show") && e.key !== "Enter" && e.key !== "Escape" && e.key !== "Tab") { e.preventDefault(); return; }
   const sp = document.activeElement && document.activeElement.closest && document.activeElement.closest("[data-split]");
   if (sp && splitKey(e, sp)) return;
@@ -2827,6 +3769,147 @@ document.addEventListener("keydown", e => {
   if (e.key === "ArrowRight") open ? (lb.i = (lb.i+1)%lb.list.length, showLb()) : move(1);
 });
 
+/* ---------- sharing: Share with ..., the inbox ---------- */
+let inbox = {on: false, items: [], checked: "", error: "", busy: false, last: null, as: "", changed: []};
+let inboxCat = {}, inboxTimer = null, lastAddAt = null, sharing = false;
+function applyMe(){
+  $("#who").textContent = me.name || "";
+  $("#bulkdel").hidden = !mayDelete();
+  refreshInboxButton();
+}
+function refreshInboxButton(){
+  const n = inbox.items.length, b = $("#inboxbtn");
+  b.hidden = !(inbox.on || n || (me.share && me.share.on));
+  $("#inboxcount").hidden = !n; $("#inboxcount").textContent = n;
+  b.title = n ? `${n} video${n > 1 ? "s" : ""} shared with you` : "Videos shared with you";
+}
+function showShareLine(r){
+  const el = $("#shline"); if (!el || !r) return;
+  const st = r.state || {}, parts = [], last = {};
+  if (st.shared_by) parts.push(`&#8600; Shared with you by <b>${esc(fromName(r))}</b>${st.shared_by.at ? " · " + esc(st.shared_by.at) : ""}`);
+  (st.shared || []).forEach(x => { last[x.to] = x; });
+  Object.values(last).forEach(x => parts.push(`&#8599; Shared with ${esc(x.name || x.to)} · ${esc(x.at || "")}`));
+  el.innerHTML = parts.join("<br>"); el.hidden = !parts.length;
+}
+async function shareReels(ids, person){
+  const p = shareTargets().find(x => x.person === person);
+  if (!p || sharing) return;
+  const rs = ids.map(id => reels.find(r => r.id === id)).filter(Boolean);
+  if (!rs.length) return;
+  if (rs.some(r => busyIds.has(r.id))) return toast("A video is being re-processed - share it when it finishes");
+  if (rs.length > 1 && !confirm(`Share ${rs.length} reels with ${p.name}?\n\n${p.name}'s Reels Hub gets the links, your favorites (times, text and the images you edited), your notes and categories, through your Cloudflare inbox. ${p.name}'s laptop downloads the videos itself.`)) return;
+  sharing = true;
+  toast(`Sharing with ${p.name}...`);
+  try {
+    await flushSaves();
+    const j = await api("/api/share", {ids: rs.map(r => r.id), to: person});
+    j.shared.forEach(x => { const r = reels.find(y => y.id === x.id); if (r) r.state.shared = x.shared; });
+    if (current && j.shared.some(x => x.id === current.id)) showShareLine(current);
+    if (j.shared.length) toast(j.shared.length === 1 ? `Shared with ${p.name}` : `Shared ${j.shared.length} reels with ${p.name}`);
+    const msg = [...j.errors, ...j.notes];
+    if (msg.length) alert((j.errors.length ? (j.shared.length ? "Some were not shared:\n\n" : "Not shared:\n\n") : "") + msg.join("\n"));
+  } catch (e) { alert("Could not share: " + e.message); }
+  finally { sharing = false; }
+}
+function fmtWhen(v){
+  const d = v ? new Date(v) : null;
+  return d && !isNaN(d) ? d.toLocaleString(undefined, {day: "numeric", month: "short", hour: "2-digit", minute: "2-digit"}) : String(v || "");
+}
+function inboxCatOptions(it){
+  const sug = String(it.category || "").trim(), same = cats.find(c => c.toLowerCase() === sug.toLowerCase());
+  const pick = inboxCat[it.id] !== undefined ? inboxCat[it.id] : (same || sug);
+  const opts = [["", "Unassigned"], ...cats.map(c => [c, c + (c === same ? " (suggested)" : "")])];
+  if (sug && !same) opts.push([sug, `${sug} (new, suggested)`]);
+  return opts.map(([v, l]) => `<option value="${esc(v)}" ${v === pick ? "selected" : ""}>${esc(l)}</option>`).join("");
+}
+function renderInbox(){
+  const a = document.activeElement;
+  if (a && a.tagName === "SELECT" && a.closest("#inboxlist")) return;     // don't close a list you have open
+  const L = inbox.items;
+  $("#inboxsub").textContent = L.length ? `${L.length} waiting` : "";
+  $("#inboxlist").innerHTML = L.length ? L.map(it => {
+    const n = it.favorites.length, ed = it.favorites.filter(f => f.image).length, adding = it.status === "adding", who = esc(it.from_name || it.from);
+    return `<div class="iitem" data-iid="${esc(it.id)}">
+      <div class="ititle">${pbadge({platform: it.platform})} ${esc(it.title || it.url)}</div>
+      <div class="imeta">From <b>${who}</b> · ${esc(fmtWhen(it.sent) || it.received)} · ${n} favorite${n === 1 ? "" : "s"}${ed ? ` (${ed} edited)` : ""}${it.notes ? " · notes" : ""} · <a href="${esc(it.url)}" target="_blank" rel="noopener">open link</a></div>
+      ${it.have && it.have.length ? `<div class="istate">You already have this video: Add asks whether to make a new version with ${who}'s favorites</div>` : ""}
+      ${it.notes ? `<div class="inotes">${esc(it.notes)}</div>` : ""}
+      <div class="irow"><label class="meta">Category <select data-icat ${it.status ? "disabled" : ""}>${inboxCatOptions(it)}</select></label><span class="spacer"></span>
+        ${it.status ? `<span class="istate">${adding ? "Adding: downloading and processing..." : "Waiting for the current run..."}</span>` : ""}
+        <button class="btn small" data-idismiss="${esc(it.id)}" ${adding ? "disabled" : ""}>Dismiss</button>
+        <button class="btn small primary" data-iadd="${esc(it.id)}" ${it.status ? "disabled" : ""} title="Download and process the video on this laptop, then fill in ${who}'s favorites, notes and category">Add</button></div>
+      ${it.error ? `<div class="ierr">${esc(it.error)}</div>` : ""}
+    </div>`; }).join("")
+    : `<div class="iempty">Nothing waiting. When someone shares a video with you, it shows up here.</div>`;
+  $("#inboxfoot").innerHTML = !inbox.on ? "Sharing is not set up on this laptop: add the Cloudflare address and this laptop's token in Settings."
+    : `${inbox.busy ? "Checking..." : inbox.checked ? `Last checked ${esc(inbox.checked)}` : "Not checked yet"}${inbox.as ? ` · this laptop is <b>${esc(inbox.as)}</b> in the inbox` : ""} · checked every 90 seconds while Reels Hub runs`
+      + (inbox.error ? `<span class="ierr">${esc(inbox.error)}</span>` : "");
+}
+async function refreshInbox(soon){
+  clearTimeout(inboxTimer);
+  let j = null;
+  try { j = await api("/api/inbox"); } catch (e) {}
+  if (j) {
+    inbox = j;
+    refreshInboxButton();
+    if ($("#inbox").classList.contains("show")) renderInbox();
+    if (j.last && lastAddAt !== null && j.last.at > lastAddAt) toast(`Added "${j.last.title || "the video"}" from ${j.last.from_name || "the inbox"}`);
+    lastAddAt = Math.max(lastAddAt || 0, j.last ? j.last.at : 0);
+    if (j.running) ensurePoll();
+    else if (!polling) { const ch = takeChanged(j.changed, j.boot); if (ch.size) loadReels(current && current.id, ch).catch(() => {}); }
+  }
+  const active = j && (j.busy || j.running || j.items.some(it => it.status));
+  inboxTimer = setTimeout(() => refreshInbox(), active || soon ? 1500 : 20000);
+}
+function openInbox(){
+  if (document.activeElement) document.activeElement.blur();
+  renderInbox(); $("#inbox").classList.add("show");
+  if (inbox.on) api("/api/inbox/check", {}).catch(() => {});     // look for new shares now, not in 90 s
+  refreshInbox(true);
+}
+function closeInbox(){ $("#inbox").classList.remove("show"); }
+async function inboxCheck(){
+  try { await api("/api/inbox/check", {}); } catch (e) { return alert(e.message); }
+  inbox.busy = true; renderInbox(); refreshInbox(true);
+}
+async function inboxAdd(id, existing){
+  const it = inbox.items.find(x => x.id === id); if (!it) return;
+  const sel = document.querySelector(`[data-iid="${CSS.escape(id)}"] [data-icat]`);
+  const category = sel ? sel.value : (inboxCat[id] !== undefined ? inboxCat[id] : "");
+  let j;
+  try { j = await api("/api/inbox/add", {id, category, max_shots: $("#maxshots").value, ...(existing ? {existing} : {})}); }
+  catch (e) { return alert("Could not add: " + e.message); }
+  if (j.existing) {
+    const pick = await chooseExisting(j.existing, 1, it);
+    if (pick === "open") { closeInbox(); return select(j.existing[0].id); }
+    if (pick === "new") return inboxAdd(id, "new");
+    return;
+  }
+  it.status = "queued"; it.error = ""; renderInbox();
+  toast(j.queued > 1 ? `Queued (${j.queued - 1} ahead of it): it is downloaded and processed on this laptop` : "Adding: the video is downloaded and processed on this laptop");
+  refreshInbox(true);
+}
+async function inboxDismiss(id){
+  const it = inbox.items.find(x => x.id === id); if (!it) return;
+  if (!confirm(`Dismiss "${it.title || it.url}" from ${it.from_name || it.from}?\n\nIt is not added to your library.`)) return;
+  try { await api("/api/inbox/dismiss", {id}); } catch (e) { return alert(e.message); }
+  inbox.items = inbox.items.filter(x => x.id !== id); delete inboxCat[id];
+  renderInbox(); refreshInboxButton(); toast("Dismissed");
+}
+async function testCloud(){
+  const out = $("#sttestres"), b = $("#sttest");
+  out.className = "meta"; out.textContent = "Connecting..."; b.disabled = true;
+  try {
+    const j = await api("/api/cloud/test", {cloud_url: $("#stcurl").value, cloud_id: $("#stcid").value, cloud_secret: $("#stcsec").value});
+    const others = (j.people || []).map(p => p.name).join(", "), typed = $("#stname").value.trim();
+    out.className = "ok";
+    out.textContent = `✓ Connected as ${j.name}` + (others ? ` · can share with ${others}` : " · no one else in PEOPLE yet")
+      + (j.can_delete ? "" : ` · deleting videos is off for ${j.name}`)
+      + (typed && typed.toLowerCase() !== String(j.name).toLowerCase() ? ` · note: this token belongs to ${j.name}, not ${typed}` : "");
+  } catch (e) { out.className = "bad"; out.textContent = e.message; }
+  finally { b.disabled = false; }
+}
+
 /* ---------- progress / ETA ---------- */
 const hms = sec => { sec = Math.max(0, Math.round(sec)); const h = Math.floor(sec/3600), m = Math.floor(sec%3600/60), x = sec%60;
   return h ? `${h}:${String(m).padStart(2,"0")}:${String(x).padStart(2,"0")}` : `${m}:${String(x).padStart(2,"0")}`; };
@@ -2843,8 +3926,18 @@ function showProgress(s){
 }
 
 /* ---------- run polling ---------- */
-let lastRunTargets = new Set(), runBusy = false;
+let lastRunTargets = new Set(), runBusy = false, polling = false, changedSeq = null, bootId = null;
+function takeChanged(list, boot){          // reels an inbox Add filled in since we last looked: reload them
+  const L = Array.isArray(list) ? list : [], ids = new Set();
+  if (changedSeq === null) return ids;     // nothing loaded yet: the first list sets the starting point
+  if (boot && boot !== bootId) { bootId = boot; changedSeq = 0; }   // the app was restarted: its count starts again
+  L.forEach(c => { if (c.seq > changedSeq) ids.add(c.folder); });
+  changedSeq = L.reduce((m, c) => Math.max(m, c.seq || 0), changedSeq);
+  return ids;
+}
+function ensurePoll(){ if (!polling) poll(); }
 async function poll(){
+  polling = true;
   let s;
   try { s = await api("/api/status"); }
   catch (e) { setTimeout(poll, 3000); return; }          // server hiccup: keep trying
@@ -2856,12 +3949,19 @@ async function poll(){
   showProgress(s);
   $("#status").classList.toggle("on", s.running);
   $("#logtitle").textContent = s.running ? "Run log · working (first run downloads models)" : "Run log";
-  if (s.running) { wasRunning = true; refreshQuiet().catch(() => {}); setTimeout(poll, 1000); }
-  else if (wasRunning) {
+  const fresh = takeChanged(s.changed, s.boot);
+  if (s.running) {
+    wasRunning = true; refreshQuiet().catch(() => {});
+    if (fresh.size) loadReels(current && current.id, fresh).catch(() => {});
+    setTimeout(poll, 1000); return;
+  }
+  polling = false;
+  if (wasRunning || fresh.size) {
     wasRunning = false;
-    const changed = lastRunTargets; lastRunTargets = new Set(); busyIds = new Set();
+    const redone = lastRunTargets, changed = new Set([...redone, ...fresh]); lastRunTargets = new Set(); busyIds = new Set();
     try { await loadReels(current && current.id, changed); } catch (e) {}
-    if (current && changed.has(current.id)) toast("Re-process finished");
+    if (current && redone.has(current.id)) toast("Re-process finished");
+    refreshInbox();
   }
 }
 async function refreshQuiet(){
@@ -2878,7 +3978,7 @@ $("#groupby").value = groupBy; $("#sortby").value = sortBy;
 if (!$("#groupby").value) { groupBy = "category"; $("#groupby").value = groupBy; }
 if (!$("#sortby").value) { sortBy = "posted-new"; $("#sortby").value = sortBy; }
 try { const m = localStorage.getItem("rh-maxshots"); if (m && [...$("#maxshots").options].some(o => o.value === m)) $("#maxshots").value = m; } catch (e) {}
-let me = {name: "", person: ""}, setupFirst = false;
+let me = {name: "", person: "", can_delete: true, share: {on: false, people: [], as: ""}}, setupFirst = false;
 async function openSetup(first){
   const c = await api("/api/config");
   setupFirst = first;
@@ -2887,7 +3987,12 @@ async function openSetup(first){
   $("#stintro").textContent = first ? "Tell the app who you are and where to keep things. You can change this later under Settings."
                                     : "Your name and folders on this computer.";
   $("#stname").value = cfg.name || ""; $("#stout").value = cfg.out || ""; $("#stvault").value = cfg.vault || "";
-  $("#stcancel").hidden = first; $("#stsave").textContent = first ? "Save and start" : "Save";
+  const cl = (c.configured && c.config.cloud) || {};
+  $("#stcurl").value = cl.url || ""; $("#stcid").value = cl.id || ""; $("#stcsec").value = "";
+  $("#stcsec").placeholder = cl.has_secret ? "Saved - leave empty to keep it" : "";
+  $("#sttestres").className = "meta";
+  $("#sttestres").textContent = cl.name ? `This laptop is ${cl.name} in the inbox` + (cl.checked ? ` (checked ${cl.checked})` : "") : "";
+  $("#stcancel").hidden = first; $("#stcancel").textContent = "Cancel"; $("#stsave").textContent = first ? "Save and start" : "Save";
   $("#sterr").hidden = true; $("#sterr").className = "sterr";
   $("#stpath").textContent = "Saved on this computer in " + c.path + (c.overrides.length ? " · started with --" + c.overrides.join(" --") + ", which overrides these" : "");
   $("#setup").classList.add("show");
@@ -2896,18 +4001,27 @@ async function openSetup(first){
 async function saveSetup(){
   const b = $("#stsave"); b.disabled = true;
   try {
-    const j = await api("/api/config", {name: $("#stname").value, out: $("#stout").value, vault: $("#stvault").value});
+    const j = await api("/api/config", {name: $("#stname").value, out: $("#stout").value, vault: $("#stvault").value,
+      cloud_url: $("#stcurl").value, cloud_id: $("#stcid").value, cloud_secret: $("#stcsec").value});
     if (j.warning) { $("#sterr").textContent = j.warning; $("#sterr").className = "sterr stwarn"; $("#sterr").hidden = false; }
-    $("#setup").classList.remove("show");
+    const bad = j.cloud_test && !j.cloud_test.ok;
+    if (bad) {                                     // saved, but the token or address needs a look
+      $("#sterr").textContent = "Saved. But the Cloudflare inbox could not be reached: " + j.cloud_test.error;
+      $("#sterr").className = "sterr"; $("#sterr").hidden = false;
+      $("#stcsec").value = ""; $("#stcsec").placeholder = "Saved - leave empty to keep it";
+      setupFirst = false; $("#stcancel").hidden = false; $("#stcancel").textContent = "Close";
+    } else $("#setup").classList.remove("show");
     current = null; reels = [];
-    await loadReels(); setView(view);
-    toast(setupFirst ? `Welcome, ${j.config.name}!` : "Settings saved");
+    await loadReels(); setView(view); refreshInbox();
+    if (!bad) toast(setupFirst ? `Welcome, ${j.config.name}!` : "Settings saved");
   } catch (e) { $("#sterr").textContent = e.message; $("#sterr").className = "sterr"; $("#sterr").hidden = false; }
   finally { b.disabled = false; }
 }
 (async () => {
   try { const c = await api("/api/config"); if (!c.configured) await openSetup(true); } catch (e) {}
   await loadReels(); setView(view); poll();
+  if (me.share && me.share.on) await api("/api/inbox/check", {}).catch(() => {});   // opening the app looks for shares
+  refreshInbox(true);
 })();
 </script>
 </body>
@@ -2945,6 +4059,9 @@ def main():
         webbrowser.open(url)
         return
     print(f"Reels Hub running at {url}  (reels folder: {OUT})\nPress Ctrl+C to stop.")
+    if cloud_settings():
+        print(f"Sharing: inbox at {CONFIG['cloud']['url']} (checked every {PICKUP_EVERY} s while this runs)")
+    threading.Thread(target=inbox_worker, daemon=True).start()
     if not args.no_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     try:

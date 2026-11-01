@@ -17,6 +17,8 @@ Drag the edges between the list, the video and the text to give each one more or
 
 Snapshots can be edited inside the app (crop, rotate, draw, arrows, boxes, text, blur, undo) or opened in Paint; the original is always kept for **Reset to original**. Images and video links can be copied to paste into chat apps.
 
+Two people with their own laptops can **share** videos with each other on purpose: see [Sharing between two laptops](#sharing-between-two-laptops-optional).
+
 ## Install (Windows)
 
 **Easiest:** download this folder (on GitHub: Code, Download ZIP, then extract it, e.g. to `Documents\reels-hub`) and double-click **`install.bat`**. It installs Python, ffmpeg and Deno if they are missing, the Python packages, and puts a **Reels Hub** shortcut on the desktop. If it says Windows needs a fresh window, close it and run `install.bat` once more.
@@ -38,6 +40,7 @@ Double-click **Reels Hub** on the desktop (or `reels-hub.bat`). The first time, 
 - **Your name** - each laptop belongs to one person; every video you add is marked as yours.
 - **Reels folder** - where videos, snapshots and notes are saved (suggested: `Downloads\reels`).
 - **Obsidian vault** - optional; leave it empty if you don't use Obsidian.
+- **Sharing** - optional: the address of your Cloudflare inbox and this laptop's token (see below). Leave it empty if you don't share.
 
 These are saved on that computer only (`%APPDATA%\ReelsHub\config.json`). Change them any time with **Settings** at the top right. Each of you has your own library, categories, favorites and notes on your own laptop.
 
@@ -64,6 +67,8 @@ python reels2notes.py -f links.txt
 |---|---|---|
 | Videos, snapshots, notes, favorites, categories | the reels folder from Settings (default `Downloads/reels`) | Settings, or `--out PATH` |
 | Obsidian notes | new notes in `<vault>/YouTube`, `/TikTok`, `/Instagram`, `/X` - move or rename them freely, the app finds them again; favorite images in `910_Attachments/ReelsHub` | `--vault PATH` |
+| Shares waiting in your Inbox | `_inbox` in the reels folder (dismissed ones in `_trash/_inbox`) | - |
+| Your name, folders, sharing token | `%APPDATA%\ReelsHub\config.json` on this computer | Settings |
 
 The vault comes from Settings. If none is set or it is not found, Obsidian sync is switched off.
 
@@ -83,9 +88,35 @@ X often needs login for videos. If an X link fails, this is the usual fix.
 
 In the app: save the file as `cookies.txt` next to `reels_hub.py` and press Run again. The app uses it automatically, and a download that fails with cookies is retried without them.
 
+## Sharing between two laptops (optional)
+
+Each laptop has its own library. To give the other person a video on purpose, press **Share with <name>** on a reel, or select several (Ctrl+click or Shift+click) and use **Share with <name>** in the bar at the bottom.
+
+**What goes through the inbox:** the link, the video's title (so the Inbox can show what it is), your favorites (their time in the video, their text, the Corrected mark, and the image only where you edited it), your My notes and your category as a suggestion. Who sent it comes from the sign-in, not from the app. Nothing else: no video, snapshots, transcript or Obsidian note. The other laptop downloads and processes the video itself.
+
+**On the other laptop:** Reels Hub looks for shares when it opens, when you open **Inbox**, and every 90 seconds while it runs (or press **Check now**). A share is copied to that laptop and deleted from Cloudflare straight away; one that is never picked up is deleted after 30 days. **Inbox** lists who sent what, how many favorites, the notes and the suggested category (pick another one if you like):
+
+- **Add** downloads and processes the video on that laptop, takes the favorites again at the same moments (with the sender's edited images), fills in their text and Corrected marks, the notes and the category, and marks the reel as shared (↘ name). If you already have the video, it offers a new version instead. Several Adds wait in line, like Run. If the download fails, the share stays in the Inbox with the reason; press Add again later.
+- **Dismiss** leaves it out (it moves to `_trash/_inbox` in the reels folder).
+
+**Settings, Sharing:** the inbox address and this laptop's service token (Client ID and Client Secret), with **Test connection**. They are saved only on this computer, never in the app folder.
+
+**Deleting:** each person has full control of their own gallery, deleting videos and images included. Optional, off by default: `"delete": false` in a person's entries in the inbox's `PEOPLE` list hides **Delete this reel** on their laptop and the app refuses it.
+
+**Your own inbox** (the `cloud/` folder): a Cloudflare Pages project with one Functions API and a D1 database, behind Cloudflare Access (an email code for people, one service token per laptop). It runs on free plans and needs Node.js 22 or newer for `wrangler`:
+
+1. In `cloud/`: `npm install`, `npx wrangler login`, `npx wrangler d1 create reels-hub --jurisdiction eu`.
+2. Copy `wrangler.toml.example` to `wrangler.toml` (kept out of git), put in a hard-to-guess project name and the `database_id`, then `npm run db:remote`.
+3. `npx wrangler pages project create <name> --production-branch main`.
+4. Cloudflare Zero Trust: one service token per laptop; a Self-hosted Access application for `<name>.pages.dev` and `*.<name>.pages.dev` (once the Pages project exists, its address is in the Domain list) with an Allow policy (your emails, one-time PIN) and a Service Auth policy (the tokens). Copy its AUD tag (the application's Additional settings).
+5. Secrets: `npx wrangler pages secret put ACCESS_TEAM_DOMAIN` (`<team>.cloudflareaccess.com`), `ACCESS_AUD`, and `PEOPLE`, for example `{"you@example.com":{"person":"anna","name":"Anna"},"<laptop client id>":{"person":"anna","name":"Anna"},"him@example.com":{"person":"ben","name":"Ben"},"<his laptop client id>":{"person":"ben","name":"Ben"}}`.
+6. `npm run deploy`, then put the address and each laptop's token into that laptop's Settings.
+
+The API checks Access's signed token on every request (audience, issuer, expiry), so it also refuses anything that did not come through Access.
+
 ## Notes
 
-- Everything runs on your own machine. The app listens on 127.0.0.1 only and ignores requests from other websites.
+- Everything runs on your own machine. The app listens on 127.0.0.1 only and ignores requests from other websites. Sharing is the only part that goes online, and it sends only what is listed above.
 - My notes and favorite text save automatically. Re-processing a video keeps your notes; its favorites are cleared only if the run succeeds, and the video's controls pause while it runs.
 - Long videos: snapshots are capped per video (`--max-shots auto` or a number; set it next to Run in the app), on-screen text is read from at most 60 of them, and transcription on CPU takes roughly a quarter to a half of the video's length.
 - Running a link that is already done asks what to do: **New version** (a separate copy, v2, v3... - the original and its favorites stay) or **Skip**. On a reel, **+ New version** does the same and **Re-process** replaces that version. Both reuse the downloaded video.
