@@ -343,6 +343,7 @@ def parse_note(folder):
         "mt": {s: int((folder / "shots" / s).stat().st_mtime) for s in shots},
         "edited": sorted(p.name for p in (folder / "shots" / "_orig").glob("*.jpg")) if (folder / "shots" / "_orig").exists() else [],
         "video": videos[0] if videos else None,
+        "slides": read_slides(folder),
         "added": _added(folder),
         "owner": meta.get("owner", "") or CONFIG.get("person", ""),
         "state": read_state(folder),
@@ -637,7 +638,8 @@ def vault_note_text(folder, r, state):
              f"**Tags**: #{plat} {tag_cat}".rstrip(),
              f"**Related**: {NOTE_RELATED.get(plat, f'[[{plat}_MOC]]')}",
              f"**Creator:** {r['author']}" + (f" - {creator_url}" if creator_url else ""),
-             f"**Posted:** {r['date']}" + (f" · {_dur(r['duration'])}" if _dur(r["duration"]) else ""),
+             f"**Posted:** {r['date']}" + (f" · {len(r['slides'])} slides" if r.get("slides") else
+                                           f" · {_dur(r['duration'])}" if _dur(r["duration"]) else ""),
              f"**Category**: {state['category'] or '-'}",
              _marker(r["id"]),
              "",
@@ -649,8 +651,11 @@ def vault_note_text(folder, r, state):
               "## My notes", "", r["notes"] or "", "",
               "# **Description**:", "", r["caption"] or "_none_", ""]
     if r["ocr"]:
-        lines += ["## On-screen text", ""] + [f"- **{mmss(r['times'].get(x['shot'], 0))}** {x['text']}" for x in r["ocr"]] + [""]
+        lines += ["## On-screen text", ""] + [f"- **{tlabel(r, r['times'].get(x['shot'], 0))}** {x['text']}" for x in r["ocr"]] + [""]
     lines += ["# **Content**:", ""]
+    if r.get("slides") and not r["transcript"]:            # photo slideshow: the slides' text, in order
+        lines += [f"**{tlabel(r, r['times'].get(x['shot'], 0))}:** {x['text']}\n" for x in r["ocr"]] or ["_No text found on the slides._", ""]
+        return "\n".join(lines) + "\n"
     lines += [p + "\n" for p in _paragraphs(full_text)] or ["_No speech detected._", ""]
     lines += ["# **Original text:**", ""]
     lines += [f"{mmss(x['t'])} {x['text']}" for x in r["transcript"]] or ["_No speech detected._"]
@@ -698,7 +703,7 @@ def send_to_obsidian(reel_id):
     block = []
     for i, f in enumerate(favs, 1):
         block += [f"![[{att_rel}/{f['shot']}|320]]",
-                  f"**{i}. [{mmss(r['times'].get(f['shot'], 0))}]({_at(r['url'], r['times'].get(f['shot'], 0))})** {f['text']}"]
+                  f"**{i}. [{tlabel(r, r['times'].get(f['shot'], 0))}]({_at(r['url'], r['times'].get(f['shot'], 0))})** {f['text']}"]
         if f.get("corrected"):
             block.append("*Corrected text*")
         block.append("")
@@ -754,8 +759,12 @@ def ai_prompt(reel_id):
                   '<mark style="background: #FFF3A3A6;">keyword</mark>: ' + ", ".join(AI_SECTIONS) + ".")
     head = (f"Video: {r['title'] or r['label']}\nSource: {r['url']}\nCreator: {r['author']}\n\n"
             "Answer each section below as Markdown under '## <section name>' headings, in this order.\n\n")
-    return head + prompt.strip() + "\n\n---\nTranscript:\n\n" + " ".join(x["text"] for x in r["transcript"]) + \
-        ("\n\nDescription:\n" + r["caption"] if r["caption"] else "")
+    slides = ""
+    if r.get("slides"):                                   # a slideshow: its text is on the slides
+        slides = "\n\nText on the slides:\n" + "\n".join(f"{tlabel(r, r['times'].get(x['shot'], 0))}: {x['text']}" for x in r["ocr"])
+    spoken = " ".join(x["text"] for x in r["transcript"])
+    return head + prompt.strip() + "\n\n---\n" + (("Transcript:\n\n" + spoken) if spoken or not slides else "Photo slideshow (no speech).") + \
+        slides + ("\n\nDescription:\n" + r["caption"] if r["caption"] else "")
 
 
 def safe_path(rel):
@@ -772,6 +781,34 @@ def safe_path(rel):
 def mmss(t):
     t = int(round(t))
     return f"{t // 60:02d}:{t % 60:02d}"
+
+
+def read_slides(folder):
+    """A photo slideshow's slides [{n, kind, start, dur}] (slides.json from reels2notes), else None."""
+    try:
+        d = json.loads((folder / "slides.json").read_text(encoding="utf-8", errors="replace"))
+        out = [{"n": int(x["n"]), "kind": "video" if x.get("kind") == "video" else "image",
+                "start": float(x["start"]), "dur": float(x["dur"])} for x in d.get("slides", [])]
+        return out or None
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def slide_at(slides, t):
+    """The slide shown at time t."""
+    cur = slides[0]
+    for x in slides:
+        if x["start"] <= t + 0.001:
+            cur = x
+    return cur
+
+
+def tlabel(r, t):
+    """Where a moment is: mm:ss for a video, 'Slide 3' (or 'Slide 3 · 00:04' in a video slide) for a slideshow."""
+    if not r.get("slides"):
+        return mmss(t)
+    x = slide_at(r["slides"], t)
+    return f"Slide {x['n']}" + (f" · {mmss(t - x['start'])}" if x["kind"] == "video" else "")
 
 
 # ---------------------------------------------------------------- saving
@@ -850,11 +887,12 @@ def write_note_favorites(folder, favs):
         text = re.sub(r"\n## Favorites\n.*?(?=\n## (?:Snapshots|My notes)|\x00NOTES|\Z)", "", text, flags=re.S)
     if favs:
         times = shot_times(folder, sorted(p.name for p in (folder / "shots").glob("*.jpg")))
+        sl = {"slides": read_slides(folder)}
         lines = ["", "## Favorites"]
         for f in favs:
             lines.append(f"![[{folder.name}/shots/{f['shot']}]]")
             mark = " _(corrected text)_" if f["corrected"] else ""
-            lines.append(f"**{mmss(times.get(f['shot'], 0))}** {f['text']}{mark}")
+            lines.append(f"**{tlabel(sl, times.get(f['shot'], 0))}** {f['text']}{mark}")
             lines.append("")
         lines = lines[:2] + [LFAV_S] + lines[2:]
         block = "\n".join(lines).rstrip("\n") + "\n" + LFAV_E + "\n"
@@ -1505,11 +1543,7 @@ def inbox_add(body):
     category = _plain(body.get("category"), 100)
     if category.lower() == "unassigned":
         category = ""
-    ms = str(body.get("max_shots") or "auto").lower()
-    try:
-        max_shots = "auto" if ms == "auto" else str(max(10, min(1000, int(ms))))
-    except ValueError:
-        max_shots = "auto"
+    max_shots = shots_setting(body.get("max_shots"))
     task = {"id": sid, "category": category, "new": False, "max_shots": max_shots}
     fill = None
     if part:                                        # downloaded before, but the fill-in failed: only fill in now
@@ -1778,6 +1812,17 @@ def find_done(url):
     return hits
 
 
+def shots_setting(v):
+    """The snapshot choice from the page: 'auto', a maximum (10 to 1000), or 'every:N' (seconds, 0.5 to 600)."""
+    ms = str(v or "auto").strip().lower()
+    try:
+        if ms.startswith("every:"):
+            return f"every:{min(600.0, max(0.5, float(ms.split(':', 1)[1]))):g}"
+        return "auto" if ms == "auto" else str(max(10, min(1000, int(ms))))
+    except ValueError:
+        return "auto"
+
+
 def run_job(urls, max_shots="auto", redo=False, flags=(), target=None, share=None):
     # JOB["running"] was already claimed under JOB_LOCK (by the request handler, or start_next_add for a share)
     JOB.update(log=[], started=time.time(), finished=None, urls=urls, progress=None, busy={target} if target else set(),
@@ -1947,11 +1992,7 @@ class Handler(BaseHTTPRequestHandler):
                 urls = list(dict.fromkeys(urls))
                 if not urls and not body.get("target"):
                     return self.send_json({"error": "No links found"}, 400)
-                ms = str(body.get("max_shots") or "auto").lower()
-                try:
-                    max_shots = "auto" if ms == "auto" else str(max(10, min(1000, int(ms))))
-                except ValueError:
-                    max_shots = "auto"
+                max_shots = shots_setting(body.get("max_shots"))
                 flags, redo = [], False
                 target = body.get("target") or ""
                 if target:                                   # a button on one reel
@@ -2321,6 +2362,7 @@ video.seekflash{animation:seekflash 1s}
 .shots figure:hover .shotdel{opacity:1}
 .shotdel:hover{background:#c94a47}
 #maxshots{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:5px 6px;font-size:12px}
+#everyn{width:58px;background:var(--panel2);color:inherit;border:1px solid var(--line);border-radius:8px;padding:5px 6px;font-size:12px}
 .rowbtns{display:flex;gap:8px;flex-wrap:wrap}
 .right{display:flex;flex-direction:column;gap:16px;min-width:0}
 #log{position:fixed;right:16px;bottom:16px;width:min(560px,calc(100vw - 32px));max-height:40vh;display:none;flex-direction:column;z-index:5}
@@ -2355,6 +2397,7 @@ video.seekflash{animation:seekflash 1s}
 #edtext{position:absolute;display:none;background:rgba(0,0,0,.35);border:1px dashed #fff;outline:none;font-weight:700;padding:0 4px;min-width:120px;font-family:system-ui,"Segoe UI",sans-serif;z-index:2}
 .edhint{text-align:center;color:var(--muted);font-size:12px;padding:8px}
 .capbar{display:flex;gap:8px}
+.slidebar{display:flex;gap:8px;align-items:center;justify-content:space-between}
 .capbar #capbtn{flex:1}
 #captime{font-variant-numeric:tabular-nums;color:var(--accent);margin-left:4px}
 .shots figure.man figcaption{color:var(--accent)}
@@ -2475,10 +2518,13 @@ body:has(#bulkbar.show) #log{bottom:84px}
       <textarea id="urls" placeholder="Paste Instagram, TikTok, YouTube or X links, one per line"></textarea>
       <div class="row">
         <button class="btn primary" id="run">Run</button>
-        <select id="maxshots" title="Auto: works out how many snapshots from the video's length and how fast it is edited. Or pick a maximum.">
+        <select id="maxshots" title="Auto: works out how many snapshots from the video's length and how fast it is edited. Or pick a maximum, or Every ... s to set the seconds between snapshots yourself.">
           <option value="auto" selected>Auto shots</option>
           <option value="60">Max 60</option><option value="120">Max 120</option>
-          <option value="200">Max 200</option><option value="400">Max 400</option></select>
+          <option value="200">Max 200</option><option value="400">Max 400</option>
+          <option value="every">Every ... s</option></select>
+        <input id="everyn" type="number" min="0.5" max="600" step="0.5" value="5" hidden
+          title="Seconds between snapshots: exactly one every this many seconds, no extra ones at scene cuts (at most 1000 per video)"> 
         <span class="status" id="status">Idle</span>
       </div>
       <div id="prog" hidden>
@@ -2629,6 +2675,10 @@ const shotUrl = (r, shot) => media(r.id, "shots/" + shot) + (r.mt && r.mt[shot] 
 const media = (id, f) => `/media/${encodeURIComponent(id)}/${f.split("/").map(encodeURIComponent).join("/")}`;
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const mmss = t => { t = Math.round(t || 0); return `${String(Math.floor(t/60)).padStart(2,"0")}:${String(t%60).padStart(2,"0")}`; };
+/* photo slideshows (Instagram posts with several slides): the video is the slides joined; say "Slide 3", not 00:10 */
+const slideAt = (slides, t) => slides.reduce((cur, x) => x.start <= t + 0.001 ? x : cur, slides[0]);
+const tlabel = (r, t) => { if (!r || !r.slides) return mmss(t); const x = slideAt(r.slides, +t || 0);
+  return `Slide ${x.n}` + (x.kind === "video" ? ` · ${mmss((+t || 0) - x.start)}` : ""); };
 const PB = {Instagram: ["IG", "#e1306c"], TikTok: ["TT", "#25f4ee"], YouTube: ["YT", "#ff4e45"], X: ["X", "#e7e9ea"]};
 const pbadge = r => { const [t, c] = Object.prototype.hasOwnProperty.call(PB, r.platform) ? PB[r.platform] : [String(r.platform||"").slice(0,3), "#8b949b"]; return `<span class="pb" style="--pc:${c}" title="${esc(r.platform)}">${esc(t)}</span>`; };
 const vtag = r => r.version > 1 ? ` <span class="vtag" title="Version ${r.version}">v${r.version}</span>` : "";
@@ -2848,7 +2898,8 @@ function seekTo(t){
   $("#lightbox").classList.remove("show");
   if (favFull) toggleFull(false);
   v.currentTime = Math.max(0, t);
-  v.play().catch(() => {});
+  if (current && current.slides && slideAt(current.slides, t).kind === "image") v.pause();   // a photo: stay on it
+  else v.play().catch(() => {});
   v.scrollIntoView({block: "nearest", behavior: "smooth"});
   v.classList.remove("seekflash"); void v.offsetWidth; v.classList.add("seekflash");
 }
@@ -2864,6 +2915,20 @@ function goHome(){
   $("#list").scrollTop = 0;
   if (filtered[0]) select(filtered[0].id); else $("#main").innerHTML = `<div class="empty">No reels yet. Paste links on the left and press Run.</div>`;
   $("#main").scrollTop = 0;
+}
+
+function stepSlide(d){
+  const v = $("#vid"), r = current; if (!v || !r || !r.slides) return;
+  const L = r.slides, i = Math.max(0, Math.min(L.length - 1, L.indexOf(slideAt(L, v.currentTime)) + d)), x = L[i];
+  v.currentTime = x.kind === "image" ? x.start + x.dur / 2 : x.start + 0.01;   // a photo: its middle, where its snapshot is
+  if (x.kind === "image") v.pause();
+  showSlidePos();
+}
+function showSlidePos(){
+  const v = $("#vid"), el = $("#slpos"), r = current; if (!v || !el || !r || !r.slides) return;
+  const x = slideAt(r.slides, v.currentTime);
+  el.textContent = `Slide ${x.n} / ${r.slides.length}${x.kind === "video" ? " (video)" : ""}`;
+  $("#slprev").disabled = x === r.slides[0]; $("#slnext").disabled = x === r.slides[r.slides.length - 1];
 }
 
 let capBusy = false;
@@ -2913,9 +2978,22 @@ async function deleteShots(names, ask, allowFav=false){
   renderList();
   toast(`Deleted ${gone.size} snapshot${gone.size===1?"":"s"}`);
 }
+/* snapshot choice: "auto", a maximum, or "every:N" (a snapshot every N seconds, typed in the box next to it) */
+function shotsValue(){
+  if ($("#maxshots").value !== "every") return $("#maxshots").value;
+  const n = Math.min(600, Math.max(0.5, parseFloat($("#everyn").value) || 5));
+  $("#everyn").value = n;
+  return `every:${n}`;
+}
+function shotsText(v){
+  if (v === "auto") return "Auto snapshots";
+  if (v.startsWith("every:")) return `a snapshot every ${v.slice(6)} s`;
+  return `up to ${v} snapshots`;
+}
+function saveShotsChoice(){ try { localStorage.setItem("rh-maxshots", $("#maxshots").value); localStorage.setItem("rh-everyn", $("#everyn").value); } catch (e) {} }
 async function reprocess(r){
   if (!r.url) return alert("This reel has no source link, so it can't be re-processed.");
-  const n = $("#maxshots").value, nTxt = n === "auto" ? "Auto snapshots" : `up to ${n} snapshots`;
+  const n = shotsValue(), nTxt = shotsText(n);
   const favNote = r.state.favorites.length ? `\n\nIts ${r.state.favorites.length} favorite${r.state.favorites.length===1?"":"s"} will be cleared when it finishes, because the snapshots are replaced (they are kept if the run fails).` : "";
   if (!confirm(`Re-process this video with ${nTxt}?\n\nThe transcript and snapshots are made again from the downloaded video (no new download). Your Obsidian note is not changed.${favNote}`)) return;
   await flushSaves();
@@ -2925,7 +3003,7 @@ async function reprocess(r){
   toast("Re-processing... favorites are cleared only if it succeeds"); $("#log").classList.add("show"); poll();
 }
 async function newVersion(r){
-  const n = $("#maxshots").value, nTxt = n === "auto" ? "Auto snapshots" : `up to ${n} snapshots`;
+  const n = shotsValue(), nTxt = shotsText(n);
   if (!confirm(`Make a new version of this video with ${nTxt}?\n\nIt reuses the downloaded file (no new download). This version and its favorites stay as they are.`)) return;
   try { await api("/api/run", {target: r.id, action: "new", max_shots: n}); } catch (e) { return alert(e.message); }
   lastRunTargets = new Set(); $("#log").classList.add("show"); poll();
@@ -3019,7 +3097,7 @@ function renderGallery(){
           <span class="tick">&#10003;</span>
           <div class="gthumb">${cover(r) ? `<img loading="lazy" src="${shotUrl(r, cover(r))}" alt="">` : ""}
             ${r.state.favorites.length ? `<span class="gstar">&#9733; ${r.state.favorites.length}</span>` : ""}
-            ${r.duration ? `<span class="gdur">${mmss(+r.duration)}</span>` : ""}</div>
+            ${r.slides ? `<span class="gdur">${r.slides.length} slides</span>` : r.duration ? `<span class="gdur">${mmss(+r.duration)}</span>` : ""}</div>
           <div class="gtitle">${esc(r.label)}</div>
           <div class="s">${pbadge(r)}${vtag(r)} ${esc(r.author)} · ${esc(r.date)}${fromBadge(r)}</div>
         </div>`).join("") : `<div class="gdrop">Drop reels here</div>`}</div></section>`;
@@ -3084,15 +3162,18 @@ function render(r){
       </div>
       ${r.video ? `<div class="capbar"><button class="btn" id="capbtn" title="Take a snapshot of what's on screen now (S)">&#128248; Snapshot <span id="captime">00:00</span></button>
         <button class="btn" id="capstar" title="Snapshot and add it to favorites (Shift+S)">&#128248; + &#9733;</button></div>` : ""}
+      ${r.video && r.slides ? `<div class="slidebar"><button class="btn" id="slprev" title="Previous slide (,)">&#9664; Slide</button>
+        <span class="pos" id="slpos">Slide 1 / ${r.slides.length}</span>
+        <button class="btn" id="slnext" title="Next slide (.)">Slide &#9654;</button></div>` : ""}
       <label class="catsel">Category ${catSelect(r)}</label>
       <div class="rowbtns">${shareTargets().map(p => `<button class="btn small" data-share="${esc(p.person)}" ${r.url ? "" : "disabled"} title="${r.url ? `Send the link, your favorites (times, text, edited images), notes and category to ${esc(p.name)}'s Reels Hub` : "This reel has no source link"}">&#8599; Share with ${esc(p.name)}</button>`).join("")}
         <button class="btn small" id="redo" title="Transcribe and take snapshots again, replacing this version">&#8635; Re-process</button>
         <button class="btn small" id="newver" title="Process the video again as a separate copy; this version and its favorites stay">+ New version</button>
         ${mayDelete() ? `<button class="btn small danger" id="delone">Delete this reel</button>` : ""}</div>
       <div class="meta shline" id="shline" hidden></div>
-      <div class="meta">${esc(r.author)} · ${esc(r.date)}${r.duration?` · ${Math.round(r.duration)}s`:""}${r.url?` · <a href="${esc(r.url)}" target="_blank" rel="noopener">Open on ${esc(r.platform)}</a> · <button class="link" id="copylink" title="${esc(r.url)}">Copy link</button>`:""}</div>
+      <div class="meta">${esc(r.author)} · ${esc(r.date)}${r.slides ? ` · ${r.slides.length} slides` : r.duration?` · ${Math.round(r.duration)}s`:""}${r.url?` · <a href="${esc(r.url)}" target="_blank" rel="noopener">Open on ${esc(r.platform)}</a> · <button class="link" id="copylink" title="${esc(r.url)}">Copy link</button>`:""}</div>
       <div class="meta">${r.obsidian && r.obsidian.uri ? `Obsidian note: <a href="${esc(r.obsidian.uri)}" title="${esc(r.obsidian.path || "")}">${esc(r.obsidian.name)}</a>` : (r.obsidian && r.obsidian.error ? esc(r.obsidian.error) : "")}
-        ${r.transcript.length ? ` · <button class="link" id="copyai" title="Copies your Obsidian AI prompt with this transcript - paste it into ChatGPT or Claude">Copy AI prompt</button>` : ""}</div>
+        ${r.transcript.length || r.slides ? ` · <button class="link" id="copyai" title="Copies your Obsidian AI prompt with this transcript - paste it into ChatGPT or Claude">Copy AI prompt</button>` : ""}</div>
     </div>
     <div class="split" data-split="player" role="separator" aria-orientation="vertical" aria-label="Width of the video column" tabindex="0" title="Drag to change the width · double-click for the standard width"></div>
     <div class="right">
@@ -3103,7 +3184,7 @@ function render(r){
           : `<span class="meta">No speech detected</span>`}${r.lang?`<div class="meta" style="margin-top:8px">Language: ${esc(r.lang)}</div>`:""}</div>
         <div class="pane ${tab==="caption"?"active":""}" data-pane="caption">${esc(r.caption) || `<span class="meta">No caption</span>`}</div>
         <div class="pane ${tab==="ocr"?"active":""}" data-pane="ocr">${
-          r.ocr.length ? r.ocr.map(x => `<div class="oline">${r.shots.includes(x.shot) ? `<img src="${shotUrl(r, x.shot)}" data-shot="${esc(x.shot)}" alt="">` : ""}<span><button class="ts tlink" data-seek="${r.times[x.shot]}" title="Play the video from here">${mmss(r.times[x.shot])}</button> ${esc(x.text)}</span></div>`).join("")
+          r.ocr.length ? r.ocr.map(x => `<div class="oline">${r.shots.includes(x.shot) ? `<img src="${shotUrl(r, x.shot)}" data-shot="${esc(x.shot)}" alt="">` : ""}<span><button class="ts tlink" data-seek="${r.times[x.shot]}" title="Play the video from here">${tlabel(r, r.times[x.shot])}</button> ${esc(x.text)}</span></div>`).join("")
           : `<span class="meta">No on-screen text found</span>`}</div>
         <div class="pane ${tab==="notes"?"active":""}" data-pane="notes">
           <textarea class="notes" id="notes" placeholder="Your notes: weight used, sets/reps, cues, how it felt">${esc(r.notesDraft !== undefined ? r.notesDraft : r.notes)}</textarea>
@@ -3129,7 +3210,8 @@ function render(r){
   showObsLine(r);
   showShareLine(r);
   const v = $("#vid");
-  if (v) v.addEventListener("timeupdate", () => { const ct = $("#captime"); if (ct) ct.textContent = mmss(Math.floor(v.currentTime)); });
+  if (v) v.addEventListener("timeupdate", () => { const ct = $("#captime"); if (ct) ct.textContent = r.slides ? tlabel(r, v.currentTime) : mmss(Math.floor(v.currentTime)); });
+  if (v && r.slides) { v.addEventListener("timeupdate", showSlidePos); v.addEventListener("seeked", showSlidePos); showSlidePos(); }
   if (v) v.addEventListener("timeupdate", () => {
     let best = null;
     document.querySelectorAll(".tline").forEach(el => { if (+el.dataset.t <= v.currentTime) best = el; el.classList.remove("now"); });
@@ -3146,7 +3228,7 @@ function shotsCard(r){
             <button class="star" data-star="${esc(s)}" title="Favorite">&#9734;</button>
             <button class="shotdel" data-delshot="${esc(s)}" title="Delete this snapshot">&#10005;</button>
             <button class="shotcopy" data-copyshot="${esc(s)}" title="Copy image">&#10697;</button>
-            <figcaption><button class="tlink" data-seek="${r.times[s]}" title="Play the video from here">${man.has(s) ? "&#128248; " : "&#9654; "}${mmss(r.times[s])}</button></figcaption></figure>`).join("")}</div>`;
+            <figcaption><button class="tlink" data-seek="${r.times[s]}" title="Play the video from here">${man.has(s) ? "&#128248; " : "&#9654; "}${tlabel(r, r.times[s])}</button></figcaption></figure>`).join("")}</div>`;
 }
 function refreshShots(r){       // update snapshots + favorites without touching the video player
   if (!$("#shotscard")) return;
@@ -3163,7 +3245,7 @@ function renderFavs(r){
     <div class="fav" data-i="${i}">
       <div class="favimg" draggable="true" title="Drag to reorder">
         <img src="${shotUrl(r, f.shot)}" alt="" draggable="false" data-favopen="${esc(f.shot)}" title="Click to enlarge · drag to reorder">
-        <span class="num">${i+1}</span><button class="tb" data-seek="${r.times[f.shot]}" title="Play the video from here">&#9654; ${mmss(r.times[f.shot])}</button>
+        <span class="num">${i+1}</span><button class="tb" data-seek="${r.times[f.shot]}" title="Play the video from here">&#9654; ${tlabel(r, r.times[f.shot])}</button>
         <button class="ico rm" data-unfav="${esc(f.shot)}" title="Remove from favorites">&#10005;</button>
         <button class="shotcopy fc2" data-copyshot="${esc(f.shot)}" title="Copy image">&#10697;</button>
         <button class="favtrash" data-delshot="${esc(f.shot)}" title="Delete this image (removes it from favorites and snapshots)">&#128465;</button>
@@ -3229,7 +3311,7 @@ function renderPaper(){
     <div class="pgrid" style="grid-template-columns:repeat(${cols},1fr)">
       ${r.state.favorites.map((f, i) => `<figure class="pfig">
         <img src="${shotUrl(r, f.shot)}" alt="">
-        <div class="pcap">${$("#pnums").checked?`<span class="pnum">${i+1}.</span>`:""}<b>${mmss(r.times[f.shot])}</b>${esc(f.text)}</div>
+        <div class="pcap">${$("#pnums").checked?`<span class="pnum">${i+1}.</span>`:""}<b>${tlabel(r, r.times[f.shot])}</b>${esc(f.text)}</div>
         ${f.corrected ? `<div class="pcorr">Corrected text</div>` : ""}
       </figure>`).join("")}
     </div>`;
@@ -3459,7 +3541,7 @@ function showLb(){
   $("#lbdel").disabled = false;
   $("#lbdel").title = on ? "Delete this favorite image (asks first)" : "Delete this snapshot and show the next one (Delete key)";
   const t = textAt(current, s);
-  $("#lbcap").textContent = `${lb.fav ? "★ Favorite " : ""}${lb.i+1} / ${lb.list.length} · ${mmss(current.times[s])}`
+  $("#lbcap").textContent = `${lb.fav ? "★ Favorite " : ""}${lb.i+1} / ${lb.list.length} · ${tlabel(current, current.times[s])}`
     + ((current.edited || []).includes(s) ? " · edited" : "") + (t ? `  ·  ${t}` : "");
 }
 
@@ -3591,6 +3673,8 @@ document.addEventListener("click", async e => {
     case "setbtn": return openSetup(false);
     case "stcancel": return $("#setup").classList.remove("show");
     case "stsave": return saveSetup();
+    case "slprev": return stepSlide(-1);
+    case "slnext": return stepSlide(1);
     case "copyai": { try { const j = await api("/api/aiprompt", {id: current.id}); copyText(j.text, "AI prompt + transcript copied - paste it into ChatGPT or Claude"); } catch (err) { alert(err.message); } return; }
     case "lbplay": return seekTo(current.times[lb.list[lb.i]]);
     case "capstar": return capture(true);
@@ -3621,8 +3705,8 @@ document.addEventListener("click", async e => {
       if (runBusy) return;
       runBusy = true; $("#run").disabled = true;
       try {
-        try { localStorage.setItem("rh-maxshots", $("#maxshots").value); } catch (e2) {}
-        const body = {urls: $("#urls").value, max_shots: $("#maxshots").value};
+        saveShotsChoice();
+        const body = {urls: $("#urls").value, max_shots: shotsValue()};
         let j;
         try { j = await api("/api/run", body); } catch (err) { return alert(err.message); }
         if (j.existing) {
@@ -3757,6 +3841,7 @@ document.addEventListener("keydown", e => {
   }
   if (e.key === "Escape" && !open && selected.size) return clearSel();
   if (!open && view !== "gallery" && (e.key === "s" || e.key === "S") && !e.ctrlKey && !e.metaKey && !e.altKey && $("#vid")) { e.preventDefault(); return capture(e.shiftKey); }
+  if (!open && view !== "gallery" && !mod && (e.key === "," || e.key === ".") && current && current.slides && $("#vid")) { e.preventDefault(); return stepSlide(e.key === "," ? -1 : 1); }
   if (e.key === "Delete" && !open && selected.size) return deleteReels([...selected]);
   if (e.key === "Escape") $("#lightbox").classList.remove("show");
   if (view === "gallery" && !open) return;
@@ -3877,7 +3962,7 @@ async function inboxAdd(id, existing){
   const sel = document.querySelector(`[data-iid="${CSS.escape(id)}"] [data-icat]`);
   const category = sel ? sel.value : (inboxCat[id] !== undefined ? inboxCat[id] : "");
   let j;
-  try { j = await api("/api/inbox/add", {id, category, max_shots: $("#maxshots").value, ...(existing ? {existing} : {})}); }
+  try { j = await api("/api/inbox/add", {id, category, max_shots: shotsValue(), ...(existing ? {existing} : {})}); }
   catch (e) { return alert("Could not add: " + e.message); }
   if (j.existing) {
     const pick = await chooseExisting(j.existing, 1, it);
@@ -3977,7 +4062,11 @@ async function refreshQuiet(){
 $("#groupby").value = groupBy; $("#sortby").value = sortBy;
 if (!$("#groupby").value) { groupBy = "category"; $("#groupby").value = groupBy; }
 if (!$("#sortby").value) { sortBy = "posted-new"; $("#sortby").value = sortBy; }
-try { const m = localStorage.getItem("rh-maxshots"); if (m && [...$("#maxshots").options].some(o => o.value === m)) $("#maxshots").value = m; } catch (e) {}
+try { const m = localStorage.getItem("rh-maxshots"); if (m && [...$("#maxshots").options].some(o => o.value === m)) $("#maxshots").value = m;
+  const e = parseFloat(localStorage.getItem("rh-everyn")); if (e >= 0.5 && e <= 600) $("#everyn").value = e; } catch (e) {}
+$("#everyn").hidden = $("#maxshots").value !== "every";
+$("#maxshots").addEventListener("change", () => { $("#everyn").hidden = $("#maxshots").value !== "every"; if (!$("#everyn").hidden) $("#everyn").focus(); saveShotsChoice(); });
+$("#everyn").addEventListener("change", () => { shotsValue(); saveShotsChoice(); });
 let me = {name: "", person: "", can_delete: true, share: {on: false, people: [], as: ""}}, setupFirst = false;
 async function openSetup(first){
   const c = await api("/api/config");

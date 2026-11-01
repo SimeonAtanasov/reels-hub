@@ -5,7 +5,7 @@ Turn Instagram reels, TikTok videos, YouTube videos/Shorts and X posts (or anyth
 For each reel it saves:
 - the video and caption
 - a timestamped transcript of what is said (Whisper, runs locally)
-- snapshots: **Auto** by default - a frame every 2 s for short videos, gradually wider for longer ones (about 5 s at 6 min, 12 s at 36 min, 20 s from 1.5 h), plus every scene cut, up to 400 (very long videos get a wider gap to stay under that). Or pick a fixed maximum in the app (60-400), which is never exceeded. Delete the ones you don't need, keep your favorites
+- snapshots: **Auto** by default - a frame every 2 s for short videos, gradually wider for longer ones (about 5 s at 6 min, 12 s at 36 min, 20 s from 1.5 h), plus every scene cut, up to 400 (very long videos get a wider gap to stay under that). Or pick a fixed maximum in the app (60-400), which is never exceeded, or **Every ... s** and type the seconds between snapshots yourself (0.5 to 600): exactly one snapshot every that many seconds, with no extra ones at scene cuts, at most 1000 per video (a longer video gets a slightly wider gap, and the log says so). Delete the ones you don't need, keep your favorites
 - on-screen text read from the snapshots (OCR)
 - a Markdown note per reel, ready for Obsidian
 
@@ -16,6 +16,8 @@ While watching, **📸 Snapshot** (or the S key; Shift+S also stars it) captures
 Drag the edges between the list, the video and the text to give each one more or less room, and drag the bar under the video to make it taller (a wide YouTube video grows when you widen its column instead). Double-click an edge or the bar to go back to the standard size. The sizes are remembered in that browser on that computer.
 
 Snapshots can be edited inside the app (crop, rotate, draw, arrows, boxes, text, blur, undo) or opened in Paint; the original is always kept for **Reset to original**. Images and video links can be copied to paste into chat apps.
+
+**Instagram photo slideshows** (posts with several slides, or a single photo) work too: the app downloads every slide's full image, joins the slides into one video (each photo shows for 4 seconds, video slides play as they are), saves each photo as a snapshot and reads its text. **◀ Slide** and **Slide ▶** under the video (or the , and . keys) step through the slides, and times show as "Slide 3" instead of 00:10. A slideshow of photos only has no transcript; its Obsidian note puts the slides' text under Content, in order, and has no Original text. Video slides in a mixed post get a transcript and snapshots as usual. Photo posts on other sites (for example TikTok photo posts) are not supported yet; the app says the post has no video.
 
 Two people with their own laptops can **share** videos with each other on purpose: see [Sharing between two laptops](#sharing-between-two-laptops-optional).
 
@@ -118,8 +120,9 @@ The API checks Access's signed token on every request (audience, issuer, expiry)
 
 - Everything runs on your own machine. The app listens on 127.0.0.1 only and ignores requests from other websites. Sharing is the only part that goes online, and it sends only what is listed above.
 - My notes and favorite text save automatically. Re-processing a video keeps your notes; its favorites are cleared only if the run succeeds, and the video's controls pause while it runs.
-- Long videos: snapshots are capped per video (`--max-shots auto` or a number; set it next to Run in the app), on-screen text is read from at most 60 of them, and transcription on CPU takes roughly a quarter to a half of the video's length.
+- Long videos: snapshots are capped per video (`--max-shots auto`, a number, or `every:5` for one every 5 seconds; set it next to Run in the app, where your choice is remembered), on-screen text is read from at most 60 of them, and transcription on CPU takes roughly a quarter to a half of the video's length.
 - Running a link that is already done asks what to do: **New version** (a separate copy, v2, v3... - the original and its favorites stay) or **Skip**. On a reel, **+ New version** does the same and **Re-process** replaces that version. Both reuse the downloaded video.
+- Instagram links are checked first (one quick extra request) to see whether the post is a slideshow. Slideshows keep their slide images in a `slides` folder inside the reel's folder, so Re-process and New version work without downloading again. A shared slideshow is rebuilt the same way on the other laptop, so favorites land on the same slides; both laptops need this version of the app.
 - If memory is low, transcription falls back to smaller Whisper models (base, then tiny).
 - For personal reference only: respect creators' rights and each platform's terms.
 - The sites change often. If downloads break, update yt-dlp: `python -m yt_dlp -U`
