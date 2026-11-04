@@ -56,6 +56,10 @@ python reels_hub.py
 
 It opens http://127.0.0.1:8765. Paste links, one per line, and press **Run**. The first run downloads the speech and OCR models (a few minutes).
 
+**The next video while one is running:** paste its link and press **Run** again. It waits under **Waiting** (below the progress bar) and starts by itself when the current one finishes; line up as many as you like. The app works on one video at a time on purpose: transcription and on-screen text reading keep the processor busy, so two at once would each take about twice as long. **×** next to a waiting item takes it out of the line (its link goes back into the box). **Re-process**, **+ New version** and Inbox **Add** wait in the same line, first come, first served; a video waiting to be re-processed is paused (no edits) until it is done. A link that is already running or waiting is not added twice. The **Log** keeps every video's lines, each next one under a `== next in line` header, so you can still read why an earlier one failed. The line lives in the app's memory: if you close Reels Hub, what is still waiting is dropped (run those links again after you start it).
+
+The top right of the page shows **Connected to this PC** with a green dot while the app answers. Keep its black Command Prompt window open while you use it: when that window is closed, the status turns yellow within a few seconds and says *The server does not answer: start Reels Hub again*. Start it again (**Reels Hub** on the desktop, or `reels-hub.bat`) and the open page connects by itself. Changes made while it is yellow can't be saved (the app tells you when a save fails).
+
 Command line only:
 
 ```
@@ -68,13 +72,13 @@ python reels2notes.py -f links.txt
 | What | Default location | Change with |
 |---|---|---|
 | Videos, snapshots, notes, favorites, categories | the reels folder from Settings (default `Downloads/reels`) | Settings, or `--out PATH` |
-| Obsidian notes | new notes in `<vault>/YouTube`, `/TikTok`, `/Instagram`, `/X` - move or rename them freely, the app finds them again; favorite images in `910_Attachments/ReelsHub` | `--vault PATH` |
+| Obsidian notes | new notes in `<vault>/YouTube`, `/TikTok`, `/Instagram`, `/X` - move or rename them freely, the app finds them again; the video and favorite images in `910_Attachments/ReelsHub/<reel>` | `--vault PATH` |
 | Shares waiting in your Inbox | `_inbox` in the reels folder (dismissed ones in `_trash/_inbox`) | - |
 | Your name, folders, sharing token | `%APPDATA%\ReelsHub\config.json` on this computer | Settings |
 
 The vault comes from Settings. If none is set or it is not found, Obsidian sync is switched off.
 
-Notes follow the vault's video template: date and time, Title, Source, Tags, Related (MOC links), Creator; then the AI sections (Obsidian Tags, Summary, Main Takeaways, Key Concepts, Reflective Questions, Actionable Insights, Compare and Contrast) left ready to fill, Favorites, My notes, Description, Content (transcript in paragraphs) and Original text (with timestamps). YouTube notes start with `'` and TikTok notes with a backtick, like the templates. **Copy AI prompt** in the app copies the vault's `$Obsidian AI prompts` with the transcript, for ChatGPT or Claude.
+Notes follow the vault's video template: date and time, Title, Source, Tags, Related (MOC links), Creator; then the AI sections (Obsidian Tags, Summary, Main Takeaways, Key Concepts, Reflective Questions, Actionable Insights, Compare and Contrast) left ready to fill, Favorites, My notes, Description, Content (transcript in paragraphs) and Original text (with timestamps). **Send to Obsidian** also copies the video into the vault and plays it at the top of the note, under the header lines (older notes get it there too the next time you send them). The vault is outside this app's folder, so videos never go to GitHub; if your vault syncs (OneDrive, Obsidian Sync), the videos sync with it. YouTube notes start with `'` and TikTok notes with a backtick, like the templates. **Copy AI prompt** in the app copies the vault's `$Obsidian AI prompts` with the transcript, for ChatGPT or Claude.
 
 ## If a download needs login
 
@@ -98,7 +102,7 @@ Each laptop has its own library. To give the other person a video on purpose, pr
 
 **On the other laptop:** Reels Hub looks for shares when it opens, when you open **Inbox**, and every 90 seconds while it runs (or press **Check now**). A share is copied to that laptop and deleted from Cloudflare straight away; one that is never picked up is deleted after 30 days. **Inbox** lists who sent what, how many favorites, the notes and the suggested category (pick another one if you like):
 
-- **Add** downloads and processes the video on that laptop, takes the favorites again at the same moments (with the sender's edited images), fills in their text and Corrected marks, the notes and the category, and marks the reel as shared (↘ name). If you already have the video, it offers a new version instead. Several Adds wait in line, like Run. If the download fails, the share stays in the Inbox with the reason; press Add again later.
+- **Add** downloads and processes the video on that laptop, takes the favorites again at the same moments (with the sender's edited images), fills in their text and Corrected marks, the notes and the category, and marks the reel as shared (↘ name). If you already have the video, it offers a new version instead. Adds wait in the same line as your Runs, first come, first served (see **Waiting** under the progress bar). If the download fails, the share stays in the Inbox with the reason; press Add again later.
 - **Dismiss** leaves it out (it moves to `_trash/_inbox` in the reels folder).
 
 **Settings, Sharing:** the inbox address and this laptop's service token (Client ID and Client Secret), with **Test connection**. They are saved only on this computer, never in the app folder.
@@ -119,7 +123,7 @@ The API checks Access's signed token on every request (audience, issuer, expiry)
 ## Notes
 
 - Everything runs on your own machine. The app listens on 127.0.0.1 only and ignores requests from other websites. Sharing is the only part that goes online, and it sends only what is listed above.
-- My notes and favorite text save automatically. Re-processing a video keeps your notes; its favorites are cleared only if the run succeeds, and the video's controls pause while it runs.
+- My notes and favorite text save automatically. Re-processing a video keeps your notes; its favorites are cleared only if the run succeeds, and the video's controls pause while it runs (or waits in line).
 - Long videos: snapshots are capped per video (`--max-shots auto`, a number, or `every:5` for one every 5 seconds; set it next to Run in the app, where your choice is remembered), on-screen text is read from at most 60 of them, and transcription on CPU takes roughly a quarter to a half of the video's length.
 - Running a link that is already done asks what to do: **New version** (a separate copy, v2, v3... - the original and its favorites stay) or **Skip**. On a reel, **+ New version** does the same and **Re-process** replaces that version. Both reuse the downloaded video.
 - Instagram links are checked first (one quick extra request) to see whether the post is a slideshow. Slideshows keep their slide images in a `slides` folder inside the reel's folder, so Re-process and New version work without downloading again. A shared slideshow is rebuilt the same way on the other laptop, so favorites land on the same slides; both laptops need this version of the app.

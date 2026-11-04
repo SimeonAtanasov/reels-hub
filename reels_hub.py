@@ -8,7 +8,8 @@ Downloaded reels are stored in Downloads/reels (change with --out).
 It opens http://127.0.0.1:8765 in your browser.
 
 - Paste Instagram, TikTok, YouTube (incl. Shorts) or X links, one per line, and press Run: reels2notes.py
-  processes them, with a live log
+  processes them, with a live log. Press Run again while one is running: the new links wait in line
+  (Waiting list, x to take one out) and start by themselves, one run at a time
 - If a site needs login (often X), put a cookies.txt next to this file: Run uses it automatically
 - Categories in the sidebar: create your own (e.g. Training), assign reels by dropdown or drag;
   reels without a category stay under Unassigned at the bottom
@@ -21,8 +22,8 @@ Data: favorites and category live in reels/<reel>/hub.json, categories in reels/
 and favorites are also written into each note.md (## Favorites) for Obsidian.
 
 Obsidian: each reel gets a note in <vault>/Instagram, /TikTok, /YouTube or /X named after the reel
-(caption, transcript); "Send to Obsidian" copies starred images to 910_Attachments/ReelsHub and
-writes them with their text. Notes can be moved or renamed in the vault; the app finds them by their id line.
+(caption, transcript); "Send to Obsidian" copies the video and the starred images to 910_Attachments/ReelsHub and
+writes them with their text; the video plays at the top of the note. Notes can be moved or renamed in the vault; the app finds them by their id line.
 
 Sharing (optional): "Share with <name>" sends the link, your favorites (times, text, the images you
 edited), My notes and the category to a private Cloudflare inbox (the cloud/ folder). The other laptop
@@ -32,7 +33,7 @@ inbox address and this laptop's service token (in the ReelsHub folder in %APPDAT
 Options:  --port 8765   --out PATH   --vault PATH   --no-browser
 Uses only the Python standard library. Listens on 127.0.0.1 only (not reachable from other devices).
 """
-import argparse, base64, json, mimetypes, os, re, shutil, subprocess, sys, tempfile, threading, time, webbrowser
+import argparse, base64, itertools, json, mimetypes, os, re, shutil, subprocess, sys, tempfile, threading, time, webbrowser
 import urllib.error, urllib.request
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -85,8 +86,8 @@ def apply_config(cfg):
 
 def save_config(body):
     """Validate and store the settings from the setup screen."""
-    if JOB["running"]:
-        raise ValueError("Wait for the current run to finish")
+    if JOB["running"] or RUNQ:
+        raise ValueError("Wait for the current run (and the ones waiting) to finish")
     name = str(body.get("name") or "").strip()[:60]
     if not name:
         raise ValueError("Please enter your name")
@@ -190,10 +191,16 @@ def can_delete():
     return CONFIG.get("can_delete") is not False
 PLATFORM_DIRS = ("Instagram", "TikTok", "YouTube", "X")             # one vault folder per platform
 FAV_START, FAV_END = "<!-- reels-hub:favorites start -->", "<!-- reels-hub:favorites end -->"
+VID_START, VID_END = "<!-- reels-hub:video start -->", "<!-- reels-hub:video end -->"
 
 JOB = {"running": False, "log": [], "started": None, "finished": None, "urls": [], "progress": None, "busy": set(),
-       "share": None}                    # share: id of the inbox item being added
-JOB_LOCK = threading.Lock()
+       "share": None, "mark": 0, "done": 0}   # share: id of the inbox item being added; mark: where this run's lines
+                                         # start in log (it runs on across queued runs); done: links finished in this run
+JOB_LOCK = threading.Lock()              # the run slot: one run at a time (taken after INBOX_LOCK, never before it)
+RUNQ = []                                # Runs pressed while another run was going wait here (guarded by INBOX_LOCK)
+QSEQ = itertools.count(1)                # one order for all that waits (Runs and inbox Adds): first come, first served
+LOG_KEEP = 1500                          # lines of the earlier runs kept when the next run in line starts
+DONE_LINE = re.compile(r"\s*done( in [^>]*)? ->")   # reels2notes' line for a finished link
 DATA_LOCK = threading.RLock()            # re-entrant: helpers that already hold it can call each other
 PORT = 8765
 NOTES_S, NOTES_E = "<!-- reels-hub:notes start -->", "<!-- reels-hub:notes end -->"
@@ -210,7 +217,7 @@ WHOAMI_EVERY = 1800                      # how often to ask the inbox again who 
 SHARE_ID_RE = re.compile(r"[A-Za-z0-9-]{8,64}")
 INBOX = {"checked": "", "error": "", "busy": False, "queue": [], "adding": None, "errors": {}, "force": True,
          "whoami_at": 0.0, "last": None, "partial": {}}   # partial: share id -> reel downloaded but not filled in
-INBOX_LOCK = threading.RLock()
+INBOX_LOCK = threading.RLock()           # also guards RUNQ: both lines of waiting work change only under it
 INBOX_WAKE = threading.Event()
 CHANGED = {"seq": 0, "list": []}         # reels an inbox Add filled in [{seq, folder}]: the page reloads them
 BOOT = os.urandom(6).hex()               # a new count each start: an open page notices the restart
@@ -642,6 +649,7 @@ def vault_note_text(folder, r, state):
                                            f" · {_dur(r['duration'])}" if _dur(r["duration"]) else ""),
              f"**Category**: {state['category'] or '-'}",
              _marker(r["id"]),
+             VID_START, '_Press "Send to Obsidian" in Reels Hub to add the video._', VID_END,
              "",
              "Formula to remove timestamp: =RIGHT(A1,LEN(A1)-13)", ""]
     for sec in AI_SECTIONS:
@@ -688,6 +696,19 @@ def send_to_obsidian(reel_id):
     att_rel = f"{ATTACH_DIR}/{reel_id}"
     att = VAULT / att_rel
     att.mkdir(parents=True, exist_ok=True)
+    vid_line = "_No video file._"                      # the video itself, so the note can play it
+    vids = [p for p in folder.glob("video.*") if p.suffix.lower() in VIDEO_EXT]
+    if vids:
+        src = vids[0]
+        dst = att / f"video{src.suffix.lower()}"
+        if not (dst.is_file() and dst.stat().st_size == src.stat().st_size):
+            tmp = att / (dst.name + ".part")
+            shutil.copyfile(src, tmp)
+            os.replace(tmp, dst)
+        for old in att.glob("video.*"):                # an older copy with another extension
+            if old != dst:
+                old.unlink()
+        vid_line = f"![[{att_rel}/{dst.name}]]"
     keep = set()
     for f in favs:
         src = folder / "shots" / f["shot"]
@@ -721,6 +742,14 @@ def send_to_obsidian(reel_id):
             text = pre + FAV_START + "\n" + block + "\n" + FAV_END + rest.split(FAV_END, 1)[1]
         else:                                          # markers removed by hand: append a fresh section
             text = text.rstrip() + f"\n\n## Favorites (Reels Hub)\n{FAV_START}\n{block}\n{FAV_END}\n"
+        vid_block = f"{VID_START}\n{vid_line}\n{VID_END}"
+        if VID_START in text and VID_END in text and text.find(VID_START) < text.find(VID_END):
+            pre, rest = text.split(VID_START, 1)
+            text = pre + vid_block + rest.split(VID_END, 1)[1]
+        elif _marker(reel_id) in text:                 # notes made before the video block: right under the id line
+            text = text.replace(_marker(reel_id), _marker(reel_id) + "\n" + vid_block, 1)
+        else:                                          # oldest notes (reel_id line): top of the favorites block
+            text = text.replace(FAV_START + "\n", FAV_START + "\n" + vid_line + "\n\n", 1)
         cat = state["category"]
         text = re.sub(r'^\*\*Category\*\*:.*$', lambda m: f'**Category**: {cat or "-"}', text, count=1, flags=re.M)
         fm = re.match(r"^---\n.*?\n---\n", text, re.S)                # older notes: only inside the frontmatter
@@ -1544,7 +1573,9 @@ def inbox_add(body):
     if category.lower() == "unassigned":
         category = ""
     max_shots = shots_setting(body.get("max_shots"))
-    task = {"id": sid, "category": category, "new": False, "max_shots": max_shots}
+    task = {"kind": "add", "id": sid, "category": category, "new": False, "max_shots": max_shots,
+            "label": f"From {item.get('from_name') or item.get('from') or 'the inbox'}: {item.get('title') or short_url(item['url'])}",
+            "platform": item.get("platform") or platform_of(item["url"])}
     fill = None
     if part:                                        # downloaded before, but the fill-in failed: only fill in now
         try:
@@ -1566,10 +1597,13 @@ def inbox_add(body):
             raise ValueError("Bad choice")
         task["new"] = mode == "new"
     with INBOX_LOCK:
+        if INBOX["adding"] == sid or any(q["id"] == sid for q in INBOX["queue"]):
+            raise ValueError("It is already being added")
         INBOX["errors"].pop(sid, None)
+        task["seq"] = next(QSEQ)
         INBOX["queue"].append(task)
-        n = len(INBOX["queue"]) + bool(JOB["running"])
-    INBOX_WAKE.set()
+        n = len(INBOX["queue"]) + len(RUNQ) + bool(JOB["running"])   # this one and all that run before it
+    start_next()
     return {"queued": n}
 
 
@@ -1589,36 +1623,169 @@ def inbox_dismiss(body):
     return {"dismissed": sid}
 
 
-def start_next_add():
-    """Start the next queued Add when the run slot is free (one run at a time, like Run)."""
-    with INBOX_LOCK:
-        if not INBOX["queue"] or JOB["running"]:
-            return
-        with JOB_LOCK:
-            if JOB["running"]:
-                return
-            JOB["running"] = True
-            JOB["busy"] = set()
-        task = INBOX["queue"].pop(0)
+# ---------------------------------------------------------------- run queue
+# One run at a time (Whisper and OCR keep the processor busy). Run, Re-process, New version and inbox Adds pressed
+# while a run is going wait in line and start by themselves, first come first served. When a run ends it hands the
+# slot straight to the next one (JOB["running"] stays true, so the page sees one long run) and the log keeps the
+# earlier lines, so a video that failed further up can still be read.
+def short_url(u):
+    """A link as the waiting list shows it: no https://, www., query or trailing slash (a YouTube ?v= stays)."""
+    u = str(u or "")
+    s = re.sub(r"^https?://(www\.|m\.)?", "", u, flags=re.I).split("#", 1)[0].split("?", 1)[0].rstrip("/")
+    v = re.search(r"[?&]v=([\w-]+)", u)
+    if v and s.lower().endswith("youtube.com/watch"):
+        s += "?v=" + v.group(1)
+    return s if len(s) <= 70 else s[:67] + "..."
+
+
+def _take_next():
+    """With INBOX_LOCK and JOB_LOCK held: the task that has waited longest (a Run or an inbox Add), out of its line."""
+    run = RUNQ[0] if RUNQ else None
+    add = INBOX["queue"][0] if INBOX["queue"] else None
+    if run and (add is None or run["seq"] < add.get("seq", 0)):
+        return RUNQ.pop(0)
+    return INBOX["queue"].pop(0) if add else None
+
+
+def _claim(task, chained):
+    """With both locks held and the slot taken: get a waiting task ready to start. Returns its thread, or None
+    when it can no longer run (an Add's reason goes to the Inbox, a Run's to the log)."""
+    if task.get("kind") == "add":
         try:
             item = _load_item(task["id"])
         except ValueError as e:
             INBOX["errors"][task["id"]] = str(e)
-            JOB["running"] = False
-            return
+            return None
         INBOX["adding"] = task["id"]
-    task = {**task, "item": item}
-    if task.get("fill"):
-        threading.Thread(target=run_fill, args=(task,), daemon=True).start()
-        return
-    flags = ["--new-version"] if task["new"] else []
-    threading.Thread(target=run_job, args=([item["url"]], task["max_shots"], False, flags, None, task), daemon=True).start()
+        task = {**task, "item": item}
+        JOB["busy"] = {task["fill"]} if task.get("fill") else set()
+        if task.get("fill"):
+            return threading.Thread(target=run_fill, args=(task, chained), daemon=True)
+        flags = ["--new-version"] if task["new"] else []
+        return threading.Thread(target=run_job, args=([item["url"]], task["max_shots"], False, flags, None, task,
+                                                      task["label"], chained), daemon=True)
+    target = task["target"]
+    if target and not (OUT / target / "note.md").exists():
+        JOB["log"].append(f"-- left out {task['label']}: that video is no longer in your library")
+        return None
+    JOB["busy"] = {target} if (target and task["redo"]) else set()
+    return threading.Thread(target=run_job, args=(task["urls"], task["max_shots"], task["redo"], task["flags"],
+                                                  target if task["redo"] else None, None, task["label"], chained),
+                            daemon=True)
 
 
-def run_fill(task):
+def start_next(after_run=False):
+    """Give the run slot to what has waited longest. after_run: called by the run that just ended, which still
+    holds the slot: it passes straight on, or goes free when nothing waits."""
+    hold = after_run
+    while True:
+        with INBOX_LOCK:
+            with JOB_LOCK:
+                if JOB["running"] and not hold:
+                    return                          # the run going now starts the next one when it ends
+                task = _take_next()
+                JOB["running"] = task is not None
+                if task is None:
+                    return
+                hold = True                         # from here on this call holds the slot
+                try:
+                    th = _claim(task, after_run)
+                except Exception as e:              # never leave the slot taken by a task that can't start
+                    JOB["log"].append(f"-- could not start {task.get('label') or 'the next run'}: {e}")
+                    th = None
+        if th:
+            try:
+                th.start()
+            except Exception as e:                  # no thread: free the slot again rather than block every run
+                with INBOX_LOCK:
+                    INBOX["adding"] = None
+                    with JOB_LOCK:
+                        JOB.update(running=False, busy=set(), share=None)
+                        JOB["log"].append(f"-- could not start {task.get('label') or 'the next run'}: {e}")
+            return
+
+
+def end_run():
+    """The run that holds the slot is over: start the next one waiting, or free the slot."""
+    JOB.update(finished=time.time(), progress=None, busy=set(), share=None)   # running stays true while passing on
+    try:
+        start_next(after_run=True)
+    except Exception as e:
+        print(f"  run queue: {e}")
+        JOB["running"] = False
+
+
+def new_log(chained, label):
+    """A run starts: a new log, or after a run in line the earlier lines stay, with a header for this one."""
+    if chained and JOB["log"]:
+        JOB["log"] = JOB["log"][-LOG_KEEP:] + ["", f"== next in line: {label}"]
+    else:
+        JOB["log"] = []
+    JOB["mark"], JOB["done"] = len(JOB["log"]), 0
+
+
+def run_lines():
+    """This run's own lines of the log (the log can hold earlier runs' lines too)."""
+    return JOB["log"][JOB["mark"]:]
+
+
+def queue_list():
+    """What waits for the run slot, in the order it will start (for the page's Waiting list)."""
+    with INBOX_LOCK:
+        L = [{"seq": t["seq"], "kind": "run", "label": t["label"], "platform": t["platform"], "target": t["target"],
+              "redo": t["redo"]} for t in RUNQ]
+        L += [{"seq": t.get("seq", 0), "kind": "add", "label": t.get("label") or "From the inbox",
+               "platform": t.get("platform") or "", "target": "", "redo": False, "share": t["id"]}
+              for t in INBOX["queue"]]
+    return sorted(L, key=lambda x: x["seq"])
+
+
+def queue_remove(body):
+    """Take a Run or an inbox Add out of the line before it starts (the Add's share stays in the Inbox)."""
+    try:
+        seq = int(body.get("seq"))
+    except (TypeError, ValueError):
+        raise ValueError("Bad request")
+    with INBOX_LOCK:
+        for line in (RUNQ, INBOX["queue"]):
+            for i, t in enumerate(line):
+                if t.get("seq") == seq:
+                    line.pop(i)                     # pasted links go back to the page's box, so none is lost
+                    return {"removed": seq, "urls": t["urls"] if t.get("kind") == "run" and not t.get("target") else []}
+    raise ValueError("It is not waiting any more: it has started or finished")
+
+
+def lined_up():
+    """Links that are running now or waiting in line."""
+    with INBOX_LOCK:
+        s = set(JOB["urls"]) if JOB["running"] else set()
+        for t in RUNQ:
+            s.update(t["urls"])
+        for t in INBOX["queue"]:
+            try:
+                s.add(_load_item(t["id"])["url"])
+            except ValueError:
+                pass
+    return s
+
+
+def queue_run(task):
+    """Put a Run in line and start it if the slot is free. Returns how many run before it (0: it started now)."""
+    with INBOX_LOCK:
+        task["seq"] = next(QSEQ)
+        RUNQ.append(task)
+    start_next()
+    with INBOX_LOCK:
+        if not any(t is task for t in RUNQ):
+            return 0
+        return sum(1 for q in queue_list() if q["seq"] < task["seq"]) + bool(JOB["running"])
+
+
+def run_fill(task, chained=False):
     """Add again after a failed fill-in: the video is already here, so only the share is filled in."""
-    JOB.update(log=[f"-- filling in {task['item'].get('from_name') or 'the'}'s share again (the video is already here)"],
-               started=time.time(), finished=None, urls=[task["item"]["url"]], progress=None, busy={task["fill"]},
+    new_log(chained, task.get("label") or "a share")
+    JOB["log"].append(f"-- filling in {task['item'].get('from_name') or 'the'}'s share again (the video is already here)")
+    JOB.update(started=time.time(), finished=None, urls=[task["item"]["url"]], progress=None, busy={task["fill"]},
                share=task["id"])
     try:
         _finish_add(task, 0, [{"url": task["item"]["url"], "folder": task["fill"]}])
@@ -1628,8 +1795,7 @@ def run_fill(task):
     finally:
         with INBOX_LOCK:
             INBOX["adding"] = None
-        JOB.update(running=False, finished=time.time(), progress=None, busy=set(), share=None)
-        INBOX_WAKE.set()
+        end_run()
 
 
 def atomic_write_bytes(path, raw):
@@ -1731,8 +1897,9 @@ def _finish_add(task, code, done):
         if any(d.get("skipped") for d in done):
             msg = "This video is already in your library: press Add again and choose New version"
         else:                                       # "Downloading failed: <the site's error>", not the whole command
-            fail = next((l.split("FAILED:", 1)[1].strip() for l in reversed(JOB["log"]) if "FAILED:" in l), "")
-            err = next((l.strip()[6:].strip() for l in reversed(JOB["log"]) if l.strip().startswith("ERROR:")), "")
+            lines = run_lines()                     # this run's lines only, not an earlier run's error
+            fail = next((l.split("FAILED:", 1)[1].strip() for l in reversed(lines) if "FAILED:" in l), "")
+            err = next((l.strip()[6:].strip() for l in reversed(lines) if l.strip().startswith("ERROR:")), "")
             fail = fail.split(" - Command '", 1)[0]
             msg = ((f"{fail}: {err}" if fail and err else fail or err) or "The run did not finish (see Log)")[:400]
         with INBOX_LOCK:
@@ -1789,9 +1956,9 @@ def inbox_worker():
                 with INBOX_LOCK:
                     INBOX["busy"] = False
         try:
-            start_next_add()
+            start_next()                        # backstop: anything waiting while the slot is free starts now
         except Exception as e:
-            print(f"  inbox: {e}")
+            print(f"  run queue: {e}")
 
 
 # ---------------------------------------------------------------- job runner
@@ -1823,9 +1990,10 @@ def shots_setting(v):
         return "auto"
 
 
-def run_job(urls, max_shots="auto", redo=False, flags=(), target=None, share=None):
-    # JOB["running"] was already claimed under JOB_LOCK (by the request handler, or start_next_add for a share)
-    JOB.update(log=[], started=time.time(), finished=None, urls=urls, progress=None, busy={target} if target else set(),
+def run_job(urls, max_shots="auto", redo=False, flags=(), target=None, share=None, label="", chained=False):
+    # JOB["running"] was already claimed under JOB_LOCK (by start_next, for a Run or an inbox Add)
+    new_log(chained, label or short_url(urls[0] if urls else ""))
+    JOB.update(started=time.time(), finished=None, urls=urls, progress=None, busy={target} if target else set(),
                share=share["id"] if share else None)
     if share:
         JOB["log"].append(f"-- adding {share['item'].get('from_name') or 'a'}'s share from the inbox")
@@ -1836,8 +2004,7 @@ def run_job(urls, max_shots="auto", redo=False, flags=(), target=None, share=Non
         with INBOX_LOCK:
             if share:
                 INBOX["adding"] = None
-        JOB.update(running=False, finished=time.time(), progress=None, busy=set(), share=None)
-        INBOX_WAKE.set()                        # the next queued Add can start
+        end_run()                               # the next one in line starts now
 
 
 def _run_job(urls, max_shots, redo, flags, target, share, done):
@@ -1876,6 +2043,8 @@ def _run_job(urls, max_shots, redo, flags, target, share, done):
                 continue
             if line and "warnings.warn" not in line:
                 JOB["log"].append(line)
+                if DONE_LINE.match(line) or "already done" in line:
+                    JOB["done"] += 1
         proc.wait()
         if share:
             _finish_add(share, proc.returncode, done)
@@ -1945,6 +2114,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
+        elif path == "/api/ping":                     # the page's heartbeat (status "Connected to this PC")
+            self.send_json({"ok": True, "boot": BOOT})
         elif path == "/api/config":
             self.send_json(config_info())
         elif path == "/api/reels":
@@ -1966,7 +2137,8 @@ class Handler(BaseHTTPRequestHandler):
                         "elapsed": prog["elapsed"] + (time.time() - prog["at"])}
             self.send_json({"running": JOB["running"], "log": JOB["log"][-300:], "urls": JOB["urls"],
                             "finished": JOB["finished"], "progress": prog, "share": JOB["share"],
-                            "changed": CHANGED["list"], "boot": BOOT,
+                            "done": JOB["done"], "busy": sorted(JOB["busy"]) if JOB["running"] else [],
+                            "queue": queue_list(), "changed": CHANGED["list"], "boot": BOOT,
                             "total_elapsed": time.time() - JOB["started"] if JOB["started"] else 0})
         elif path.startswith("/media/"):
             self.serve_file(path[len("/media/"):])
@@ -1985,15 +2157,13 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(body, dict):
             return self.send_json({"error": "Bad request"}, 400)
         try:
-            if path == "/api/run":
-                if JOB["running"]:
-                    return self.send_json({"error": "A run is already in progress"}, 409)
+            if path == "/api/run":                           # starts now, or waits in line behind the run going now
                 urls = [u.strip() for u in re.split(r"[\s,]+", str(body.get("urls") or "")) if u.strip().startswith("http")]
                 urls = list(dict.fromkeys(urls))
                 if not urls and not body.get("target"):
                     return self.send_json({"error": "No links found"}, 400)
                 max_shots = shots_setting(body.get("max_shots"))
-                flags, redo = [], False
+                flags, redo, skipped = [], False, 0
                 target = body.get("target") or ""
                 if target:                                   # a button on one reel
                     folder = reel_dir(target)
@@ -2007,9 +2177,20 @@ class Handler(BaseHTTPRequestHandler):
                     flags = ["--target", target]
                     if body.get("action") == "redo":         # favorites are cleared only if the run succeeds
                         redo = True
+                        with INBOX_LOCK:
+                            if (JOB["running"] and target in JOB["busy"]) or any(t["redo"] and t["target"] == target for t in RUNQ):
+                                raise ValueError("This video is already being re-processed, or waiting for it")
                     else:
                         flags.append("--new-version")
+                    label = f"{'Re-process' if redo else 'New version'}: {r.get('label') or target}"
                 else:
+                    taken = lined_up()                       # a link running now or waiting is not queued twice
+                    skipped = sum(1 for u in urls if u in taken)
+                    urls = [u for u in urls if u not in taken]
+                    if not urls:
+                        raise ValueError("Already running or waiting in line" if skipped == 1
+                                         else "These links are already running or waiting in line")
+                    label = (f"{len(urls)} links: " if len(urls) > 1 else "") + short_url(urls[0])   # count first: it stays visible
                     mode = body.get("existing")              # what to do with links that are already done
                     if mode is None:
                         done = [(u, f) for u in urls for f in find_done(u)[:1]]
@@ -2019,13 +2200,11 @@ class Handler(BaseHTTPRequestHandler):
                                 "total": len(urls)})
                     elif mode == "new":
                         flags.append("--new-version")
-                with JOB_LOCK:                               # claim the single run slot atomically
-                    if JOB["running"]:
-                        return self.send_json({"error": "A run is already in progress"}, 409)
-                    JOB["running"] = True
-                    JOB["busy"] = {target} if (target and redo) else set()
-                threading.Thread(target=run_job, args=(urls, max_shots, redo, flags, target if redo else None), daemon=True).start()
-                self.send_json({"ok": True, "count": len(urls)})
+                ahead = queue_run({"kind": "run", "urls": urls, "max_shots": max_shots, "redo": redo, "flags": flags,
+                                   "target": target, "label": label, "platform": platform_of(urls[0])})
+                self.send_json({"ok": True, "count": len(urls), "queued": ahead, "skipped": skipped})
+            elif path == "/api/queue/remove":
+                self.send_json({"ok": True, **queue_remove(body)})
             elif path == "/api/config":
                 self.send_json({"ok": True, **save_config(body), **config_info()})
             elif path == "/api/notes":
@@ -2139,18 +2318,23 @@ PAGE = r"""<!doctype html>
 <style>
 :root{
   --bg:#0f1214; --panel:#171b1e; --panel2:#1d2226; --line:#2a3035; --text:#e6e8ea; --muted:#8b949b;
-  --accent:#5fd0c4; --accent-ink:#06201d; --warn:#f0b35a; --star:#f5c451; --radius:10px;
+  --accent:#5fd0c4; --accent-ink:#06201d; --warn:#f0b35a; --star:#f5c451; --ok:#9fdcb4; --radius:10px;
 }
 *{box-sizing:border-box}
 html,body{margin:0;height:100%}
 body{background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;display:flex;flex-direction:column}
 button,textarea,input,select{font:inherit;color:inherit}
 [hidden]{display:none!important}
-header{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--panel)}
+header{display:flex;flex-wrap:wrap;align-items:center;gap:12px;row-gap:8px;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--panel)}
 header h1{font-size:16px;margin:0;font-weight:600;letter-spacing:.2px;cursor:pointer}
 header h1:hover{color:var(--accent)}
 header .count{color:var(--muted);font-size:13px}
 header .spacer{flex:1}
+.conn{flex:none;margin-left:auto;font-size:12px;color:var(--muted);white-space:nowrap}
+.conn[data-state]::before{content:"";display:inline-block;width:8px;height:8px;margin-right:6px;border-radius:50%;background:var(--ok)}
+.conn[data-state="down"]{color:var(--warn)}
+.conn[data-state="down"]::before{background:var(--warn)}
+@media (max-width:1000px){ header > .status{display:none} }
 .btn{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:6px 12px;cursor:pointer}
 .btn:hover{border-color:var(--accent)}
 .btn.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:600}
@@ -2188,6 +2372,14 @@ body.resizing-y,body.resizing-y *{cursor:row-resize!important;user-select:none}
 #pfill{height:100%;width:0;background:var(--accent);transition:width .6s}
 #pfill[data-stage="download"]{background:#6aa8ff}
 #pfill[data-stage="ocr"]{background:var(--star)}
+#queue{display:flex;flex-direction:column;gap:3px;border-top:1px dashed var(--line);padding-top:6px}
+#queue .qhead{font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+#qlist{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:1px;max-height:150px;overflow-y:auto;contain:inline-size}
+/* contain: long links shorten with ... instead of widening the list (one column below 900 px) */
+#qlist li{display:flex;align-items:center;gap:6px;min-width:0;font-size:12px;line-height:1.5}
+#qlist .qn{color:var(--muted);font-variant-numeric:tabular-nums;flex:none;min-width:14px;text-align:right}
+#qlist .ql{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#qlist .ico{flex:none}
 .listtools{display:flex;gap:8px;padding:10px 12px 6px;align-items:center}
 .sortbar{display:flex;gap:10px;padding:0 12px 8px}
 .sortbar label{display:flex;gap:5px;align-items:center;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;flex:1;min-width:0}
@@ -2445,7 +2637,8 @@ kbd{background:var(--panel2);border:1px solid var(--line);border-bottom-width:2p
 @media (max-width:900px){
   .layout{grid-template-columns:1fr}
   .split{display:none}
-  aside{max-height:45vh;border-right:0;border-bottom:1px solid var(--line)}
+  aside{max-height:45vh;border-right:0;border-bottom:1px solid var(--line);overflow-y:auto}
+  #list{flex:none;overflow:visible}   /* the whole column scrolls: progress and Waiting can't squeeze the list away */
   .detail{grid-template-columns:1fr}
   .player{position:static}
   .paper{width:100%;min-height:0}
@@ -2463,6 +2656,7 @@ kbd{background:var(--panel2);border:1px solid var(--line);border-bottom-width:2p
 body:has(#bulkbar.show) #log{bottom:84px}
 #main.busy #notes,#main.busy .favtext,#main.busy .favs,#main.busy .shots,#main.busy .capbar,#main.busy #favs + *,#main.busy .rowbtns{opacity:.45;pointer-events:none}
 #main.busy .detail::before{content:"Re-processing this video... favorites and snapshots are paused until it finishes";grid-column:1/-1;background:#2a2412;border:1px solid var(--warn);color:var(--warn);border-radius:8px;padding:8px 12px;font-size:13px}
+#main.busy.waiting .detail::before{content:"Waiting in line to be re-processed... favorites and snapshots are paused until it is done (× in the Waiting list cancels it)"}
 
 /* sharing: share buttons, inbox, shared-by marks, Settings section */
 #inboxbtn .ib{display:inline-block;min-width:18px;margin-left:6px;padding:0 6px;border-radius:9px;background:var(--accent);color:var(--accent-ink);font-size:11px;font-weight:700;line-height:17px;text-align:center}
@@ -2511,6 +2705,7 @@ body:has(#bulkbar.show) #log{bottom:84px}
   <button class="btn" id="inboxbtn" hidden title="Videos shared with you">&#128229; Inbox<span class="ib" id="inboxcount" hidden></span></button>
   <button class="btn" id="setbtn" title="Your name and folders">&#9881; Settings</button>
   <button class="btn" id="showlog">Log</button>
+  <span class="conn" id="conn" role="status">Connecting</span>
 </header>
 <div class="layout">
   <aside>
@@ -2531,6 +2726,10 @@ body:has(#bulkbar.show) #log{bottom:84px}
         <div class="pline"><span id="pstage"></span><span id="peta"></span></div>
         <div class="pbar"><div id="pfill"></div></div>
         <div class="pline sub"><span id="pvid"></span><span id="pel"></span></div>
+      </div>
+      <div id="queue" hidden>
+        <div class="qhead" id="qhead"></div>
+        <ol id="qlist"></ol>
       </div>
     </div>
     <div class="listtools">
@@ -2689,8 +2888,38 @@ const mayDelete = () => me.can_delete !== false;                                
 const fromName = r => r.state.shared_by ? (r.state.shared_by.name || r.state.shared_by.person || "") : "";
 const fromBadge = r => r.state.shared_by ? ` · <span class="from" title="Shared with you by ${esc(fromName(r))}">&#8600; ${esc(fromName(r))}</span>` : "";
 
+/* ---------- connection to the Reels Hub server on this PC (status at the top right) ---------- */
+const CONN_DOWN = "The server does not answer: start Reels Hub again";
+let connUp = null, connTimer = null, connBusy = false, leaving = false;
+function setConn(up){
+  if (up === connUp || (!up && leaving)) return;     // a page being closed or reloaded is not "down"
+  connUp = up;
+  const c = $("#conn");
+  c.dataset.state = up ? "up" : "down";
+  c.textContent = up ? "Connected to this PC" : CONN_DOWN;
+  c.title = up ? `Reels Hub runs on this PC (${location.host}); only this computer can reach it`
+               : "Double-click Reels Hub on the desktop, or reels-hub.bat in the app folder. This page connects again by itself.";
+  if (!up) pingSoon(2000);
+}
+function pingSoon(ms){ clearTimeout(connTimer); connTimer = setTimeout(ping, ms); }
+async function ping(){                     // heartbeat: every 5 s, every 2 s while the server does not answer
+  if (connBusy) return;
+  connBusy = true;
+  const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), 10000);
+  try { await fetch("/api/ping", {cache: "no-store", signal: ctl.signal}); setConn(true); }
+  catch (e) { setConn(false); }
+  finally { clearTimeout(t); connBusy = false; }
+  pingSoon(connUp ? 5000 : 2000);
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden) ping(); });
+window.addEventListener("pagehide", () => { leaving = true; });
+window.addEventListener("pageshow", e => { leaving = false; if (e.persisted) ping(); });
+
 async function api(path, body){
-  const res = await fetch(path, body ? {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)} : {});
+  let res;
+  try { res = await fetch(path, body ? {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)} : {}); }
+  catch (e) { setConn(false); throw new Error(CONN_DOWN); }       // no answer at all: its window was closed
+  setConn(true);
   const j = await res.json();
   if (!res.ok) throw new Error(j.error || res.statusText);
   return j;
@@ -2732,11 +2961,18 @@ async function loadReels(keepId, changedIds){
 }
 
 const saveTimers = {}, pending = {};
-let busyIds = new Set();                  // reels being re-processed: edits are paused
+let busyIds = new Set();                  // reels being re-processed (or waiting for it): edits are paused
+let waitingIds = new Set(), busyEpoch = 0; // waitingIds: Re-process still in line; busyEpoch: see syncBusy
 function isBusy(r, quiet){
   if (!r || !busyIds.has(r.id)) return false;
-  if (!quiet) toast("This video is being re-processed - changes are paused until it finishes");
+  if (!quiet) toast(waitingIds.has(r.id) ? "This video is waiting in line to be re-processed - changes are paused until it is done"
+                                         : "This video is being re-processed - changes are paused until it finishes");
   return true;
+}
+function showBusy(){                      // the banner over the open reel
+  if (!current) return;
+  $("#main").classList.toggle("busy", busyIds.has(current.id));
+  $("#main").classList.toggle("waiting", waitingIds.has(current.id));
 }
 function saveState(r, now){
   if (isBusy(r)) return;
@@ -2912,7 +3148,7 @@ function goHome(){
   clearSel();
   view = "detail"; try { localStorage.setItem("rh-view", view); } catch (e) {} $("#viewbtn").classList.remove("on");
   history.replaceState(null, "", location.pathname);
-  $("#list").scrollTop = 0;
+  $("#list").scrollTop = 0; document.querySelector("aside").scrollTop = 0;   // below 900 px the whole column scrolls
   if (filtered[0]) select(filtered[0].id); else $("#main").innerHTML = `<div class="empty">No reels yet. Paste links on the left and press Run.</div>`;
   $("#main").scrollTop = 0;
 }
@@ -2997,17 +3233,23 @@ async function reprocess(r){
   const favNote = r.state.favorites.length ? `\n\nIts ${r.state.favorites.length} favorite${r.state.favorites.length===1?"":"s"} will be cleared when it finishes, because the snapshots are replaced (they are kept if the run fails).` : "";
   if (!confirm(`Re-process this video with ${nTxt}?\n\nThe transcript and snapshots are made again from the downloaded video (no new download). Your Obsidian note is not changed.${favNote}`)) return;
   await flushSaves();
-  try { await api("/api/run", {target: r.id, action: "redo", max_shots: n}); } catch (e) { return alert(e.message); }
-  busyIds = new Set([r.id]); lastRunTargets = new Set([r.id]);
-  if (current === r) { $("#main").classList.add("busy"); }
-  toast("Re-processing... favorites are cleared only if it succeeds"); $("#log").classList.add("show"); poll();
+  let j;
+  try { j = await api("/api/run", {target: r.id, action: "redo", max_shots: n}); } catch (e) { return alert(e.message); }
+  busyEpoch++; busyIds.add(r.id); lastRunTargets.add(r.id);
+  if (j.queued) waitingIds.add(r.id);
+  showBusy();
+  toast(j.queued ? `Re-process queued: ${queuedText(j.queued)}` : "Re-processing... favorites are cleared only if it succeeds");
+  $("#log").classList.add("show"); ensurePoll();
 }
 async function newVersion(r){
   const n = shotsValue(), nTxt = shotsText(n);
   if (!confirm(`Make a new version of this video with ${nTxt}?\n\nIt reuses the downloaded file (no new download). This version and its favorites stay as they are.`)) return;
-  try { await api("/api/run", {target: r.id, action: "new", max_shots: n}); } catch (e) { return alert(e.message); }
-  lastRunTargets = new Set(); $("#log").classList.add("show"); poll();
+  let j;
+  try { j = await api("/api/run", {target: r.id, action: "new", max_shots: n}); } catch (e) { return alert(e.message); }
+  if (j.queued) toast(`New version queued: ${queuedText(j.queued)}`);
+  $("#log").classList.add("show"); ensurePoll();
 }
+const queuedText = n => n === 1 ? "it starts when the current run finishes" : `${n} ahead of it, it starts by itself`;
 function chooseExisting(list, total, share){      // share: an inbox item (Add of a video you already have)
   return new Promise(res => {
     const box = $("#choice");
@@ -3148,7 +3390,7 @@ function updateNav(){
 }
 
 function render(r){
-  setTimeout(() => $("#main").classList.toggle("busy", busyIds.has(r.id)), 0);
+  setTimeout(() => { $("#main").classList.toggle("busy", busyIds.has(r.id)); $("#main").classList.toggle("waiting", waitingIds.has(r.id)); }, 0);
   const tabs = [["transcript","Transcript",r.transcript.length],["caption","Caption",""],["ocr","On-screen text",r.ocr.length],["notes","My notes",""]];
   $("#main").innerHTML = `
   <div class="detail">
@@ -3196,7 +3438,7 @@ function render(r){
         <div class="cardhead"><h2>Favorites · <span id="favcount"></span></h2>
           <span class="hint">Drag images or use &#9664; &#9654; to reorder · edit the text under each one</span>
           <button class="btn small" id="expandbtn">${favFull ? "&#10005; Close" : "&#10530; Expand"}</button>
-          <button class="btn small" id="obsbtn" title="${esc(vault.ok ? "Copy starred images and their text into " + vault.path : "Obsidian vault not found: " + vault.path)}" ${vault.ok?"":"disabled"}>Send to Obsidian</button>
+          <button class="btn small" id="obsbtn" title="${esc(vault.ok ? "Copy the video and the starred images with their text into " + vault.path : "Obsidian vault not found: " + vault.path)}" ${vault.ok?"":"disabled"}>Send to Obsidian</button>
           <button class="btn primary small" id="printbtn">Print A4</button></div>
         <div class="obsline" id="obsline"></div>
         <div id="favs"></div>
@@ -3622,6 +3864,7 @@ document.addEventListener("click", async e => {
   if (c("#capbtn")) return capture(false);
   if ((el = c("[data-share]"))) return current && shareReels([current.id], el.dataset.share);
   if ((el = c("[data-bulkshare]"))) return shareReels([...selected], el.dataset.bulkshare);
+  if ((el = c("[data-qrm]"))) return removeQueued(el);
   if ((el = c("[data-iadd]"))) return inboxAdd(el.dataset.iadd);
   if ((el = c("[data-idismiss]"))) return inboxDismiss(el.dataset.idismiss);
   if ((el = c("[data-star]"))) return toggleFav(current, el.dataset.star);
@@ -3714,11 +3957,14 @@ document.addEventListener("click", async e => {
           if (!pick) return;
           if (pick === "open") { $("#urls").value = ""; return select(j.existing[0].id); }
           if (pick === "skip" && j.existing.length === j.total) { $("#urls").value = ""; return toast("Nothing to run: all links are already done"); }
-          try { await api("/api/run", {...body, existing: pick}); } catch (err) { return alert(err.message); }
+          try { j = await api("/api/run", {...body, existing: pick}); } catch (err) { return alert(err.message); }
         }
-        lastRunTargets = new Set();
-        $("#urls").value = ""; $("#log").classList.add("show"); poll();
-      } finally { runBusy = false; if (!wasRunning) $("#run").disabled = false; }
+        const left = j.skipped ? ` (${j.skipped} link${j.skipped > 1 ? "s were" : " was"} already running or waiting, left out)` : "";
+        $("#urls").value = "";
+        if (j.queued) toast(`Queued: ${queuedText(j.queued)}${left}`);           // waits in line: see Waiting
+        else { if (left) toast("Running" + left); $("#log").classList.add("show"); }
+        ensurePoll();
+      } finally { runBusy = false; $("#run").disabled = false; }   // Run is off only while a press is being sent
       return;
     }
   }
@@ -4023,31 +4269,73 @@ function takeChanged(list, boot){          // reels an inbox Add filled in since
 function ensurePoll(){ if (!polling) poll(); }
 async function poll(){
   polling = true;
+  const ep = busyEpoch;
   let s;
   try { s = await api("/api/status"); }
   catch (e) { setTimeout(poll, 3000); return; }          // server hiccup: keep trying
+  const q = s.queue || [];
   $("#logtext").textContent = s.log.join("\n") || "(waiting for output)";
   $("#logtext").scrollTop = 1e9;
-  $("#run").disabled = s.running;
-  const done = s.log.filter(l => /^\s*done( in [^>]*)? ->/.test(l) || l.includes("already done")).length;
-  $("#status").textContent = s.running ? `Running · ${done} / ${s.urls.length} done` : (s.finished ? "Finished" : "Idle");
-  showProgress(s);
+  $("#status").textContent = s.running ? `Running · ${s.done || 0} / ${s.urls.length} done` : (s.finished ? "Finished" : "Idle");
+  showProgress(s); showQueue(q);
   $("#status").classList.toggle("on", s.running);
   $("#logtitle").textContent = s.running ? "Run log · working (first run downloads models)" : "Run log";
   const fresh = takeChanged(s.changed, s.boot);
-  if (s.running) {
+  const ended = syncBusy(s, q, ep);                       // a re-process that finished, even with more in line
+  if (s.running || q.length) {
     wasRunning = true; refreshQuiet().catch(() => {});
-    if (fresh.size) loadReels(current && current.id, fresh).catch(() => {});
+    if (fresh.size || ended.length) reloadChanged(new Set([...fresh, ...ended]));
     setTimeout(poll, 1000); return;
   }
   polling = false;
-  if (wasRunning || fresh.size) {
+  if (wasRunning || fresh.size || ended.length) {
     wasRunning = false;
-    const redone = lastRunTargets, changed = new Set([...redone, ...fresh]); lastRunTargets = new Set(); busyIds = new Set();
-    try { await loadReels(current && current.id, changed); } catch (e) {}
-    if (current && redone.has(current.id)) toast("Re-process finished");
+    const changed = new Set([...lastRunTargets, ...fresh, ...ended]);
+    busyIds = new Set(); waitingIds = new Set(); showBusy();
+    await reloadChanged(changed);
+    lastRunTargets = new Set();
     refreshInbox();
   }
+}
+async function reloadChanged(ids){       // reels a run changed: take the server's copy (others keep your edits)
+  const redone = [...ids].filter(id => lastRunTargets.has(id));
+  redone.forEach(id => lastRunTargets.delete(id));
+  try { await loadReels(current && current.id, ids); } catch (e) {}
+  if (current && redone.includes(current.id)) toast("Re-process finished");
+}
+function syncBusy(s, q, ep){
+  // Paused reels come from the server: the one being re-processed (or filled in from the inbox) and the
+  // Re-processes still in line. Returns the ones that stopped being paused. An answer to a request sent before
+  // a Re-process was pressed or taken out of the line (ep is old) is skipped: the next answer decides.
+  if (ep !== busyEpoch) return [];
+  const wait = new Set(q.filter(x => x.redo && x.target).map(x => x.target));
+  const now = new Set([...(s.running ? s.busy || [] : []), ...wait]);
+  const ended = [...busyIds].filter(id => !now.has(id));
+  busyIds = now; waitingIds = wait; showBusy();
+  return ended;
+}
+let lastQueueHtml = null;
+function showQueue(q){                    // the Waiting list under the progress bar
+  $("#queue").hidden = !q.length;
+  $("#qhead").textContent = q.length ? `Waiting · ${q.length}` : "";
+  const html = q.map((x, i) => `<li><span class="qn">${i + 1}.</span>${x.platform ? pbadge({platform: x.platform}) : ""}`
+    + `<span class="ql" title="${esc(x.label)}">${esc(x.label)}</span>`
+    + `<button class="ico" data-qrm="${x.seq}" data-qkind="${esc(x.kind)}" data-qtarget="${esc(x.redo ? x.target : "")}" aria-label="Take it out of the line" `
+    + `title="${x.kind === "add" ? "Take it out of the line (the share stays in your Inbox)" : "Take it out of the line"}">&times;</button></li>`).join("");
+  if (html !== lastQueueHtml) { $("#qlist").innerHTML = html; lastQueueHtml = html; }   // unchanged: leave hover and focus alone
+}
+async function removeQueued(el){
+  const target = el.dataset.qtarget, kind = el.dataset.qkind;
+  let j;
+  try { j = await api("/api/queue/remove", {seq: +el.dataset.qrm}); }
+  catch (e) { toast(e.message); return ensurePoll(); }
+  if (target) { busyEpoch++; busyIds.delete(target); waitingIds.delete(target); lastRunTargets.delete(target); showBusy(); }
+  const back = (j.urls || []).filter(u => !$("#urls").value.includes(u));
+  if (back.length) $("#urls").value = [$("#urls").value.trim(), ...back].filter(Boolean).join("\n");
+  toast(kind === "add" ? "Taken out of the line: the share is still in your Inbox"
+        : back.length ? `Taken out of the line: the link${back.length > 1 ? "s are" : " is"} back in the box above` : "Taken out of the line");
+  lastQueueHtml = null; ensurePoll();
+  if (kind === "add") refreshInbox(true);
 }
 async function refreshQuiet(){
   const j = await api("/api/reels");
@@ -4107,6 +4395,7 @@ async function saveSetup(){
   finally { b.disabled = false; }
 }
 (async () => {
+  pingSoon(5000);                            // status at the top right: is the server on this PC answering?
   try { const c = await api("/api/config"); if (!c.configured) await openSetup(true); } catch (e) {}
   await loadReels(); setView(view); poll();
   if (me.share && me.share.on) await api("/api/inbox/check", {}).catch(() => {});   // opening the app looks for shares
