@@ -15,6 +15,7 @@ Usage:
     python reels2notes.py https://www.youtube.com/shorts/abcdEFGhijk
     python reels2notes.py https://x.com/user/status/1234567890123456789
     python reels2notes.py -f links.txt            # one URL per line
+    python reels2notes.py --transcripts https://www.youtube.com/@name/videos   # transcripts of a whole channel
 Options:
     --cookies cookies.txt           login cookies (Netscape format) - use if a download needs login
     --browser firefox|edge|chrome   read login cookies straight from a browser (default: none)
@@ -28,6 +29,11 @@ Options:
     --model small                   whisper model: tiny|base|small|medium
     --lang en                       force transcript language (default: auto)
     --no-ocr                        skip on-screen text recognition
+    --transcripts                   transcripts only, no video: each link is a video, a YouTube channel or a playlist;
+                                    YouTube captions (creator's, else automatic), Whisper where there are none;
+                                    one folder per video in <out>/_transcripts/<channel>/ (Reels Hub makes the notes)
+Graphics card: Whisper and the on-screen text use an NVIDIA card when one works (same models, same text),
+    else the processor. REELS_HUB_CPU=1 forces the processor. Setup: README "Use the graphics card".
     --out PATH                      output folder (default: Downloads/reels)
 """
 import argparse, json, re, shutil, subprocess, sys, time
@@ -59,9 +65,100 @@ def find_video(folder):
     return vids[0] if vids else None
 
 
+# ---------------------------------------------------------------- graphics card (NVIDIA)
+# Whisper (CTranslate2) and easyocr (PyTorch) run on an NVIDIA card when it works, else on the processor.
+# Same models and full-size images either way. Any error on the card: that step goes on with the processor.
+# REELS_HUB_CPU=1 forces the processor. GTX 10 cards need PyTorch 2.14 with CUDA 12.6 (README).
+DEV = {}                       # {"whisper": "cuda"|"cpu", "ocr": ...}, decided once per run
+
+
+def gpu_off():
+    return os.environ.get("REELS_HUB_CPU", "").strip() not in ("", "0")
+
+
+def skey(key, device):
+    """Speed-profile key: the graphics card's speeds are learned apart from the processor's."""
+    return key + "_gpu" if device == "cuda" else key
+
+
+def _short(e):
+    return (str(e).strip().splitlines() or [type(e).__name__])[0][:160]
+
+
+_DLLS_DONE = []
+def _cuda_dlls():
+    """Windows: let CTranslate2 (Whisper) find the CUDA libraries that come with PyTorch (torch\\lib)
+    or with the nvidia-cublas-cu12 / nvidia-cudnn-cu12 packages."""
+    if _DLLS_DONE or os.name != "nt":
+        return
+    _DLLS_DONE.append(1)
+    import importlib.util, site
+    dirs = []
+    try:
+        spec = importlib.util.find_spec("torch")           # finds torch without loading it
+        if spec and spec.submodule_search_locations:
+            dirs.append(Path(list(spec.submodule_search_locations)[0]) / "lib")
+    except (ImportError, ValueError):
+        pass
+    try:
+        roots = site.getsitepackages() + [site.getusersitepackages()]
+    except AttributeError:
+        roots = []
+    for r in roots:
+        dirs += sorted(Path(r, "nvidia").glob("*/bin"))
+    for d in dirs:
+        if d.is_dir():
+            try:
+                os.add_dll_directory(str(d))
+            except OSError:
+                pass
+            os.environ["PATH"] = str(d) + os.pathsep + os.environ.get("PATH", "")
+
+
+def whisper_device():
+    if "whisper" not in DEV:
+        DEV["whisper"] = "cpu"
+        if not gpu_off():
+            _cuda_dlls()
+            try:
+                import ctranslate2
+                if ctranslate2.get_cuda_device_count() > 0:
+                    DEV["whisper"] = "cuda"
+            except Exception:
+                pass
+    return DEV["whisper"]
+
+
+def ocr_device():
+    if "ocr" not in DEV:
+        DEV["ocr"] = "cpu"
+        if not gpu_off():
+            _cuda_dlls()
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    DEV["ocr"] = "cuda"
+            except Exception:
+                pass
+    return DEV["ocr"]
+
+
+def gpu_name():
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_name(0)
+    except Exception:
+        pass
+    return "NVIDIA"
+
+
 # ---------------------------------------------------------------- progress / ETA
 # Lines starting with "@@PROGRESS " carry JSON for Reels Hub; it shows them as a progress bar.
-DEFAULT_STATS = {"tx_factor": 0.35, "model_load": 6.0, "ocr_per_img": 1.5, "ocr_load": 8.0, "shot_factor": 0.03}
+DEFAULT_STATS = {"tx_factor": 0.35, "model_load": 6.0, "ocr_per_img": 1.5, "ocr_load": 8.0, "shot_factor": 0.03,
+                 # the same, measured on the graphics card (learned separately, so the ETA fits either way)
+                 "tx_factor_gpu": 0.1, "model_load_gpu": 5.0, "ocr_per_img_gpu": 0.4, "ocr_load_gpu": 8.0,
+                 "cap_secs": 8.0}                                  # transcripts only: seconds per video (captions)
 
 
 def load_stats(out):
@@ -94,6 +191,16 @@ class Progress:
         self.stage, self.frac, self.base = None, 0.0, time.time()
         self.last_emit = 0
         self.dl_eta = None
+        self.times, self.stage_t0 = {}, time.time()     # seconds per step, for the log
+
+    STEP_NAME = {"download": "download", "transcribe": "transcript", "snapshots": "snapshots", "ocr": "on-screen text"}
+
+    def steps(self):
+        """'download 3s, transcript 52s, snapshots 12s, on-screen text 38s' (the current step counted so far)."""
+        t = dict(self.times)
+        if self.stage:
+            t[self.stage] = t.get(self.stage, 0) + time.time() - self.stage_t0
+        return ", ".join(f"{self.STEP_NAME.get(k, k)} {fmt_dur(v)}" for k, v in t.items())
 
     def plan(self, duration, nshots=None):
         st = self.stats
@@ -103,13 +210,20 @@ class Progress:
             nshots = min(EVERY_CAP, int(d / self.every) + 1)
         n = nshots if nshots is not None else min(cap, max(3, int(d / min(20.0, max(2.0, 2.0 * (d / 60) ** 0.5)))))
         self.est["snapshots"] = 2 + d * st["shot_factor"]
-        self.est["transcribe"] = st["model_load"] + d * st["tx_factor"]
-        self.est["ocr"] = (st["ocr_load"] * (_ocr is None) + min(n, 60) * st["ocr_per_img"]) if self.do_ocr else 0
+        wd = whisper_device()
+        od = ocr_device() if self.do_ocr else "cpu"
+        self.est["transcribe"] = st[skey("model_load", wd)] + d * st[skey("tx_factor", wd)]
+        self.est["ocr"] = (st[skey("ocr_load", od)] * (_ocr is None or _ocr_dev != od)
+                           + min(n, 60) * st[skey("ocr_per_img", od)]) if self.do_ocr else 0
         self.planned = True
 
     def start(self, stage):
         CURRENT_STEP[0] = stage
-        self.stage, self.frac, self.base = stage, 0.0, time.time()
+        now = time.time()
+        if self.stage:
+            self.times[self.stage] = self.times.get(self.stage, 0) + now - self.stage_t0
+        self.stage_t0 = now
+        self.stage, self.frac, self.base = stage, 0.0, now
         self.emit(force=True)
 
     def rebase(self):                       # e.g. after the Whisper model has loaded
@@ -371,7 +485,6 @@ def snapshots(video, workdir, scene, max_shots=200, speech=(), prog=None, every=
 
 def transcribe(video, model_name, lang, prog=None, out=None):
     import numpy as np
-    from faster_whisper import WhisperModel
     # decode audio with ffmpeg (16 kHz mono float32) - avoids PyAV version issues
     raw = subprocess.run(["ffmpeg", "-loglevel", "error", "-i", str(video), "-vn",
                           "-ac", "1", "-ar", "16000", "-f", "f32le", "-"],
@@ -380,14 +493,30 @@ def transcribe(video, model_name, lang, prog=None, out=None):
     if audio.size == 0:
         return [], lang or "-", []
     dur = audio.size / 16000
+    device = whisper_device()
+    if device == "cuda":
+        print(f"  transcript on the graphics card ({gpu_name()})")
+        try:
+            return _whisper(audio, dur, model_name, "cuda", [model_name], lang, prog, out)
+        except Exception as e:                # any trouble on the card: the processor does it, same model
+            print(f"  the graphics card did not work for the transcript ({_short(e)}) - using the processor")
+            DEV["whisper"] = "cpu"
+            if prog:
+                prog.update(0)
     # Low RAM: fall back to smaller models instead of failing (small -> base -> tiny)
     sizes = ["large-v3", "medium", "small", "base", "tiny"]
     chain = [model_name] + [m for m in sizes[sizes.index(model_name) + 1:]] if model_name in sizes else [model_name, "base", "tiny"]
+    return _whisper(audio, dur, model_name, "cpu", chain, lang, prog, out)
+
+
+def _whisper(audio, dur, model_name, device, chain, lang, prog, out):
+    from faster_whisper import WhisperModel
     for attempt, name in enumerate(chain):
         model = None
         try:
             t0 = time.time()
-            model = WhisperModel(name, device="cpu", compute_type="int8", cpu_threads=min(4, os.cpu_count() or 4))
+            model = WhisperModel(name, device=device, compute_type="int8",   # int8 works on GTX 10 cards too
+                                 cpu_threads=min(4, os.cpu_count() or 4))
             t1 = time.time()
             if prog:
                 prog.rebase(); prog.update(0)
@@ -405,25 +534,51 @@ def transcribe(video, model_name, lang, prog=None, out=None):
             low_mem = isinstance(e, MemoryError) or any(k in str(e).lower() for k in ("alloc", "memory"))
             del model
             import gc; gc.collect()
-            if not low_mem or attempt == len(chain) - 1:
+            if device != "cpu" or not low_mem or attempt == len(chain) - 1:
                 raise
             print(f"  not enough memory for the '{name}' Whisper model ({e}) - retrying with '{chain[attempt + 1]}'")
     if prog and out and name == model_name:
         stats = prog.stats
-        learn(out, stats, "model_load", t1 - t0)
+        learn(out, stats, skey("model_load", device), t1 - t0)
         if dur > 5:
-            learn(out, stats, "tx_factor", (time.time() - t1) / dur)
+            learn(out, stats, skey("tx_factor", device), (time.time() - t1) / dur)
     return lines, info.language, starts
 
 
 _ocr = None
+_ocr_dev = None
+def _ocr_reader(device):
+    global _ocr, _ocr_dev
+    if _ocr is None or _ocr_dev != device:
+        import easyocr
+        _ocr = None
+        _ocr = easyocr.Reader(["en"], gpu=(device == "cuda"), verbose=False)
+        _ocr_dev = device
+    return _ocr
+
+
 def ocr(images, prog=None, outdir=None):
-    global _ocr
-    import easyocr
+    """On-screen text of each image, at full size. On the graphics card when it works (same model, same text)."""
     t0 = time.time()
-    loaded_now = _ocr is None
-    if _ocr is None:
-        _ocr = easyocr.Reader(["en"], gpu=False, verbose=False)
+    device = ocr_device()
+    loaded_now = _ocr is None or _ocr_dev != device
+    switched = False
+
+    def to_cpu(e):
+        nonlocal device, switched
+        print(f"  the graphics card did not work for the on-screen text ({_short(e)}) - using the processor")
+        DEV["ocr"] = device = "cpu"
+        switched = True
+        return _ocr_reader("cpu")
+
+    if device == "cuda":
+        print(f"  on-screen text on the graphics card ({gpu_name()})")
+        try:
+            reader = _ocr_reader("cuda")
+        except Exception as e:
+            reader = to_cpu(e)
+    else:
+        reader = _ocr_reader("cpu")
     t1 = time.time()
     if prog:
         prog.rebase()
@@ -431,15 +586,22 @@ def ocr(images, prog=None, outdir=None):
     for k, img in enumerate(images, 1):
         if prog:
             prog.update((k - 1) / max(len(images), 1))
-        texts = [t for _, t, conf in _ocr.readtext(str(img)) if conf > 0.4]
+        try:
+            found = reader.readtext(str(img))
+        except Exception as e:
+            if device == "cpu":
+                raise
+            reader = to_cpu(e)                 # this image again on the processor: nothing is skipped
+            found = reader.readtext(str(img))
+        texts = [t for _, t, conf in found if conf > 0.4]
         line = " | ".join(texts).strip()
         if line and line.lower() not in seen:  # drop repeats across frames
             seen.add(line.lower())
             out.append((img.name, line))
-    if prog and outdir and images:
+    if prog and outdir and images and not switched:
         if loaded_now:
-            learn(outdir, prog.stats, "ocr_load", t1 - t0)
-        learn(outdir, prog.stats, "ocr_per_img", (time.time() - t1) / len(images))
+            learn(outdir, prog.stats, skey("ocr_load", device), t1 - t0)
+        learn(outdir, prog.stats, skey("ocr_per_img", device), (time.time() - t1) / len(images))
     return out
 
 
@@ -467,7 +629,7 @@ def old_owner(note):
     return m.group(1) if m else ""
 
 
-def write_note(workdir, url, info, shots, transcript, lang, ocr_lines, owner="", slides=None):
+def write_note(workdir, url, info, shots, transcript, lang, ocr_lines, owner="", slides=None, extra=()):
     author = info.get("uploader") or info.get("channel") or "unknown"
     caption = (info.get("description") or "").strip()
     date = info.get("upload_date", "")
@@ -483,6 +645,7 @@ def write_note(workdir, url, info, shots, transcript, lang, ocr_lines, owner="",
         f"date: {date}",
         f"duration_s: {info.get('duration', '')}",
         *([f"slides: {len(slides)}"] if slides else []),
+        *extra,
         f"tags: [reel, {platform.lower()}]",
         "---",
         f"# {title or info.get('id')}",
@@ -527,8 +690,10 @@ def probe_post(url, browser, cookies):
     auth = _auth(browser, cookies)
     for a in ([auth, []] if auth else [[]]):
         print("  > checking the post: " + " ".join(base[2:] + a + [url]))
+        t0 = time.time()
         r = subprocess.run(base + a + [url], capture_output=True, text=True, encoding="utf-8", errors="replace")
         out = (r.stdout or "").strip()
+        print(f"  post checked in {fmt_dur(time.time() - t0)}")
         if r.returncode == 0 and out.startswith("{"):
             try:
                 return json.loads(out)
@@ -864,7 +1029,7 @@ def _process(url, args, i=1, n=1, stats=None):
         step = max(1, -(-len(shots) // args.ocr_max))       # read text from at most --ocr-max frames
         ocr_lines = ocr(shots[::step], prog, args.out)
     note = write_note(workdir, url, info, shots, transcript, lang, ocr_lines, args.owner)
-    print(f"  done in {fmt_dur(time.time() - prog.t0)} -> {note}")
+    print(f"  done in {fmt_dur(time.time() - prog.t0)} ({prog.steps()}) -> {note}")
     # for Reels Hub: which folder this link went to (an Add from the inbox fills in that reel next)
     print("@@DONE " + json.dumps({"url": url, "folder": workdir.name}), flush=True)
 
@@ -891,8 +1056,594 @@ def _process_slides(url, args, workdir, video, info, slides, prog):
         step = max(1, -(-len(shots) // args.ocr_max))
         ocr_lines = ocr(shots[::step], prog, args.out)
     note = write_note(workdir, url, info, shots, transcript, lang, ocr_lines, args.owner, slides)
-    print(f"  done in {fmt_dur(time.time() - prog.t0)} -> {note}")
+    print(f"  done in {fmt_dur(time.time() - prog.t0)} ({prog.steps()}) -> {note}")
     print("@@DONE " + json.dumps({"url": url, "folder": workdir.name}), flush=True)
+
+# ---------------------------------------------------------------- transcripts only (videos and whole channels)
+# `--transcripts`: no video download, no snapshots, no on-screen text. Each link is a video, or a YouTube channel or
+# playlist (every video in it). The transcript comes from YouTube's captions: the creator's subtitles in the video's
+# own language, else the automatic ones (the untranslated "xx-orig" track). A video without captions, or on another
+# site, is transcribed with Whisper from its audio only. Each video gets a small folder
+# <out>/_transcripts/<channel>/<date>_<id>/ (note.md as for a reel, video.info.json trimmed), which Reels Hub turns
+# into an Obsidian note and lists in its Transcripts catalogue. A video that is already there, or already in the
+# library as a full reel, is left alone.
+TR_DIR = "_transcripts"
+TR_PAUSE = 1.5                       # seconds between videos, on top of yt-dlp's own waits (--sleep-requests)
+TR_SUB_SLEEP = 2                     # seconds yt-dlp waits before each caption download (YouTube limits these)
+TR_RETRY_WAIT = float(os.environ.get("REELS_HUB_RETRY_WAIT", 60))   # after "429 Too Many Requests": wait, then try once more
+INFO_KEEP = ("id", "title", "description", "upload_date", "timestamp", "duration", "uploader", "uploader_id",
+             "uploader_url", "channel", "channel_id", "channel_url", "channel_follower_count", "webpage_url",
+             "original_url", "extractor_key", "extractor", "language", "view_count", "like_count", "tags",
+             "categories", "thumbnail", "chapters", "availability", "live_status", "playable_in_embed")
+AUDIO_FORMAT = "ba[ext=m4a]/ba/b"    # for Whisper: the audio only (the video would be downloaded for nothing)
+CONTROL = "_control.json"            # in _transcripts: {"pause": bool, "stop": bool}, written by Reels Hub's Pause / Stop
+
+
+def yt_video_id(url):
+    """The id of a YouTube video link (watch, youtu.be, shorts, live, embed), else None."""
+    m = re.search(r"(?:youtube\.com/(?:watch\?(?:[^#]*&)?v=|shorts/|live/|embed/|v/)|youtu\.be/)([A-Za-z0-9_-]{11})", url)
+    return m.group(1) if m else None
+
+
+def video_id_of(url):
+    """The video id a link carries, as yt-dlp names it: YouTube, TikTok (/video/<n>), Instagram (/p|reel/<code>),
+    X (/status/<n>); else None."""
+    v = yt_video_id(url)
+    if v:
+        return v
+    for pat in (r"tiktok\.com/.*/video/(\d+)", r"instagram\.com/(?:[^/]+/)?(?:p|reels?|tv)/([A-Za-z0-9_-]+)",
+                r"(?:x|twitter)\.com/[^/]+/status/(\d+)"):
+        m = re.search(pat, url, re.I)
+        if m:
+            return m.group(1)
+    return None
+
+
+def is_listing(url):
+    """Many videos in one link: a YouTube channel or playlist, or a TikTok profile (tiktok.com/@name)."""
+    u = url.split("#")[0]
+    if video_id_of(u):
+        return False
+    if re.search(r"youtube\.com/(@[^/?]+|channel/|c/|user/|playlist\?)", u, re.I):
+        return True
+    return bool(re.search(r"tiktok\.com/@[\w.-]+/?(?:$|[?])", u, re.I))
+
+
+def listing_url(url):
+    """A bare channel link lists every upload, Shorts and live streams included: take its Videos tab unless a tab
+    is given (youtube.com/@name/shorts lists the Shorts)."""
+    u = url.split("#")[0].rstrip("/")
+    if re.search(r"youtube\.com/(@[^/?]+|channel/[^/?]+|c/[^/?]+|user/[^/?]+)$", u, re.I):
+        return u + "/videos"
+    return u
+
+
+def _ytdlp_quiet(cmd):
+    """Run yt-dlp without showing its output; on failure raise its error line made readable."""
+    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if proc.returncode != 0:
+        err = next((l for l in (proc.stderr + "\n" + proc.stdout).splitlines() if l.startswith("ERROR:")), "")
+        raise YtdlpError(friendly_error(err) if err else f"yt-dlp stopped (exit code {proc.returncode})")
+    return proc.stdout
+
+
+def list_videos(url, browser, cookies):
+    """The videos of a channel tab or playlist as YouTube lists them (newest first): (listing, [entries])."""
+    cmd = [sys.executable, "-m", "yt_dlp", "-J", "--flat-playlist", "--no-warnings", "--sleep-requests", "0.75"]
+    out = _ytdlp_quiet(cmd + _auth(browser, cookies) + [url])
+    try:
+        data = json.loads(out)
+    except ValueError:
+        raise RuntimeError("yt-dlp did not return the channel's list")
+    entries = []
+    for e in data.get("entries") or []:
+        if not isinstance(e, dict) or not e.get("id"):
+            continue
+        if e.get("_type") == "playlist" or (e.get("ie_key") or "").endswith("Tab"):
+            continue                                        # a tab or a playlist inside the list, not a video
+        if not e.get("url") and (e.get("ie_key") or "Youtube") != "Youtube":
+            continue
+        entries.append({"id": str(e["id"]), "url": e.get("url") or f"https://www.youtube.com/watch?v={e['id']}",
+                        "title": (e.get("title") or "").strip(), "duration": e.get("duration")})
+    return data, entries
+
+
+def _handle(info, url=""):
+    """The creator's handle as yt-dlp reports it per site: YouTube uploader_id (@name), TikTok uploader (name),
+    Instagram channel (username), X uploader_id (screen name); else what the link or the title says."""
+    plat = platform_of(url, info)
+    order = {"YouTube": ("uploader_id", "channel", "channel_id"), "TikTok": ("uploader", "channel", "uploader_id"),
+             "Instagram": ("channel", "uploader", "uploader_id"), "X": ("uploader_id", "uploader", "channel")}
+    for k in order.get(plat, ("uploader_id", "uploader", "channel", "channel_id")):
+        v = str(info.get(k) or "").strip()
+        if v and not (k == "uploader_id" and plat != "X" and v.isdigit()):   # a numeric uploader_id is not a handle
+            return v
+    m = re.search(r"/@([\w.-]+)", url or "")
+    return m.group(1) if m else str(info.get("title") or "")
+
+
+def tr_key(info, url=""):
+    """Folder name of a video's channel in _transcripts: the handle without the @, made safe for a folder."""
+    key = re.sub(r"[^0-9A-Za-z._-]+", "_", _handle(info, url).lstrip("@")).strip("._-")[:60]
+    return key or "channel"
+
+
+def tr_name(info, url=""):
+    """The channel as shown: YouTube's channel name, TikTok's nickname, Instagram's full name, X's display name."""
+    plat = platform_of(url, info)
+    for k in {"Instagram": ("uploader", "channel"), "X": ("uploader", "uploader_id")}.get(plat, ("channel", "uploader", "uploader_id")):
+        v = str(info.get(k) or "").strip()
+        if v and not v.isdigit():
+            return v
+    return _handle(info, url) or "channel"
+
+
+def tr_done(out):
+    """Video ids already here: {id: ("transcript", folder) or ("reel", folder)}."""
+    ids, out = {}, Path(out)
+    for note in (out / TR_DIR).glob("*/*/note.md"):
+        name = note.parent.name
+        if not name.startswith((".", "_")) and not note.parent.parent.name.startswith((".", "_")):
+            ids[name.split("_", 1)[-1]] = ("transcript", f"{TR_DIR}/{note.parent.parent.name}/{name}")
+    for note in out.glob("*/note.md"):                       # the library: a full reel wins over a transcript
+        name = note.parent.name
+        if not name.startswith((".", "_")) and find_video(note.parent):
+            ids[re.sub(r"_v\d+$", "", name).split("_", 1)[-1]] = ("reel", name)
+    return ids
+
+
+def fetch_info(url, workdir, browser, cookies):
+    """yt-dlp's metadata of one video, nothing downloaded: video.info.json in workdir."""
+    cmd = [sys.executable, "-m", "yt_dlp", "--skip-download", "--write-info-json", "--no-playlist",
+           "--playlist-items", "1", "--no-warnings", "--sleep-requests", "0.75",
+           "-o", str(workdir / "video.%(ext)s")]
+    _ytdlp_quiet(cmd + _auth(browser, cookies) + [url])
+    f = workdir / "video.info.json"
+    if not f.exists():
+        raise RuntimeError("yt-dlp wrote no metadata for this video")
+    return json.loads(f.read_text(encoding="utf-8", errors="replace"))
+
+
+LANG3 = {"en": "eng", "es": "spa", "de": "deu", "fr": "fra", "it": "ita", "pt": "por", "bg": "bul", "ru": "rus", "nl": "nld",
+         "pl": "pol", "tr": "tur", "ja": "jpn", "zh": "zho", "ko": "kor", "ar": "ara", "hi": "hin", "sv": "swe", "da": "dan",
+         "no": "nor", "fi": "fin", "cs": "ces", "el": "ell", "ro": "ron", "hu": "hun", "uk": "ukr", "he": "heb", "id": "ind",
+         "vi": "vie", "th": "tha", "ca": "cat", "sr": "srp", "hr": "hrv", "sk": "slk", "sl": "slv"}
+
+
+def pick_caption(info):
+    """Which caption track to take: ("subs"|"auto", code), or None when the site has none in the video's language.
+    YouTube: the creator's subtitles come first, then the automatic ones ("xx-orig" is the untranslated track; the
+    other automatic languages are machine translations and are never taken). Other sites (TikTok has captions on most
+    videos): the track in the video's language, else the first one."""
+    subs = {k: v for k, v in (info.get("subtitles") or {}).items() if v and k != "live_chat"}
+    auto = {k: v for k, v in (info.get("automatic_captions") or {}).items() if v}
+    if platform_of(info.get("webpage_url") or "", info) != "YouTube":
+        if not subs:
+            return None
+        lang = (info.get("language") or "").lower()
+        wanted = {lang, LANG3.get(lang, lang)} if lang else set()        # TikTok codes are 3 letters (eng-US)
+        k = next((k for k in subs if any(w and (k.lower() == w or k.lower().startswith(w + "-")) for w in wanted)), None)
+        return "subs", k or next(iter(subs))
+    orig = [k for k in auto if k.lower().endswith("-orig")]
+    lang = (info.get("language") or (orig[0][:-5] if orig else "")).lower()
+    if lang:
+        k = next((k for k in subs if k.lower() == lang or k.lower().startswith(lang + "-")), None)
+        if k:
+            return "subs", k
+        k = next((k for k in orig if k.lower() == f"{lang}-orig"), None)
+        if k:
+            return "auto", k
+    if subs and not lang:
+        return "subs", next(iter(subs))
+    if orig:
+        return "auto", orig[0]
+    return None
+
+
+def fetch_caption(workdir, kind, code):
+    """Download one caption track as json3 from the saved metadata (no second lookup of the video)."""
+    cmd = [sys.executable, "-m", "yt_dlp", "--load-info-json", str(workdir / "video.info.json"), "--skip-download",
+           "--write-subs" if kind == "subs" else "--write-auto-subs", "--sub-langs", re.escape(code),
+           "--sub-format", "json3/srt/vtt/best", "--no-warnings", "--sleep-subtitles", str(TR_SUB_SLEEP),
+           "-o", str(workdir / "video.%(ext)s")]
+    _ytdlp_quiet(cmd)
+    files = sorted(p for p in workdir.glob("video.*") if p.suffix.lower() in (".json3", ".srt", ".vtt"))
+    if not files:
+        raise RuntimeError(f"the {code} captions could not be downloaded")
+    return files[0]
+
+
+def _cues(path):
+    """(start seconds, text) per cue from a json3 (YouTube), srt or vtt caption file."""
+    text = Path(path).read_text(encoding="utf-8", errors="replace")
+    cues = []
+    if path.suffix.lower() == ".json3":
+        for ev in (json.loads(text).get("events") or []):
+            if ev.get("tStartMs") is None:
+                continue
+            t = re.sub(r"\s+", " ", "".join(s.get("utf8", "") for s in ev.get("segs") or [])).strip()
+            if t:
+                cues.append((ev["tStartMs"] / 1000.0, t))
+        return cues
+    last = None
+    for block in re.split(r"\n\s*\n", text.replace("\r\n", "\n")):          # srt and vtt: blocks of cue lines
+        m = re.search(r"(\d+):(\d{2}):(\d{2})[.,](\d{1,3})\s*-->|(\d{1,2}):(\d{2})[.,](\d{1,3})\s*-->", block)
+        if not m:
+            continue
+        if m.group(1) is not None:
+            t0 = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3)) + int(m.group(4).ljust(3, "0")) / 1000
+        else:
+            t0 = int(m.group(5)) * 60 + int(m.group(6)) + int(m.group(7).ljust(3, "0")) / 1000
+        lines = block.split("\n")
+        body = lines[[i for i, l in enumerate(lines) if "-->" in l][0] + 1:]
+        t = re.sub(r"<[^>]+>", "", " ".join(body)).replace("&nbsp;", " ")
+        t = re.sub(r"\s+", " ", t).strip()
+        if t and t != last:                                     # rolling captions repeat the previous line
+            cues.append((t0, t)); last = t
+    return cues
+
+
+def caption_lines(path, max_span=8.0, max_chars=150):
+    """A caption file (json3, srt or vtt) -> ([mm:ss] lines, start times). Cues are joined into readable lines: a
+    line ends at a sentence end, after about max_span seconds, or at max_chars (automatic captions have no
+    punctuation)."""
+    cues = _cues(Path(path))
+    lines, starts, cur, t0 = [], [], [], 0.0
+    def flush():
+        if cur:
+            lines.append(f"[{int(t0)//60:02d}:{int(t0)%60:02d}] " + " ".join(cur)); starts.append(t0)
+            cur.clear()
+    for t, text in cues:
+        if cur and (t - t0 >= max_span or sum(len(x) + 1 for x in cur) + len(text) > max_chars
+                    or re.search(r"[.!?…]$", cur[-1])):
+            flush()
+        if not cur:
+            t0 = t
+        cur.append(text)
+    flush()
+    return lines, starts
+
+
+def fetch_audio(workdir, url, browser, cookies, prog):
+    """The audio only, for Whisper: from the saved metadata, else by looking the video up again."""
+    cmd = [sys.executable, "-m", "yt_dlp", "-f", AUDIO_FORMAT, "--no-warnings", "--no-playlist", "--playlist-items", "1",
+           "-o", str(workdir / "audio.%(ext)s")]
+    try:
+        run_ytdlp(cmd + ["--load-info-json", str(workdir / "video.info.json")], prog)
+    except YtdlpError:
+        run_ytdlp(cmd + _auth(browser, cookies) + [url], prog)
+    files = [p for p in workdir.glob("audio.*") if p.suffix.lower() not in (".part", ".ytdl", ".json")]
+    if not files:
+        raise RuntimeError("no audio file was downloaded")
+    return files[0]
+
+
+def _channel_url(url, info):
+    """The creator's page: the @handle address when there is one (else the /channel/ one), Videos tab on YouTube;
+    built from the handle on Instagram and X."""
+    plat = platform_of(url, info)
+    u = next((x for x in (info.get("uploader_url"), info.get("channel_url")) if x and "/@" in x), None) \
+        or info.get("channel_url") or info.get("uploader_url") or ""
+    u = u.rstrip("/")
+    if not u:
+        h = _handle(info, url).lstrip("@")
+        u = {"Instagram": f"https://www.instagram.com/{h}/", "X": f"https://x.com/{h}", "TikTok": f"https://www.tiktok.com/@{h}"}.get(plat, "") if h else ""
+    return u + "/videos" if u and plat == "YouTube" else u
+
+
+def trim_info(info):
+    return {k: info[k] for k in INFO_KEEP if k in info}
+
+
+def _is_429(e):
+    return bool(re.search(r"\b429\b|too many requests", str(e), re.I))
+
+
+class TrProgress:
+    """@@PROGRESS lines for a transcripts run: the bar covers the whole run (videos done of all), the time left
+    comes from the learned seconds per video; a Whisper fallback shows its own stage."""
+    def __init__(self, n, stats, out):
+        self.n, self.stats, self.out, self.i = n, stats, out, 0
+        self.t0, self.last, self.stage, self.base, self.frac = time.time(), 0, "captions", time.time(), 0.0
+        self.dl_eta, self.est, self.tx = None, {}, 0.0
+    def plan(self, dur):                 # Whisper for this video: same estimate as a normal run
+        wd = whisper_device()
+        self.tx = self.stats[skey("model_load", wd)] + dur * self.stats[skey("tx_factor", wd)]
+    def start(self, stage):
+        self.stage, self.frac, self.base = stage, 0.0, time.time(); self.emit(force=True)
+    def rebase(self):
+        self.base = time.time()
+    def update(self, frac, dl_eta=None):
+        self.frac, self.dl_eta = max(0.0, min(1.0, frac)), dl_eta; self.emit()
+    def video(self, i):
+        self.i = i; self.start("captions")
+    def emit(self, force=False):
+        now = time.time()
+        if not force and now - self.last < 0.8:
+            return
+        self.last = now
+        left_videos = max(0, self.n - self.i)                  # after this one
+        rest = left_videos * self.stats["cap_secs"]
+        if self.stage == "paused":
+            label, pct, eta = "Paused", 100.0 * (self.i - 1) / max(1, self.n), None
+        elif self.stage == "captions":
+            label, pct, eta = "Getting captions", 100.0 * (self.i - 1) / max(1, self.n), self.stats["cap_secs"] + rest
+        elif self.stage == "download":
+            label, pct, eta = "Downloading the audio", self.frac * 100, (self.dl_eta or 0) + self.tx + rest
+        else:
+            el = now - self.base
+            mine = el / self.frac * (1 - self.frac) if self.frac > 0.05 and el > 1.5 else max(self.tx * (1 - self.frac), self.tx * 0.1)
+            label, pct, eta = "Transcribing (no captions on YouTube)", self.frac * 100, mine + rest
+        print("@@PROGRESS " + json.dumps({"i": self.i, "n": self.n, "stage": self.stage, "label": label,
+                                          "stage_pct": round(pct, 1), "eta": None if eta is None else round(eta),
+                                          "elapsed": round(now - self.t0), "eta_partial": False}), flush=True)
+
+
+def transcript_one(url, args, out, prog, source_hint="link"):
+    """One video: metadata, captions (or audio + Whisper), note.md in _transcripts/<channel>/<date>_<id>/.
+    Returns the @@DONE dict."""
+    t_start = time.time()
+    tmp = out / TR_DIR / "_tmp"
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    tmp.mkdir(parents=True)
+    info = fetch_info(url, tmp, args.browser, args.cookies)
+    vid = str(info.get("id") or "")
+    title = (info.get("title") or vid).strip().replace("\n", " ")
+    key, name = tr_key(info, url), tr_name(info, url)
+    dest = out / TR_DIR / key / f"{info.get('upload_date') or '00000000'}_{vid}"
+    if dest.exists():
+        shutil.rmtree(tmp)
+        print(f"  already done: {title}")
+        return {"url": url, "folder": f"{TR_DIR}/{key}/{dest.name}", "skipped": True, "transcripts": True, "channel": key}
+    pick = pick_caption(info)
+    lang, source = "-", ""
+    if pick:
+        kind, code = pick
+        cap = fetch_caption(tmp, kind, code)
+        lines, starts = caption_lines(cap)
+        cap.unlink()
+        lang = re.sub(r"-orig$", "", code, flags=re.I)
+        site = platform_of(url, info).lower()
+        source = f"{site} captions" if kind == "subs" else f"{site} captions (automatic)"
+        how = (f"{platform_of(url, info)}'s captions" if site != "youtube" else "the creator's captions") if kind == "subs" else "automatic captions"
+    else:
+        print(f"  no captions on {platform_of(url, info)}")
+        print("  downloading the audio for Whisper")
+        prog.start("download")
+        audio = fetch_audio(tmp, url, args.browser, args.cookies, prog)
+        dur = video_duration(audio) or float(info.get("duration") or 0)
+        prog.plan(dur)
+        prog.start("transcribe")
+        lines, lang, starts = transcribe(audio, args.model, args.lang, prog, str(out))
+        audio.unlink(missing_ok=True)
+        source, how = "whisper", "Whisper"
+        prog.start("captions")
+    tinfo = trim_info(info)
+    (tmp / "video.info.json").write_text(json.dumps(tinfo, ensure_ascii=False, indent=1), encoding="utf-8")
+    write_note(tmp, url, tinfo, [], lines, lang, None, args.owner, extra=[f"transcript: {source}"])
+    for p in tmp.iterdir():                                   # nothing else stays (a leftover caption file)
+        if p.name not in ("note.md", "video.info.json"):
+            p.unlink()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    chan = dest.parent / "_channel.json"
+    if chan.exists():                                          # a listing knew only the handle: the video knows the name
+        try:
+            meta = json.loads(chan.read_text(encoding="utf-8"))
+            if isinstance(meta, dict) and name and meta.get("name") in ("", key, meta.get("handle", "").lstrip("@")) and meta.get("name") != name:
+                meta["name"] = name
+                tmp_c = chan.with_name("._channel.json.tmp")
+                tmp_c.write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
+                os.replace(tmp_c, chan)
+        except (OSError, ValueError):
+            pass
+    if not chan.exists():
+        chan.write_text(json.dumps({"key": key, "name": name, "id": info.get("channel_id") or info.get("uploader_id") or "",
+                                    "handle": ("@" + _handle(info, url).lstrip("@")) if _handle(info, url) else "",
+                                    "url": _channel_url(url, info),
+                                    "platform": platform_of(url, info), "at": time.strftime("%Y-%m-%d %H:%M")},
+                                   ensure_ascii=False, indent=1), encoding="utf-8")
+    os.replace(tmp, dest)
+    took = time.time() - t_start
+    if source != "whisper":
+        learn(str(out), prog.stats, "cap_secs", took)
+    print(f"  done in {fmt_dur(took)} ({how}, {len(lines)} lines) -> {dest / 'note.md'}")
+    return {"url": url, "folder": f"{TR_DIR}/{key}/{dest.name}", "transcripts": True, "channel": key,
+            "from": source_hint, "source": source, "title": title}
+
+
+def control(out):
+    """What Reels Hub asked for: {"pause": bool, "stop": bool} (no file: nothing)."""
+    try:
+        d = json.loads((out / TR_DIR / CONTROL).read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def wait_or_stop(out, secs):
+    """Sleep up to secs, a second at a time; True if a Stop came in meanwhile."""
+    end = time.time() + secs
+    while time.time() < end:
+        if control(out).get("stop"):
+            return True
+        time.sleep(min(1.0, max(0.0, end - time.time())))
+    return False
+
+
+def hold_if_paused(out, prog, i):
+    """Pause pressed: wait here (the bar says Paused) until Resume or Stop. True if Stop came."""
+    c = control(out)
+    if not c.get("pause") and not c.get("stop"):
+        return False
+    if c.get("stop"):
+        return True
+    print("  paused - press Resume to go on", flush=True)
+    prog.start("paused")
+    while True:
+        time.sleep(1)
+        c = control(out)
+        if c.get("stop"):
+            return True
+        if not c.get("pause"):
+            print("  resumed", flush=True)
+            prog.video(i)
+            return False
+        prog.emit()
+
+
+class RunRecord:
+    """What a channel (or playlist) run did, kept in its _channel.json under "run" so Reels Hub can say where it
+    stopped and offer Resume: listed, here (already done before), todo, done, failed, last, next, state."""
+    def __init__(self, out, data, lurl, entries, new):
+        self.cdir = out / TR_DIR / tr_key(data, lurl)
+        self.rec = {"url": lurl, "title": data.get("title") or lurl, "pid": os.getpid(),
+                    "started": time.strftime("%Y-%m-%d %H:%M"), "at": time.strftime("%Y-%m-%d %H:%M"),
+                    "listed": len(entries), "here": len(entries) - len(new), "todo": len(new), "done": 0, "failed": 0,
+                    "last": "", "next": new[0]["title"] if new else "", "state": "running"}
+        self.titles = [e["title"] for e in new]
+        self.data = data
+        self.save()
+
+    def save(self):
+        self.cdir.mkdir(parents=True, exist_ok=True)
+        f = self.cdir / "_channel.json"
+        try:
+            meta = json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
+            if not isinstance(meta, dict):
+                meta = {}
+        except (OSError, ValueError):
+            meta = {}
+        if not meta.get("key"):
+            d, u = self.data, self.rec["url"]
+            plat = platform_of(u, d)
+            meta.update({"key": tr_key(d, u), "name": tr_name(d, u), "id": d.get("channel_id") or d.get("uploader_id") or "",
+                         "handle": ("@" + _handle(d, u).lstrip("@")) if _handle(d, u) else "",
+                         "url": (_channel_url(u, d) or u) if plat == "YouTube" else u,
+                         "platform": plat, "at": time.strftime("%Y-%m-%d %H:%M")})
+        self.rec["at"] = time.strftime("%Y-%m-%d %H:%M")
+        meta["run"] = self.rec
+        tmp = f.with_name("._channel.json.tmp")
+        tmp.write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
+        os.replace(tmp, f)
+
+    def step(self, k, ok):
+        """Video number k of this listing (1-based) finished (ok) or failed."""
+        self.rec["done" if ok else "failed"] += 1
+        self.rec["last"] = self.titles[k - 1] if k - 1 < len(self.titles) else ""
+        self.rec["next"] = self.titles[k] if k < len(self.titles) else ""
+        self.save()
+
+    def end(self, state):
+        left = self.rec["todo"] - self.rec["done"] - self.rec["failed"]
+        self.rec["state"] = "finished" if left <= 0 and state == "finished" else state
+        self.rec["left"] = max(0, left)
+        self.save()
+
+
+def transcripts_main(urls, args):
+    """`--transcripts`: every link (video, channel or playlist) -> transcript folders, one @@DONE line per video.
+    Pause / Stop come through the control file; a run that is stopped or breaks off can be resumed with the same link
+    (what is here is skipped) and its channel's _channel.json says where it got to."""
+    out = Path(args.out)
+    (out / TR_DIR).mkdir(parents=True, exist_ok=True)
+    stats = load_stats(args.out)
+    todo, failed_lists, records = [], [], []                    # todo: (url, from, title, record, k)
+    done = tr_done(args.out)
+    for url in urls:
+        if is_listing(url):
+            lurl = listing_url(url)
+            print(f"\n== listing {lurl}")
+            try:
+                data, entries = list_videos(lurl, args.browser, args.cookies)
+            except Exception as e:
+                print(f"  FAILED to list it: {e}"); failed_lists.append(url); continue
+            seen = set(x[0] for x in todo)
+            new = [e for e in entries if e["id"] not in done and e["url"] not in seen]
+            print(f"  {data.get('title') or lurl}: {len(entries)} videos, {len(entries) - len(new)} already here, {len(new)} to do")
+            rec = RunRecord(out, data, lurl, entries, new)
+            records.append(rec)
+            todo += [(e["url"], "channel", e["title"], rec, k) for k, e in enumerate(new, 1)]
+        else:
+            vid = video_id_of(url)
+            if vid and vid in done:
+                kind, folder = done[vid]
+                print(f"\n== {url}\n  already {'in your library as a full video' if kind == 'reel' else 'done'}: {folder}")
+                print("@@DONE " + json.dumps({"url": url, "folder": folder, "skipped": True, "transcripts": True}), flush=True)
+                continue
+            if url not in set(x[0] for x in todo):
+                todo.append((url, "link", "", None, 0))
+    print("@@TOTAL " + json.dumps({"n": len(todo)}), flush=True)
+    if not todo:
+        for rec in records:
+            rec.end("finished")
+        print("\nnothing to do" + (": the listed channels could not be read" if failed_lists else ""))
+        return 1 if failed_lists else 0
+    prog = TrProgress(len(todo), stats, args.out)
+    failed, consecutive_429, channels, ended, tried = [], 0, {}, "finished", 0
+    for i, (url, origin, title, rec, k) in enumerate(todo, 1):
+        if hold_if_paused(out, prog, i):
+            ended = "stopped"
+            print(f"\n  stopped by you after {i - 1} of {len(todo)}: next would be {title or url} - "
+                  "Resume on the channel (or the same link again) goes on from here", flush=True)
+            break
+        print(f"\n== [{i}/{len(todo)}] {title or url}")
+        prog.video(i)
+        tried = i
+        ok = False
+        try:
+            try:
+                d = transcript_one(url, args, out, prog, origin)
+            except (YtdlpError, RuntimeError) as e:
+                if not _is_429(e):
+                    raise
+                consecutive_429 += 1
+                if consecutive_429 >= 3:
+                    print("  YouTube keeps refusing (429 Too Many Requests): stopping here, run it again later - "
+                          "what is done stays done")
+                    failed.append(url)
+                    ended = "interrupted"
+                    if rec:
+                        rec.step(k, False)
+                    break
+                print(f"  YouTube is limiting requests (429): waiting {TR_RETRY_WAIT:g} s and trying once more")
+                if wait_or_stop(out, TR_RETRY_WAIT):
+                    ended = "stopped"
+                    print(f"  stopped by you after {i - 1} of {len(todo)}: next would be {title or url}", flush=True)
+                    break
+                d = transcript_one(url, args, out, prog, origin)
+            consecutive_429 = 0
+            ok = True
+            print("@@DONE " + json.dumps(d, ensure_ascii=False), flush=True)
+            if d.get("channel") and not d.get("skipped"):
+                channels[d["channel"]] = channels.get(d["channel"], 0) + 1
+        except Exception as e:
+            print(f"  FAILED: {e}"); failed.append(url)
+        if rec:
+            rec.step(k, ok)
+        if i < len(todo):
+            if wait_or_stop(out, TR_PAUSE):
+                ended = "stopped"
+                nxt = todo[i][2] or todo[i][0]
+                print(f"\n  stopped by you after {i} of {len(todo)}: next would be {nxt} - "
+                      "Resume on the channel (or the same link again) goes on from here", flush=True)
+                break
+    for rec in records:
+        rec.end(ended)
+    for key, n in channels.items():
+        print("@@CHANNEL " + json.dumps({"channel": key, "new": n}), flush=True)
+    shutil.rmtree(out / TR_DIR / "_tmp", ignore_errors=True)   # a failed video's leftovers
+    attempted = len(todo) if ended == "finished" else tried
+    ok = attempted - len(failed)
+    if ended == "finished":
+        print(f"\n{ok} of {len(todo)} done" + (f", {len(failed)} failed" if failed else "")
+              + (f", {len(failed_lists)} channel link(s) could not be listed" if failed_lists else ""))
+    else:
+        print(f"\n{ended} after {attempted} of {len(todo)}: {ok} done, {len(failed)} failed, {len(todo) - attempted} not done yet")
+    if failed:
+        Path(args.out, "failed.txt").write_text("\n".join(failed), encoding="utf-8")
+    return 0 if ok or not (failed or failed_lists) else 1
+
 
 
 def main():
@@ -912,6 +1663,8 @@ def main():
     ap.add_argument("--new-version", action="store_true", help="process already-done videos again as a new copy (_v2, _v3)")
     ap.add_argument("--target", help="reel folder name to use (with --redo or --new-version)")
     ap.add_argument("--out", default=str(Path.home() / "Downloads" / "reels"))
+    ap.add_argument("--transcripts", action="store_true",
+                    help="transcripts only (no video, no snapshots): links can be videos, YouTube channels or playlists")
     args = ap.parse_args()
     ms = str(args.max_shots).strip().lower()
     args.every = 0.0
@@ -929,6 +1682,8 @@ def main():
         urls += [l.strip() for l in Path(args.file).read_text(encoding="utf-8-sig", errors="replace").splitlines() if l.strip().startswith("http")]
     if not urls:
         ap.error("give at least one URL or -f links.txt")
+    if args.transcripts:
+        return transcripts_main(urls, args)
 
     failed = []
     stats = load_stats(args.out)

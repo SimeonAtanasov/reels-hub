@@ -17,6 +17,7 @@ reels/
 _tmp/
 _inbox/
 _trash/
+_transcripts/
 _categories.json
 hub.json
 shots.json

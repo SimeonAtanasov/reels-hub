@@ -19,6 +19,8 @@ Snapshots can be edited inside the app (crop, rotate, draw, arrows, boxes, text,
 
 **Instagram photo slideshows** (posts with several slides, or a single photo) work too: the app downloads every slide's full image, joins the slides into one video (each photo shows for 4 seconds, video slides play as they are), saves each photo as a snapshot and reads its text. **◀ Slide** and **Slide ▶** under the video (or the , and . keys) step through the slides, and times show as "Slide 3" instead of 00:10. A slideshow of photos only has no transcript; its Obsidian note puts the slides' text under Content, in order, and has no Original text. Video slides in a mixed post get a transcript and snapshots as usual. Photo posts on other sites (for example TikTok photo posts) are not supported yet; the app says the post has no video.
 
+**Transcripts only**: paste a YouTube channel link (or a playlist, or single video links) and press **Transcripts** instead of Run: every video gets its transcript as a note in Obsidian, without downloading the video. See [Transcripts of a whole channel](#transcripts-of-a-whole-channel-or-just-the-text).
+
 Two people with their own laptops can **share** videos with each other on purpose: see [Sharing between two laptops](#sharing-between-two-laptops-optional).
 
 ## Install (Windows)
@@ -34,6 +36,25 @@ winget install DenoLand.Deno
 ```
 
 Open a new terminal after installing ffmpeg.
+
+### Use the graphics card (optional, NVIDIA only)
+
+With an NVIDIA graphics card, the transcript and the on-screen text run on the card: the same models on full-size snapshots, so the same text, only several times faster (a 1:30 reel took about 6 minutes on the processor). The app uses the card by itself when it works. If it doesn't, or stops working halfway, that step goes on with the processor and the Log says why. Intel or AMD graphics are not used.
+
+Check what you have (Command Prompt): `powershell -NoProfile -Command "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name"`. If it lists an NVIDIA card, install the graphics-card build of PyTorch (about 2.5 GB). Older cards (GTX 10 series such as the GTX 1060) need exactly this version: PyTorch 2.15 and later no longer support them.
+
+```
+py -m pip uninstall -y torch torchvision
+py -m pip install torch==2.14.0 torchvision==0.29.0 --index-url https://download.pytorch.org/whl/cu126
+py -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+The last line should print `2.14.0+cu126 True` and the card's name. The transcript (Whisper) uses the CUDA libraries that come with that PyTorch. If its Log line says the card did not work for the transcript and mentions a missing `cublas` or `cudnn` file, also run `py -m pip install nvidia-cublas-cu12 "nvidia-cudnn-cu12==9.*"`.
+
+- The Log shows "transcript on the graphics card" and "on-screen text on the graphics card", and every video's `done in` line lists how long each step took.
+- Don't upgrade torch afterwards (`pip install --upgrade torch`, or a tool that does it): that brings back the processor-only build. Run the two install lines again to repair it. `install.bat` does not change an installed torch.
+- To use the processor anyway: `set REELS_HUB_CPU=1` before `reels-hub.bat` in the same Command Prompt window.
+- The estimated time learns the card's speed separately, so it is right after one or two videos.
 
 ## First start
 
@@ -65,7 +86,31 @@ Command line only:
 ```
 python reels2notes.py https://www.instagram.com/p/XXXXXXXX/
 python reels2notes.py -f links.txt
+python reels2notes.py --transcripts https://www.youtube.com/@name/videos   # the folders only: the app makes the notes
 ```
+
+## Transcripts of a whole channel, or just the text
+
+Sometimes you want the words, not the video: everything a creator has said, searchable in Obsidian. Paste one or more links in the box and press **Transcripts** instead of Run:
+
+- a **YouTube channel** (`https://www.youtube.com/@name` or `.../@name/videos`): every video in its Videos tab. Shorts and live streams are left out unless you paste their tab (`.../@name/shorts`, `.../@name/streams`)
+- a **playlist** link: every video in it
+- a **TikTok profile** (`https://www.tiktok.com/@name`): every video of that creator. TikTok changes its site often, so this is less reliable than YouTube; if it fails, update yt-dlp or try with `cookies.txt`
+- **single video links** from YouTube, TikTok, Instagram or X. Whole accounts on Instagram and X cannot be listed (Instagram blocks it, X offers nothing to list), so paste their video links one by one; X usually needs `cookies.txt`
+
+No video is downloaded. For a YouTube video the transcript is its captions: the creator's own subtitles in the video's language when there are any, else YouTube's automatic captions (the untranslated track; the machine translations into other languages are never taken). TikTok videos usually carry captions too, and those are taken the same way. A video without captions, and every Instagram or X video (no captions there), is transcribed with Whisper from its audio only, as a normal Run would (slower, on the graphics card when you have one). A video that is already in your library, in full or as a transcript, is skipped, so you can paste the same channel again next month and only the new videos are done.
+
+Each video gets:
+
+- an **Obsidian note made from your own `'YouTube Template.md`**, read from the vault's Templates folder each time (so a change to the template carries over): date, time, Title, Source, Tags, Related, the formula line, the six sections to fill in, then the transcript under Content (paragraphs) and Original text (with times). Nothing else is added; the app's own bookkeeping (the video's id, where the text came from) sits in `<!-- reels-hub -->` comments that Obsidian does not show. Videos from a channel, playlist or profile link go to `YouTube\<channel name>\` (or `TikTok\<creator>\`); single video links go to `YouTube\` like any other note. TikTok links use the TikTok template (Creator and Description filled in); Instagram and X links keep the app's usual video-note format in `Instagram\` and `X\`
+- a line in the **channel note**, `YouTube\<channel name>\'<channel name> (channel).md`: every video of that channel with its date, length and where the text came from, linked to its note (newest first). Only the list between its markers is rewritten; write your own notes anywhere else in it
+- a small folder in the reels folder (`_transcripts\<channel>\<date>_<id>\`, the note's text and the video's details), nothing else
+
+The **Transcripts** tab above the list (next to **Videos**) is the catalogue: each channel or creator as a folder (with its site's badge) and its videos, newest first, with a badge for where the text came from (CC = the site's captions, AUTO = YouTube's automatic captions, W = Whisper). Click a video to read its transcript: every time opens the video on YouTube at that moment. From there: **Open note** (the link under the title), **Get the video** (downloads it and processes it in full: Whisper transcript, snapshots, on-screen text; it then shows under Videos, and its note is kept: the caption text is replaced by Whisper's transcript, the video is added by Send to Obsidian as usual), **Copy transcript**, **Copy AI prompt** and **Remove** (the folder goes to `_trash\_transcripts`, and if you tick it, the note to the vault's trash). The × on a channel removes all its transcripts. **Categories work here as for videos**: pick one on a transcript, or drag it onto a category, group the list by Channel, Category or None, sort it, and filter by channel or category with the chips; the categories are the same list as under Videos. A transcript's category also goes into its Obsidian note as a tag on the Tags line (`#YouTube #Training`). Search looks at titles, channels and categories here. The transcript runs wait in the same line as everything else (**Waiting** under the progress bar) and show in the **Log** video by video; the progress bar counts videos.
+
+**Pause, Stop, Resume.** During a transcripts run, **Pause** and **Stop** sit under the progress bar; both let the current video finish first. Pause holds the run (the bar says *paused*) until you press **Resume**; Stop ends it. Under each channel in the Transcripts tab a line says how its last run went: *Running · 57 of 255 done · next: ...*, *Stopped after 57 of 255 · next: ... · 198 left*, or *Interrupted* when the app was closed or the run broke off, each with a **Resume** button that lists the channel again and does only what is not here yet (pasting the link again does the same). After a run with failed videos the line offers **Retry**.
+
+How long it takes: roughly 10 seconds per video with captions, so a channel of 300 videos in under an hour, and a few MB on disk. YouTube limits how fast captions can be fetched: the app waits between videos and, when YouTube answers "429 Too Many Requests", waits a minute and tries again; after three refusals in a row the run stops and says so, and what is done stays done (just press Transcripts again later). Install Deno (see Install) before a big run: yt-dlp uses it for the checks YouTube now asks for; without it some videos or captions are refused. Members-only, private and unavailable videos are listed as failed in the Log and left out. If YouTube asks you to sign in, `cookies.txt` next to the app works here too.
 
 ## Where things are stored
 
@@ -74,6 +119,7 @@ python reels2notes.py -f links.txt
 | Videos, snapshots, notes, favorites, categories | the reels folder from Settings (default `Downloads/reels`) | Settings, or `--out PATH` |
 | Obsidian notes | new notes in `<vault>/YouTube`, `/TikTok`, `/Instagram`, `/X` - move or rename them freely, the app finds them again; the video and favorite images in `910_Attachments/ReelsHub/<reel>` | `--vault PATH` |
 | Shares waiting in your Inbox | `_inbox` in the reels folder (dismissed ones in `_trash/_inbox`) | - |
+| Transcript-only videos (the Transcripts tab) | `_transcripts/<channel>/<date>_<id>` in the reels folder (removed ones in `_trash/_transcripts`); their notes in `<vault>/YouTube/<channel>` | Settings |
 | Your name, folders, sharing token | `%APPDATA%\ReelsHub\config.json` on this computer | Settings |
 
 The vault comes from Settings. If none is set or it is not found, Obsidian sync is switched off.
@@ -124,7 +170,7 @@ The API checks Access's signed token on every request (audience, issuer, expiry)
 
 - Everything runs on your own machine. The app listens on 127.0.0.1 only and ignores requests from other websites. Sharing is the only part that goes online, and it sends only what is listed above.
 - My notes and favorite text save automatically. Re-processing a video keeps your notes; its favorites are cleared only if the run succeeds, and the video's controls pause while it runs (or waits in line).
-- Long videos: snapshots are capped per video (`--max-shots auto`, a number, or `every:5` for one every 5 seconds; set it next to Run in the app, where your choice is remembered), on-screen text is read from at most 60 of them, and transcription on CPU takes roughly a quarter to a half of the video's length.
+- Long videos: snapshots are capped per video (`--max-shots auto`, a number, or `every:5` for one every 5 seconds; set it next to Run in the app, where your choice is remembered), on-screen text is read from at most 60 of them, and transcription on CPU takes roughly a quarter to a half of the video's length (much less on an NVIDIA graphics card, see [Use the graphics card](#use-the-graphics-card-optional-nvidia-only)). The Log's `done in` line shows how long each step took, and `post checked in` how long the Instagram check took.
 - Running a link that is already done asks what to do: **New version** (a separate copy, v2, v3... - the original and its favorites stay) or **Skip**. On a reel, **+ New version** does the same and **Re-process** replaces that version. Both reuse the downloaded video.
 - Instagram links are checked first (one quick extra request) to see whether the post is a slideshow. Slideshows keep their slide images in a `slides` folder inside the reel's folder, so Re-process and New version work without downloading again. A shared slideshow is rebuilt the same way on the other laptop, so favorites land on the same slides; both laptops need this version of the app.
 - If memory is low, transcription falls back to smaller Whisper models (base, then tiny).

@@ -192,6 +192,37 @@ def can_delete():
 PLATFORM_DIRS = ("Instagram", "TikTok", "YouTube", "X")             # one vault folder per platform
 FAV_START, FAV_END = "<!-- reels-hub:favorites start -->", "<!-- reels-hub:favorites end -->"
 VID_START, VID_END = "<!-- reels-hub:video start -->", "<!-- reels-hub:video end -->"
+TXT_START, TXT_END = "<!-- reels-hub:text start -->", "<!-- reels-hub:text end -->"   # a transcript-only note's text
+VIDS_START, VIDS_END = "<!-- reels-hub:videos start -->", "<!-- reels-hub:videos end -->"   # a channel note's list
+TR_DIR = "_transcripts"                  # transcript-only videos, one folder per channel (see reels2notes --transcripts)
+TR_VIDEO_LINE = "_Video not downloaded: paste the link in Reels Hub and press Run to add it._"
+def tr_source_label(source):
+    """'youtube captions (automatic)' -> 'YouTube captions (automatic)', 'tiktok captions' -> 'TikTok captions',
+    'whisper' -> 'Whisper'."""
+    src = str(source or "").strip().lower()
+    if not src:
+        return "captions"
+    if src == "whisper":
+        return "Whisper"
+    names = {"youtube": "YouTube", "tiktok": "TikTok", "instagram": "Instagram", "x": "X"}
+    site = src.split(" ")[0]
+    rest = src[len(site):].strip()
+    return f"{names.get(site, site.title())} {rest}".strip() if rest else names.get(site, site.title())
+TR_CACHE = {}                            # transcript folder -> (note mtime, hub mtime, item) for the catalogue
+TR_CONTROL = "_control.json"             # in _transcripts: {"pause", "stop"} for the transcripts run (reels2notes reads it)
+TEMPLATE_FILES = {"YouTube": "'YouTube Template.md", "TikTok": "`TikTok Template.md"}   # in the vault's Templates folder
+TEMPLATE_FALLBACK = {                    # copies of those templates (2026-11-05), used when the vault has none
+    "YouTube": "{{date}}\n{{time}}\n**Title:** \n**Source**:\n**Tags**: #YouTube \n"
+               "**Related**: [[900_Meta/MOCs/YouTube_MOC|YouTube_MOC]] [[900_Meta/MOCs/YouTube_MOC.canvas|YouTube_MOC]]\n\n"
+               "Formula to remove timestamp: =RIGHT(A1,LEN(A1)-13)\n\n# **Summary**:\n\n"
+               "# **What was the most memorable thing / Main Takeaways?**\n\n# **Key Concepts and Themes:**\n\n"
+               "# **Reflective Questions:**\n\n# **Actionable Insights:**\n\n# **Compare and Contrast:**\n\n"
+               "# **Content**:\n\n# **Original text:**\n",
+    "TikTok": "{{date}}\n{{time}}\n**Source**:\n**Tags**: #TikTok\n**Related**: [[TikTok_MOC]]\n**Creator:** \n**Description:**\n\n"
+              "Formula to remove timestamp: =RIGHT(A1,LEN(A1)-13)\n\n# **Summary**:\n\n"
+              "# **What was the most memorable thing / Main Takeaways?**\n\n# **Key Concepts and Themes:**\n\n"
+              "# **Reflective Questions:**\n\n# **Actionable Insights:**\n\n# **Compare and Contrast:**\n\n"
+              "# **Content**:\n\n# **Original text:**\n"}
 
 JOB = {"running": False, "log": [], "started": None, "finished": None, "urls": [], "progress": None, "busy": set(),
        "share": None, "mark": 0, "done": 0}   # share: id of the inbox item being added; mark: where this run's lines
@@ -344,6 +375,7 @@ def parse_note(folder):
         "url": meta.get("source", ""), "author": meta.get("author", ""),
         "date": meta.get("date", ""), "duration": meta.get("duration_s", ""),
         "caption": caption, "lang": lang.group(1) if lang else "",
+        "tsource": meta.get("transcript", ""),              # transcript-only videos: youtube captions / whisper
         "transcript": transcript, "ocr": ocr, "notes": notes,
         "times": times,
         "manual": manual_shots(folder),
@@ -592,6 +624,8 @@ def _ensure_vault_note(folder, r):
             waiting = folder.name in INBOX["partial"].values()       # downloaded, fill-in to be tried again
         if waiting or (JOB["running"] and JOB.get("share") and r.get("url") in (JOB.get("urls") or [])):
             return {"pending": True}       # a video being added from the inbox: its note waits for the share's notes
+        rel = _adopt_transcript_note(folder, r)      # the same video as a transcript-only note: keep that note
+    if not rel:
         dname = vault_dir(r["platform"])
         base = NOTE_PREFIX.get(r["platform"], "") + clean_name(r["label"], r["id"]) + (f" (v{r['version']})" if r["version"] > 1 else "")
         name, k = base, 2
@@ -633,12 +667,24 @@ def _info(folder):
         return {}
 
 
-def vault_note_text(folder, r, state):
+def _text_lines(r):
+    """The note's Content (paragraphs) and Original text (mm:ss lines) from the transcript."""
+    full_text = " ".join(x["text"] for x in r["transcript"])
+    lines = ["# **Content**:", ""]
+    lines += [p + "\n" for p in _paragraphs(full_text)] or ["_No speech detected._", ""]
+    lines += ["# **Original text:**", ""]
+    lines += [f"{mmss(x['t'])} {x['text']}" for x in r["transcript"]] or ["_No speech detected._"]
+    return lines
+
+
+def vault_note_text(folder, r, state, tonly=None):
+    """The note in your template. tonly (transcript-only videos): {label, video}: a Transcript line under Posted,
+    that text instead of the video placeholder, and the Content + Original text between the text markers (replaced
+    by Whisper's transcript if the video is processed in full later)."""
     info = _info(folder)
     plat = r["platform"]
     creator_url = info.get("uploader_url") or info.get("channel_url") or ""
     tag_cat = ("#" + re.sub(r"[^0-9A-Za-z]+", "", state["category"].title())) if state["category"] else ""
-    full_text = " ".join(x["text"] for x in r["transcript"])
     lines = [time.strftime("%Y-%m-%d"), time.strftime("%H:%M"),
              f"**Title:** {r['title'] or r['label']}",
              f"**Source**: {r['url']}",
@@ -647,9 +693,10 @@ def vault_note_text(folder, r, state):
              f"**Creator:** {r['author']}" + (f" - {creator_url}" if creator_url else ""),
              f"**Posted:** {r['date']}" + (f" · {len(r['slides'])} slides" if r.get("slides") else
                                            f" · {_dur(r['duration'])}" if _dur(r["duration"]) else ""),
+             *([f"**Transcript:** {tonly['label']}"] if tonly else []),
              f"**Category**: {state['category'] or '-'}",
              _marker(r["id"]),
-             VID_START, '_Press "Send to Obsidian" in Reels Hub to add the video._', VID_END,
+             VID_START, tonly["video"] if tonly else '_Press "Send to Obsidian" in Reels Hub to add the video._', VID_END,
              "",
              "Formula to remove timestamp: =RIGHT(A1,LEN(A1)-13)", ""]
     for sec in AI_SECTIONS:
@@ -660,13 +707,13 @@ def vault_note_text(folder, r, state):
               "# **Description**:", "", r["caption"] or "_none_", ""]
     if r["ocr"]:
         lines += ["## On-screen text", ""] + [f"- **{tlabel(r, r['times'].get(x['shot'], 0))}** {x['text']}" for x in r["ocr"]] + [""]
-    lines += ["# **Content**:", ""]
     if r.get("slides") and not r["transcript"]:            # photo slideshow: the slides' text, in order
+        lines += ["# **Content**:", ""]
         lines += [f"**{tlabel(r, r['times'].get(x['shot'], 0))}:** {x['text']}\n" for x in r["ocr"]] or ["_No text found on the slides._", ""]
         return "\n".join(lines) + "\n"
-    lines += [p + "\n" for p in _paragraphs(full_text)] or ["_No speech detected._", ""]
-    lines += ["# **Original text:**", ""]
-    lines += [f"{mmss(x['t'])} {x['text']}" for x in r["transcript"]] or ["_No speech detected._"]
+    lines += [TXT_START] if tonly else []
+    lines += _text_lines(r)
+    lines += [TXT_END] if tonly else []
     return "\n".join(lines) + "\n"
 
 
@@ -773,7 +820,10 @@ def _at(url, t):
 
 def ai_prompt(reel_id):
     """Your Obsidian AI prompt + this reel's transcript, ready to paste into ChatGPT/Claude."""
-    folder = reel_dir(reel_id)
+    return _ai_prompt(reel_dir(reel_id))
+
+
+def _ai_prompt(folder):
     r = parse_note(folder)
     if not r:
         raise ValueError("unknown reel")
@@ -794,6 +844,426 @@ def ai_prompt(reel_id):
     spoken = " ".join(x["text"] for x in r["transcript"])
     return head + prompt.strip() + "\n\n---\n" + (("Transcript:\n\n" + spoken) if spoken or not slides else "Photo slideshow (no speech).") + \
         slides + ("\n\nDescription:\n" + r["caption"] if r["caption"] else "")
+
+
+# ---------------------------------------------------------------- transcripts (transcript-only videos, whole channels)
+# reels2notes.py --transcripts puts each video in <reels folder>/_transcripts/<channel>/<date>_<id>/ (note.md as for a
+# reel, a trimmed video.info.json; hub.json gets note_path once the vault note exists, and "full" once the same video
+# was processed in full). The page's Transcripts catalogue lists them by channel. Nothing here touches the gallery.
+def tr_cdir(key):
+    """A channel folder inside _transcripts, from a key sent by the page."""
+    if not isinstance(key, str) or not re.fullmatch(r"[^/\\:*?\"<>|\x00-\x1f]{1,200}", key) \
+            or key.startswith((".", "_")) or key.strip() != key:
+        raise PermissionError("bad channel")
+    folder = OUT / TR_DIR / key
+    if folder.parent.resolve() != (OUT / TR_DIR).resolve() or not folder.is_dir():
+        raise ValueError("unknown channel")
+    return folder
+
+
+def tr_dir(key, rid):
+    """A transcript folder from a channel key and a video folder name sent by the page (or by the pipeline)."""
+    cdir = tr_cdir(key)
+    if not isinstance(rid, str) or not re.fullmatch(r"[^/\\:*?\"<>|\x00-\x1f]{1,200}", rid) \
+            or rid.startswith((".", "_")) or rid.strip() != rid:
+        raise PermissionError("bad video id")
+    folder = cdir / rid
+    if folder.parent.resolve() != cdir.resolve() or not (folder / "note.md").is_file():
+        raise ValueError("unknown transcript")
+    return folder
+
+
+def _hub(folder):
+    """hub.json as it is (a transcript folder's note_path, note_name, full)."""
+    try:
+        d = json.loads(read_text(folder / "hub.json"))
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _channel_meta(cdir):
+    try:
+        d = json.loads(read_text(cdir / "_channel.json"))
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_channel_meta(cdir, meta):
+    atomic_write(cdir / "_channel.json", json.dumps(meta, indent=1, ensure_ascii=False))
+
+
+def tr_item(folder, key):
+    """One transcript-only video for the catalogue: reads only the head of note.md (cached by file times)."""
+    try:
+        mt = ((folder / "note.md").stat().st_mtime, (folder / "hub.json").stat().st_mtime if (folder / "hub.json").exists() else 0)
+    except OSError:
+        return None
+    hit = TR_CACHE.get(str(folder))
+    if hit and hit[0] == mt:
+        it = dict(hit[1])
+    else:
+        try:
+            with open(folder / "note.md", encoding="utf-8", errors="replace") as fh:
+                head = fh.read()
+        except OSError:
+            return None
+        meta, body = {}, head
+        m = re.match(r"^---\n(.*?)\n---\n(.*)$", head, re.S)
+        if m:
+            for line in m.group(1).splitlines():
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    meta[k.strip()] = v.strip()
+            body = m.group(2)
+        t = re.search(r"^# (.+)$", body, re.M)
+        lm = re.search(r"^## Transcript \((.*?)\)", body, re.M)
+        tl = re.search(r"^## Transcript\b[^\n]*\n(.*?)(?=^## |\Z)", body, re.M | re.S)
+        n = len(re.findall(r"^\[\d+:\d+\]", tl.group(1), re.M)) if tl else 0
+        url = meta.get("source", "")
+        it = {"ch": key, "id": folder.name, "title": (t.group(1).strip() if t else folder.name)[:200],
+              "author": meta.get("author", ""), "date": meta.get("date", ""), "duration": meta.get("duration_s", ""),
+              "url": url, "platform": meta.get("platform") or platform_of(url), "lang": lm.group(1) if lm else "",
+              "source": meta.get("transcript", ""), "lines": n, "added": int(mt[0])}
+        st = _hub(folder)
+        it["note_path"] = st.get("note_path") or ""
+        it["full_flag"] = st.get("full") or ""
+        it["category"] = str(st.get("category") or "")[:100]
+        TR_CACHE[str(folder)] = (mt, dict(it))
+    rel = it.pop("note_path")
+    it["note"] = {"name": Path(rel).stem, "path": rel, "uri": obsidian_uri(rel)} if rel and (VAULT / rel).is_file() else None
+    it.pop("full_flag")
+    it["full"] = folder.name if (OUT / folder.name / "note.md").is_file() else None   # the same video, in full
+    return it
+
+
+def _tr_folders(cdir):
+    return sorted(f for f in cdir.iterdir() if f.is_dir() and not f.name.startswith((".", "_")) and (f / "note.md").is_file())
+
+
+def list_transcripts():
+    """The catalogue: channels (folders in _transcripts) and their transcript-only videos."""
+    root = OUT / TR_DIR
+    chans, items = [], []
+    if not root.is_dir():
+        return {"channels": chans, "items": items}
+    for cdir in sorted(root.iterdir()):
+        if not cdir.is_dir() or cdir.name.startswith((".", "_")):
+            continue
+        meta = _channel_meta(cdir)
+        n = 0
+        for f in _tr_folders(cdir):
+            it = tr_item(f, cdir.name)
+            if it:
+                items.append(it); n += 1
+        rel = meta.get("note_path") or ""
+        note = {"name": Path(rel).stem, "path": rel, "uri": obsidian_uri(rel)} if rel and (VAULT / rel).is_file() else None
+        chans.append({"key": cdir.name, "name": meta.get("name") or cdir.name, "handle": meta.get("handle", ""),
+                      "url": meta.get("url", ""), "platform": meta.get("platform", ""), "count": n, "note": note,
+                      "run": tr_run_state(meta.get("run"))})
+    items.sort(key=lambda x: (x["date"], x["id"]), reverse=True)
+    return {"channels": chans, "items": items}
+
+
+def _tr_set_category(folder, cat):
+    """A transcript-only video's category: hub.json, and in its note the #Category tag on the **Tags** line (the
+    tag the app set before is taken out) plus the **Category** line where the note has one."""
+    with DATA_LOCK:
+        st = _hub(folder)
+        st["category"] = cat
+        tag = ("#" + re.sub(r"[^0-9A-Za-z]+", "", cat.title())) if cat else ""
+        old_tag = st.get("cat_tag") or ""
+        rel = st.get("note_path") or ""
+        if vault_ok() and rel and (VAULT / rel).is_file():
+            text = read_text(VAULT / rel)
+            if has_marker(text, folder.name):
+                def tags(m):
+                    parts = [t for t in m.group(1).split() if not (old_tag and t == old_tag) and t != tag]
+                    return "**Tags**: " + " ".join(parts + ([tag] if tag else []))
+                new = re.sub(r"^\*\*Tags\*\*:(.*)$", tags, text, count=1, flags=re.M)
+                new = re.sub(r"^\*\*Category\*\*:.*$", lambda m: f"**Category**: {cat or '-'}", new, count=1, flags=re.M)
+                if new != text:
+                    atomic_write(VAULT / rel, new)
+        st["cat_tag"] = tag
+        atomic_write(folder / "hub.json", json.dumps(st, indent=1, ensure_ascii=False))
+        TR_CACHE.pop(str(folder), None)
+    return cat
+
+
+def tr_set_category(key, rid, cat):
+    cat = str(cat or "")[:100]
+    if cat and cat not in read_cats():
+        raise ValueError("No such category")
+    return {"category": _tr_set_category(tr_dir(key, rid), cat)}
+
+
+def tr_run_state(run):
+    """The last run of a channel as the page shows it. A record left at "running" by a run that is no longer going
+    (the app was closed, the pipeline died) is "interrupted"."""
+    if not isinstance(run, dict) or not run.get("url"):
+        return None
+    r = {k: run.get(k) for k in ("url", "title", "started", "at", "listed", "here", "todo", "done", "failed", "last", "next", "state")}
+    r["left"] = max(0, int(run.get("todo") or 0) - int(run.get("done") or 0) - int(run.get("failed") or 0))
+    going = JOB["running"] and JOB.get("transcripts") and JOB.get("pid") and run.get("pid") == JOB.get("pid")
+    if r["state"] == "running" and not going:
+        r["state"] = "interrupted"
+    return r
+
+
+def tr_control(action):
+    """Pause, Resume or Stop the transcripts run that is going: reels2notes reads the control file before each video."""
+    if not (JOB["running"] and JOB.get("transcripts")):
+        raise ValueError("No transcripts run is going")
+    if action not in ("pause", "resume", "stop"):
+        raise ValueError("Bad request")
+    atomic_write(OUT / TR_DIR / TR_CONTROL, json.dumps({"pause": action == "pause", "stop": action == "stop"}))
+    JOB["paused"] = action == "pause"
+    JOB["stopping"] = action == "stop"
+    return {"paused": JOB["paused"], "stopping": JOB["stopping"]}
+
+
+def transcript_text(key, rid):
+    """A transcript-only video's lines, description and language for the page."""
+    r = parse_note(tr_dir(key, rid))
+    if not r:
+        raise ValueError("unknown transcript")
+    return {"lines": r["transcript"], "caption": r["caption"], "lang": r["lang"], "title": r["title"], "url": r["url"]}
+
+
+def template_note_text(folder, r):
+    """A transcript-only note in your own template, read from the vault's Templates folder at that moment (else the
+    copy kept here): date, time, Title, Source (Creator and Description in the TikTok one), the id marker and the
+    transcript's source as comments after Related, the transcript under Content and Original text between the text
+    markers. Nothing else is added, so the note looks exactly like one made from the template by hand."""
+    plat = r["platform"]
+    tf = VAULT / "Templates" / TEMPLATE_FILES[plat]
+    text = read_text(tf) if tf.is_file() else TEMPLATE_FALLBACK[plat]
+    lines = [l.rstrip() for l in text.replace("\r\n", "\n").split("\n")]
+    needed = ("**Source**", "**Related**", "# **Content**", "# **Original text")
+    if not all(any(l.startswith(n) for l in lines) for n in needed):
+        lines = [l.rstrip() for l in TEMPLATE_FALLBACK[plat].split("\n")]
+    body = _text_lines(r)                                     # # **Content**:, paragraphs, # **Original text:**, lines
+    paras = [x.rstrip("\n") for x in body[2:body.index("# **Original text:**")] if x.strip()]
+    content = ["", "\n\n".join(paras)]                        # one blank line between paragraphs
+    original = body[body.index("# **Original text:**") + 1:]
+    out = []
+    for line in lines:
+        if line.strip() == "{{date}}":
+            out.append(time.strftime("%Y-%m-%d"))
+        elif line.strip() == "{{time}}":
+            out.append(time.strftime("%H:%M"))
+        elif line.startswith("**Title:**"):
+            out.append(f"**Title:** {r['title'] or r['label']}")
+        elif line.startswith("**Source**"):
+            out.append(f"**Source**: {r['url']}")
+        elif line.startswith("**Creator:**"):
+            out.append(f"**Creator:** {r['author']}")
+        elif line.startswith("**Description:**"):
+            out.append("**Description:** " + (r["caption"].strip() or "-"))
+        elif line.startswith("**Related**"):
+            out += [line, _marker(r["id"]), f"<!-- reels-hub:transcript={r['tsource'] or 'captions'}, video not downloaded -->"]
+        elif line.startswith("# **Content**"):
+            out += [TXT_START, line] + content
+        elif line.startswith("# **Original text"):
+            out += [line] + original + [TXT_END]
+        else:
+            out.append(line)
+    return "\n".join(out).rstrip("\n") + "\n"
+
+
+def transcript_note(folder, from_channel):
+    """Create the Obsidian note of a transcript-only video once: your template, the transcript between the text
+    markers. From a channel link the note goes to YouTube/<channel>/, from a single link to YouTube/ as usual."""
+    if not vault_ok():
+        return {"error": f"Vault not found: {VAULT}"}
+    with DATA_LOCK:
+        r = parse_note(folder)
+        if not r:
+            return {"error": "no note.md"}
+        st = _hub(folder)
+        rel = st.get("note_path") or ""
+        if rel and (VAULT / rel).is_file():
+            return {"name": Path(rel).stem, "path": rel, "uri": obsidian_uri(rel)}
+        label = tr_source_label(r["tsource"]) + " · video not downloaded"
+        dname = vault_dir(r["platform"])
+        if from_channel:
+            cm = _channel_meta(folder.parent)
+            dname = f"{dname}/{clean_name(cm.get('name') or folder.parent.name, folder.parent.name)}"
+        base = NOTE_PREFIX.get(r["platform"], "") + clean_name(r["label"], r["id"])
+        name, k = base, 2
+        while (VAULT / dname / f"{name}.md").exists():
+            name = f"{base} ({k})"; k += 1
+        rel = f"{dname}/{name}.md"
+        (VAULT / dname).mkdir(parents=True, exist_ok=True)
+        text = template_note_text(folder, r) if r["platform"] in TEMPLATE_FILES else \
+            vault_note_text(folder, r, read_state(folder), tonly={"label": label, "video": TR_VIDEO_LINE})
+        atomic_write(VAULT / rel, text)
+        st.update(note_path=rel, note_name=name)
+        atomic_write(folder / "hub.json", json.dumps(st, indent=1, ensure_ascii=False))
+        return {"name": name, "path": rel, "uri": obsidian_uri(rel)}
+
+
+def channel_note(key):
+    """The channel's own note, YouTube/<channel>/'<channel> (channel).md: the list of its videos' notes. Only the
+    block between the videos markers is ever rewritten; the rest of the note is yours."""
+    if not vault_ok():
+        return None
+    cdir = tr_cdir(key)
+    meta = _channel_meta(cdir)
+    cname = clean_name(meta.get("name") or key, key)
+    rows = []
+    items = [it for it in (tr_item(f, key) for f in _tr_folders(cdir)) if it]
+    for it in sorted(items, key=lambda x: (x["date"], x["id"]), reverse=True):
+        title = re.sub(r"[\[\]|]+", " ", it["title"]).strip() or it["id"]
+        link = f"[[{it['note']['path'][:-3]}|{title}]]" if it["note"] else title
+        src = tr_source_label(it["source"]) if it["source"] else ""
+        rows.append(f"- {it['date'] or '----'} · {_dur(it['duration']) or '-'} · {link}" + (f" · {src}" if src else "")
+                    + (" · in Reels Hub with the video" if it["full"] else ""))
+    block = "\n".join(rows) or "_No videos yet._"
+    with DATA_LOCK:
+        rel = meta.get("note_path") or ""
+        mark = f"<!-- reels-hub:channel={key} -->"
+        if rel and (VAULT / rel).is_file():
+            text = read_text(VAULT / rel)
+            if mark not in text:
+                print(f"  {rel} is not this channel's note (its marker is missing) - not changing it")
+                return None
+            if VIDS_START in text and VIDS_END in text and text.find(VIDS_START) < text.find(VIDS_END):
+                pre, rest = text.split(VIDS_START, 1)
+                text = pre + VIDS_START + "\n" + block + "\n" + VIDS_END + rest.split(VIDS_END, 1)[1]
+            else:
+                text = text.rstrip() + f"\n\n## Videos (Reels Hub)\n{VIDS_START}\n{block}\n{VIDS_END}\n"
+        else:
+            plat = meta.get("platform") or "YouTube"
+            dname = f"{vault_dir(plat)}/{cname}"
+            rel = f"{dname}/{NOTE_PREFIX.get(plat, '')}{cname} (channel).md"
+            if (VAULT / rel).is_file() and mark not in read_text(VAULT / rel):
+                rel = f"{dname}/{NOTE_PREFIX.get(plat, '')}{cname} (channel, Reels Hub).md"
+            (VAULT / dname).mkdir(parents=True, exist_ok=True)
+            text = "\n".join([time.strftime("%Y-%m-%d"), time.strftime("%H:%M"),
+                              f"**Channel:** {meta.get('name') or key}" + (f" ({meta['handle']})" if meta.get("handle") else ""),
+                              f"**Source**: {meta.get('url') or '-'}",
+                              f"**Tags**: #{meta.get('platform') or 'YouTube'} #Channel",
+                              f"**Related**: {NOTE_RELATED.get(meta.get('platform') or 'YouTube', '')}".rstrip(),
+                              mark, "",
+                              "## Videos (Reels Hub)", VIDS_START, block, VIDS_END, "",
+                              "## My notes", "", ""])
+        atomic_write(VAULT / rel, text)
+        meta["note_path"] = rel
+        _save_channel_meta(cdir, meta)
+    return rel
+
+
+def _adopt_transcript_note(folder, r):
+    """A video processed in full that already has a transcript-only note (same id): that note is kept, and
+    Whisper's transcript goes in place of the caption text between the text markers. Returns the note's path."""
+    root = OUT / TR_DIR
+    if not root.is_dir() or not vault_ok():
+        return None
+    for cdir in sorted(root.iterdir()):
+        rec = cdir / folder.name
+        if not cdir.is_dir() or cdir.name.startswith((".", "_")) or not (rec / "note.md").is_file():
+            continue
+        st = _hub(rec)
+        rel = st.get("note_path") or ""
+        if not rel or not (VAULT / rel).is_file():
+            continue
+        text = read_text(VAULT / rel)
+        if not has_marker(text, folder.name):
+            continue
+        if r["transcript"] and TXT_START in text and TXT_END in text and text.find(TXT_START) < text.find(TXT_END):
+            pre, rest = text.split(TXT_START, 1)
+            ocr = ["## On-screen text", ""] + [f"- **{tlabel(r, r['times'].get(x['shot'], 0))}** {x['text']}" for x in r["ocr"]] + [""] if r["ocr"] else []
+            text = pre + "\n".join(ocr + _text_lines(r)) + "\n" + rest.split(TXT_END, 1)[1].lstrip("\n")
+            text = re.sub(r"^\*\*Transcript:\*\* .*\n", "", text, count=1, flags=re.M)
+            text = re.sub(r"^<!-- reels-hub:transcript=.*-->\n", "", text, count=1, flags=re.M)
+            atomic_write(VAULT / rel, text)
+            print(f"  {rel}: the caption text was replaced by the full video's transcript")
+        st["full"] = folder.name
+        atomic_write(rec / "hub.json", json.dumps(st, indent=1, ensure_ascii=False))
+        TR_CACHE.pop(str(rec), None)
+        try:
+            channel_note(rec.parent.name)                   # the channel's list now says the video is here in full
+        except Exception as e:
+            print(f"  channel note: {e}")
+        return rel
+    return None
+
+
+def remove_transcripts(body):
+    """Take transcript-only videos, or a whole channel, out of the catalogue: their folders go to
+    _trash/_transcripts/<channel>, and with obsidian=true their notes to the vault's .trash (only notes that carry
+    the video's id marker, and never the note of a video that is in the library in full)."""
+    if JOB["running"]:
+        raise ValueError("Wait for the current run to finish before removing")
+    key = body.get("channel")
+    cdir = tr_cdir(key)
+    whole = bool(body.get("all"))
+    with_obsidian = bool(body.get("obsidian"))
+    folders = _tr_folders(cdir) if whole else [tr_dir(key, rid) for rid in (body.get("ids") or [])]
+    if not folders and not whole:
+        raise ValueError("Nothing to remove")
+    trash = OUT / "_trash" / TR_DIR / key
+    vtrash = VAULT / ".trash"
+    done, errors = [], []
+    for f in folders:
+        try:
+            st = _hub(f)
+            rel = st.get("note_path") or ""
+            note = None
+            if with_obsidian and vault_ok() and rel and (VAULT / rel).is_file() and not (OUT / f.name / "note.md").is_file() \
+                    and has_marker(read_text(VAULT / rel), f.name):
+                note = VAULT / rel
+            trash.mkdir(parents=True, exist_ok=True)
+            with DATA_LOCK:
+                os.replace(f, _unique(trash / f.name))
+            TR_CACHE.pop(str(f), None)
+            if note:
+                vtrash.mkdir(exist_ok=True)
+                try:
+                    os.replace(note, _unique(vtrash / note.name))
+                except OSError as e:
+                    errors.append(f"{f.name}: Obsidian note not moved ({e})")
+            done.append(f.name)
+        except Exception as e:
+            errors.append(f"{f.name}: {e}")
+    if whole and not errors:
+        meta = _channel_meta(cdir)
+        rel = meta.get("note_path") or ""
+        if with_obsidian and vault_ok() and rel and (VAULT / rel).is_file() and f"<!-- reels-hub:channel={key} -->" in read_text(VAULT / rel):
+            vtrash.mkdir(exist_ok=True)
+            try:
+                os.replace(VAULT / rel, _unique(vtrash / Path(rel).name))
+            except OSError as e:
+                errors.append(f"channel note not moved ({e})")
+        trash.mkdir(parents=True, exist_ok=True)
+        for extra in cdir.iterdir():                        # _channel.json and anything else left
+            try:
+                os.replace(extra, _unique(trash / extra.name))
+            except OSError as e:
+                errors.append(f"{extra.name}: {e}")
+        try:
+            cdir.rmdir()
+        except OSError as e:
+            errors.append(f"the channel folder stays ({e})")
+    return {"removed": done, "errors": errors, "channel": key, "gone": whole and not errors}
+
+
+def tr_listing(url):
+    """A YouTube channel or playlist link, or a TikTok profile (many videos): only Transcripts takes those."""
+    u = str(url or "").split("#")[0]
+    if re.search(r"(?:youtube\.com/(?:watch\?(?:[^#]*&)?v=|shorts/|live/|embed/|v/)|youtu\.be/)[A-Za-z0-9_-]{11}", u):
+        return False
+    if re.search(r"youtube\.com/(@[^/?]+|channel/|c/|user/|playlist\?)", u, re.I):
+        return True
+    return bool(re.search(r"tiktok\.com/@[\w.-]+/?(?:$|[?])", u, re.I))
+
+
+def tr_label(url):
+    """How a transcripts run shows in the Waiting list: the creator's handle, or the link."""
+    m = re.search(r"(?:youtube|tiktok)\.com/(@[^/?#]+)", url, re.I)
+    return m.group(1) if m else short_url(url)
 
 
 def safe_path(rel):
@@ -956,11 +1426,21 @@ def write_cats(cats):
 def recategorize(old, new):
     for folder in OUT.iterdir():
         f = folder / "hub.json"
-        if folder.is_dir() and f.exists():
+        if folder.is_dir() and f.exists() and not folder.name.startswith((".", "_")):
             s = read_state(folder)
             if s["category"] == old:
                 s["category"] = new
                 write_state(folder, s)
+    root = OUT / TR_DIR                                   # transcript-only videos keep their category in hub.json too
+    if root.is_dir():
+        for cdir in root.iterdir():
+            if cdir.is_dir() and not cdir.name.startswith((".", "_")):
+                for folder in cdir.iterdir():
+                    if folder.is_dir() and (folder / "hub.json").is_file() and _hub(folder).get("category") == old:
+                        try:
+                            _tr_set_category(folder, new)
+                        except Exception as e:
+                            print(f"  {folder.name}: category not changed ({e})")
 
 
 def _shot_path(reel_id, name):
@@ -1733,7 +2213,7 @@ def queue_list():
     """What waits for the run slot, in the order it will start (for the page's Waiting list)."""
     with INBOX_LOCK:
         L = [{"seq": t["seq"], "kind": "run", "label": t["label"], "platform": t["platform"], "target": t["target"],
-              "redo": t["redo"]} for t in RUNQ]
+              "redo": t["redo"], "transcripts": bool(t.get("transcripts"))} for t in RUNQ]
         L += [{"seq": t.get("seq", 0), "kind": "add", "label": t.get("label") or "From the inbox",
                "platform": t.get("platform") or "", "target": "", "redo": False, "share": t["id"]}
               for t in INBOX["queue"]]
@@ -1994,7 +2474,14 @@ def run_job(urls, max_shots="auto", redo=False, flags=(), target=None, share=Non
     # JOB["running"] was already claimed under JOB_LOCK (by start_next, for a Run or an inbox Add)
     new_log(chained, label or short_url(urls[0] if urls else ""))
     JOB.update(started=time.time(), finished=None, urls=urls, progress=None, busy={target} if target else set(),
-               share=share["id"] if share else None)
+               share=share["id"] if share else None, total=None, transcripts="--transcripts" in flags, vault_warned=False,
+               paused=False, stopping=False, pid=None)
+    if "--transcripts" in flags:                # a Pause or Stop left over from an earlier run must not hold this one
+        try:
+            (OUT / TR_DIR).mkdir(parents=True, exist_ok=True)
+            (OUT / TR_DIR / TR_CONTROL).unlink(missing_ok=True)
+        except OSError:
+            pass
     if share:
         JOB["log"].append(f"-- adding {share['item'].get('from_name') or 'a'}'s share from the inbox")
     done = []                                   # @@DONE lines from reels2notes: which folder each link went to
@@ -2005,6 +2492,26 @@ def run_job(urls, max_shots="auto", redo=False, flags=(), target=None, share=Non
             if share:
                 INBOX["adding"] = None
         end_run()                               # the next one in line starts now
+
+
+def _transcript_done(d, channels):
+    """A transcript-only video is done: create its Obsidian note; remember its channel for the channel note."""
+    try:
+        parts = d["folder"].replace("\\", "/").split("/")
+        if len(parts) != 3 or parts[0] != TR_DIR:
+            raise ValueError("unexpected folder " + d["folder"])
+        folder = tr_dir(parts[1], parts[2])
+        from_channel = d.get("from") == "channel"
+        note = transcript_note(folder, from_channel)
+        if note.get("path"):
+            JOB["log"].append(f"  Obsidian note: {note['path']}")
+            if from_channel:
+                channels.add(parts[1])
+        elif note.get("error") and not JOB.get("vault_warned"):
+            JOB["log"].append(f"  Obsidian: {note['error']} (no notes this run)")
+            JOB["vault_warned"] = True
+    except Exception as e:
+        JOB["log"].append(f"  Obsidian: {e}")
 
 
 def _run_job(urls, max_shots, redo, flags, target, share, done):
@@ -2020,15 +2527,23 @@ def _run_job(urls, max_shots, redo, flags, target, share, done):
         cmd += ["--cookies", str(cookies)]
         JOB["log"].append("-- using cookies.txt for sites that need login")
     cmd += urls
+    channels = set()                        # transcripts run: channels whose own note is written at the end
     try:
         proc = subprocess.Popen(cmd, cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, encoding="utf-8", errors="replace", env=env)
+        JOB["pid"] = proc.pid
         for line in proc.stdout:
             line = line.rstrip()
             if line.startswith("@@PROGRESS "):
                 try:
                     JOB["progress"] = {**json.loads(line[11:]), "at": time.time()}
                 except ValueError:
+                    pass
+                continue
+            if line.startswith("@@TOTAL "):        # transcripts run: how many videos it will do
+                try:
+                    JOB["total"] = int(json.loads(line[8:]).get("n"))
+                except (ValueError, TypeError, AttributeError):
                     pass
                 continue
             if line.startswith("@@DONE "):
@@ -2040,12 +2555,29 @@ def _run_job(urls, max_shots, redo, flags, target, share, done):
                     done.append(d)
                     if share and not d.get("skipped") and isinstance(d.get("folder"), str):
                         JOB["busy"].add(d["folder"])   # no edits from the page until the share is filled in
+                    if d.get("transcripts") and not d.get("skipped") and isinstance(d.get("folder"), str):
+                        _transcript_done(d, channels)  # its Obsidian note, now
                 continue
+            if line.startswith("@@CHANNEL "):
+                continue                               # channel notes are written below, once per channel
             if line and "warnings.warn" not in line:
                 JOB["log"].append(line)
                 if DONE_LINE.match(line) or "already done" in line:
                     JOB["done"] += 1
         proc.wait()
+        JOB.update(paused=False, stopping=False)
+        if "--transcripts" in flags:
+            try:
+                (OUT / TR_DIR / TR_CONTROL).unlink(missing_ok=True)
+            except OSError:
+                pass
+        for key in sorted(channels):                   # the channel notes list every video, so once at the end
+            try:
+                rel = channel_note(key)
+                if rel:
+                    JOB["log"].append(f"-- channel note: {rel}")
+            except Exception as e:
+                JOB["log"].append(f"-- channel note of {key}: {e}")
         if share:
             _finish_add(share, proc.returncode, done)
         if redo and target and proc.returncode == 0:   # snapshots were replaced: old favorites no longer apply
@@ -2130,6 +2662,8 @@ class Handler(BaseHTTPRequestHandler):
                             "vault": {"path": str(VAULT), "ok": vault_ok()}})
         elif path == "/api/inbox":
             self.send_json(inbox_status())
+        elif path == "/api/transcripts":
+            self.send_json(list_transcripts() if CONFIG.get("name") else {"channels": [], "items": []})
         elif path == "/api/status":
             prog = JOB["progress"]
             if prog:   # age the ETA by the time since the last update
@@ -2138,6 +2672,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"running": JOB["running"], "log": JOB["log"][-300:], "urls": JOB["urls"],
                             "finished": JOB["finished"], "progress": prog, "share": JOB["share"],
                             "done": JOB["done"], "busy": sorted(JOB["busy"]) if JOB["running"] else [],
+                            "total": JOB.get("total") if JOB.get("total") is not None else len(JOB["urls"]),
+                            "transcripts": bool(JOB.get("transcripts")),
+                            "paused": bool(JOB.get("paused")) and JOB["running"], "stopping": bool(JOB.get("stopping")) and JOB["running"],
                             "queue": queue_list(), "changed": CHANGED["list"], "boot": BOOT,
                             "total_elapsed": time.time() - JOB["started"] if JOB["started"] else 0})
         elif path.startswith("/media/"):
@@ -2192,6 +2729,13 @@ class Handler(BaseHTTPRequestHandler):
                                          else "These links are already running or waiting in line")
                     label = (f"{len(urls)} links: " if len(urls) > 1 else "") + short_url(urls[0])   # count first: it stays visible
                     mode = body.get("existing")              # what to do with links that are already done
+                    listing = next((u for u in urls if tr_listing(u)), None)
+                    if listing and not body.get("transcripts"):
+                        raise ValueError(f"{short_url(listing)} is a channel, profile or playlist link: press Transcripts for it (Run takes single videos)")
+                    if body.get("transcripts"):              # transcripts only: videos, channels, playlists
+                        flags.append("--transcripts")
+                        label = "Transcripts: " + (f"{len(urls)} links" if len(urls) > 1 else tr_label(urls[0]))
+                        mode = "skip"                        # the pipeline leaves out what is already here
                     if mode is None:
                         done = [(u, f) for u in urls for f in find_done(u)[:1]]
                         if done:
@@ -2201,7 +2745,8 @@ class Handler(BaseHTTPRequestHandler):
                     elif mode == "new":
                         flags.append("--new-version")
                 ahead = queue_run({"kind": "run", "urls": urls, "max_shots": max_shots, "redo": redo, "flags": flags,
-                                   "target": target, "label": label, "platform": platform_of(urls[0])})
+                                   "target": target, "label": label, "platform": platform_of(urls[0]),
+                                   "transcripts": "--transcripts" in flags})
                 self.send_json({"ok": True, "count": len(urls), "queued": ahead, "skipped": skipped})
             elif path == "/api/queue/remove":
                 self.send_json({"ok": True, **queue_remove(body)})
@@ -2216,6 +2761,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, **send_to_obsidian(body["id"])})
             elif path == "/api/aiprompt":
                 self.send_json({"ok": True, "text": ai_prompt(body["id"])})
+            elif path == "/api/transcripts/text":
+                self.send_json({"ok": True, **transcript_text(body.get("channel"), body.get("id"))})
+            elif path == "/api/transcripts/aiprompt":
+                self.send_json({"ok": True, "text": _ai_prompt(tr_dir(body.get("channel"), body.get("id")))})
+            elif path == "/api/transcripts/remove":
+                self.send_json({"ok": True, **remove_transcripts(body)})
+            elif path == "/api/transcripts/control":
+                self.send_json({"ok": True, **tr_control(str(body.get("action") or ""))})
+            elif path == "/api/transcripts/state":
+                self.send_json({"ok": True, **tr_set_category(body.get("channel"), body.get("id"), body.get("category"))})
             elif path == "/api/shots/capture":
                 self.send_json({"ok": True, **capture_shot(body["id"], body.get("t", 0))})
             elif path == "/api/shots/edit":
@@ -2380,6 +2935,32 @@ body.resizing-y,body.resizing-y *{cursor:row-resize!important;user-select:none}
 #qlist .qn{color:var(--muted);font-variant-numeric:tabular-nums;flex:none;min-width:14px;text-align:right}
 #qlist .ql{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #qlist .ico{flex:none}
+.runbox .row{flex-wrap:wrap}
+.modebar{display:flex;gap:4px;padding:10px 12px 0}
+.item.tr .tcat{color:var(--accent)}
+.group a.ico{text-decoration:none;line-height:1}
+.mode{flex:1;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:5px 8px;cursor:pointer;color:var(--muted);font-size:12px;font-weight:600;letter-spacing:.4px;text-transform:uppercase;display:flex;justify-content:center;align-items:center;gap:6px}
+.mode.on{color:var(--text);border-color:var(--accent);background:var(--panel)}
+.mode .cn{font-size:10.5px;background:var(--panel2);border-radius:10px;padding:0 6px;color:var(--muted)}
+.item.tr{padding:6px 8px 6px 22px}
+.item.tr .t{-webkit-line-clamp:2}
+.srcb{display:inline-block;font-size:9.5px;font-weight:700;letter-spacing:.4px;padding:0 4px;border-radius:4px;border:1px solid var(--muted);color:var(--muted);line-height:14px;vertical-align:1px}
+.srcb.cc{border-color:var(--ok, #9fdcb4);color:var(--ok, #9fdcb4)}
+.srcb.w{border-color:var(--accent);color:var(--accent)}
+.pbtns{display:flex;gap:6px;margin-top:6px}
+.gstat{font-size:11px;color:var(--muted);padding:0 8px 6px 22px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;line-height:1.5}
+.gstat .btn{padding:1px 8px;font-size:11px}
+.gstat .warn{color:var(--warn)}
+.trview{padding:16px 20px;max-width:1100px}
+.trview h2{font-size:18px;margin:0 0 6px;line-height:1.3}
+.trview .meta + .meta{margin-top:4px}
+.trview .rowbtns{margin:10px 0 14px}
+.trview .card{margin-top:12px}
+.trview .pane{max-height:none}
+.trline{display:flex;gap:10px;padding:4px 6px;border-radius:6px;white-space:normal}
+.trline:hover{background:var(--panel2)}
+.trline a.ts{text-decoration:none}
+.trdesc{white-space:pre-wrap}
 .listtools{display:flex;gap:8px;padding:10px 12px 6px;align-items:center}
 .sortbar{display:flex;gap:10px;padding:0 12px 8px}
 .sortbar label{display:flex;gap:5px;align-items:center;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;flex:1;min-width:0}
@@ -2710,9 +3291,10 @@ body:has(#bulkbar.show) #log{bottom:84px}
 <div class="layout">
   <aside>
     <div class="runbox">
-      <textarea id="urls" placeholder="Paste Instagram, TikTok, YouTube or X links, one per line"></textarea>
+      <textarea id="urls" placeholder="Paste Instagram, TikTok, YouTube or X links, one per line. Transcripts also takes YouTube channel and playlist links."></textarea>
       <div class="row">
         <button class="btn primary" id="run">Run</button>
+        <button class="btn" id="trbtn" title="Only the transcript of each video, as a note in Obsidian: no video, no snapshots. YouTube channel and playlist links do every video in them. Captions from YouTube (the creator's, else automatic); Whisper where there are none.">Transcripts</button>
         <select id="maxshots" title="Auto: works out how many snapshots from the video's length and how fast it is edited. Or pick a maximum, or Every ... s to set the seconds between snapshots yourself.">
           <option value="auto" selected>Auto shots</option>
           <option value="60">Max 60</option><option value="120">Max 120</option>
@@ -2726,11 +3308,19 @@ body:has(#bulkbar.show) #log{bottom:84px}
         <div class="pline"><span id="pstage"></span><span id="peta"></span></div>
         <div class="pbar"><div id="pfill"></div></div>
         <div class="pline sub"><span id="pvid"></span><span id="pel"></span></div>
+        <div class="pbtns" id="pbtns" hidden>
+          <button class="btn small" id="ppause" title="Finish the current video, then wait; Resume goes on">Pause</button>
+          <button class="btn small" id="pstop" title="Finish the current video, then stop; Resume on the channel goes on later">Stop</button>
+        </div>
       </div>
       <div id="queue" hidden>
         <div class="qhead" id="qhead"></div>
         <ol id="qlist"></ol>
       </div>
+    </div>
+    <div class="modebar" role="tablist">
+      <button class="mode on" data-mode="reels" role="tab" aria-selected="true" title="Your videos">Videos</button>
+      <button class="mode" data-mode="transcripts" role="tab" aria-selected="false" title="Transcript-only videos, by channel">Transcripts<span class="cn" id="trcount" hidden></span></button>
     </div>
     <div class="listtools">
       <input id="search" placeholder="Search">
@@ -2868,6 +3458,18 @@ const $ = s => document.querySelector(s);
 let reels = [], cats = [], filtered = [], current = null, tab = "transcript";
 let lb = {list: [], i: 0}, wasRunning = false, dragFav = null;
 let collapsed = new Set(), vault = {ok: false, path: ""}, view = "detail", favFull = false;
+let mode = "reels";                        // "reels" (the gallery) or "transcripts" (the catalogue of transcript-only videos)
+let tr = {channels: [], items: [], current: null, shown: ""}, trCollapsed = new Set(), trTick = 0;
+let trGroupBy = "channel", tfChan = new Set(), tfCat = new Set();   // the catalogue's own grouping and filters
+try { trCollapsed = new Set(JSON.parse(localStorage.getItem("rh-trcollapsed") || "[]")); } catch (e) {}
+try { trGroupBy = localStorage.getItem("rh-trgroupby") || trGroupBy; const f = JSON.parse(localStorage.getItem("rh-trfilters") || "{}"); tfChan = new Set(f.ch || []); tfCat = new Set(f.c || []); } catch (e) {}
+const GROUP_OPTS = {reels: [["category", "Category"], ["source", "Source"], ["none", "None"]], transcripts: [["channel", "Channel"], ["category", "Category"], ["none", "None"]]};
+function setGroupOptions(m){            // the Group menu offers Channel in Transcripts and Source in Videos
+  const sel = $("#groupby");
+  sel.innerHTML = GROUP_OPTS[m].map(([v, l]) => `<option value="${v}">${l}</option>`).join("");
+  sel.value = m === "transcripts" ? trGroupBy : groupBy;
+  if (!sel.value) { sel.value = GROUP_OPTS[m][0][0]; if (m === "transcripts") trGroupBy = sel.value; else groupBy = sel.value; }
+}
 try { view = localStorage.getItem("rh-view") || "detail"; } catch (e) {}
 try { collapsed = new Set(JSON.parse(localStorage.getItem("rh-collapsed") || "[]")); } catch (e) {}
 const shotUrl = (r, shot) => media(r.id, "shots/" + shot) + (r.mt && r.mt[shot] ? `?v=${r.mt[shot]}` : "");
@@ -3058,6 +3660,7 @@ function groupsFor(){
           {key: "", label: "Unassigned", cat: "", kind: "cat", test: r => catOf(r) === ""}];
 }
 function renderList(){
+  if (mode === "transcripts") return renderTrList();      // the list shows the catalogue; reels keep their state
   const q = $("#search").value.trim().toLowerCase();
   const groups = groupsFor();
   filtered = []; shown = [];
@@ -3146,6 +3749,7 @@ function goHome(){
   closeInbox();
   if (favFull) toggleFull(false);
   clearSel();
+  if (mode === "transcripts") setMode("reels");
   view = "detail"; try { localStorage.setItem("rh-view", view); } catch (e) {} $("#viewbtn").classList.remove("on");
   history.replaceState(null, "", location.pathname);
   $("#list").scrollTop = 0; document.querySelector("aside").scrollTop = 0;   // below 900 px the whole column scrolls
@@ -3277,6 +3881,7 @@ function askDelete(rs){
     $("#cmsg").textContent = names + "\n\nVideo, snapshots, transcript, favorites and notes move to Downloads\\reels\\_trash, so you can still restore them.";
     const hasNotes = rs.some(r => r.obsidian && r.obsidian.name);
     $("#cobs").checked = false; $("#cobs").closest("label").hidden = !hasNotes || !vault.ok;
+    $("#cobs").closest("label").lastChild.textContent = " Also delete their Obsidian notes and images"; $("#cyes").textContent = "Delete";
     $("#confirm").classList.add("show");
     if (document.activeElement) document.activeElement.blur();
     setTimeout(() => $("#cno").focus(), 0);
@@ -3320,6 +3925,7 @@ async function deleteReelsNow(rs){
 function setView(v){
   view = v; try { localStorage.setItem("rh-view", v); } catch (e) {}
   $("#viewbtn").classList.toggle("on", v === "gallery");
+  if (mode === "transcripts") return renderTrMain();
   if (v === "gallery") renderGallery(); else if (current) render(current);
   else $("#main").innerHTML = `<div class="empty">Pick a reel on the left.</div>`;
 }
@@ -3350,6 +3956,7 @@ function renderGallery(){
 function select(id, scroll=true, keepView=false){
   if (current && current.id !== id) flushSaves();
   const r = reels.find(x => x.id === id); if (!r) return;
+  if (mode === "transcripts") { current = r; return; }      // remembered; shown when you go back to Videos
   if (keepView && view === "gallery") {   // remember the reel without leaving the gallery
     current = r; document.querySelectorAll(".item").forEach(el => el.classList.toggle("active", el.dataset.id === id));
     return renderGallery();
@@ -3374,8 +3981,11 @@ async function catAction(body){
   if (body.action === "rename") reels.forEach(r => { if (r.state.category === body.name) r.state.category = body.new; });
   if (body.action === "rename" && fCat.delete(body.name)) { fCat.add(body.new); saveFilters(); }
   if (body.action === "delete") reels.forEach(r => { if (r.state.category === body.name) r.state.category = ""; });
+  tr.items.forEach(it => { if (body.action === "rename" && it.category === body.name) it.category = body.new; if (body.action === "delete" && it.category === body.name) it.category = ""; });
+  if (body.action === "rename" && tfCat.delete(body.name)) { tfCat.add(body.new); saveTrFilters(); }
   renderList();
   if (current && $("#catsel")) { $("#catsel").outerHTML = catSelect(current); updateNav(); }
+  if (tr.current && $("#trcat")) $("#trcat").outerHTML = trCatSelect(tr.current);
 }
 
 /* ---------- detail ---------- */
@@ -3860,6 +4470,17 @@ document.addEventListener("click", async e => {
   const t = e.target, c = sel => t.closest(sel);
   let el;
   if ((el = c("[data-seek]"))) { e.preventDefault(); e.stopPropagation(); return seekTo(+el.dataset.seek); }
+  if ((el = c("[data-mode]"))) return setMode(el.dataset.mode);
+  if ((el = c("[data-tid]"))) { const [ch, id] = splitTid(el.dataset.tid); return selectTr(ch, id, false); }
+  if ((el = c("[data-trtoggle]"))) { const k = el.closest(".group").dataset.trkey; trCollapsed.has(k) ? trCollapsed.delete(k) : trCollapsed.add(k);
+    try { localStorage.setItem("rh-trcollapsed", JSON.stringify([...trCollapsed])); } catch (err) {} return renderTrList(); }
+  if ((el = c("[data-tfchan]"))) { const v = el.dataset.tfchan; tfChan.has(v) ? tfChan.delete(v) : tfChan.add(v); saveTrFilters(); return renderTrList(); }
+  if ((el = c("[data-tfcat]"))) { const v = el.dataset.tfcat; tfCat.has(v) ? tfCat.delete(v) : tfCat.add(v); saveTrFilters(); return renderTrList(); }
+  if (t.id === "tfclear") { tfChan.clear(); tfCat.clear(); saveTrFilters(); return renderTrList(); }
+  if ((el = c("[data-trrm]"))) return trRemoveChannel(el.dataset.trrm);
+  if ((el = c("[data-trresume]"))) return trResume(el.dataset.trresume);
+  if ((el = c("[data-ttab]"))) { document.querySelectorAll("[data-ttab]").forEach(x => x.classList.toggle("active", x === el));
+    document.querySelectorAll("[data-tpane]").forEach(x => x.classList.toggle("active", x.dataset.tpane === el.dataset.ttab)); return; }
   if (c("#inboxbtn")) return openInbox();
   if (c("#capbtn")) return capture(false);
   if ((el = c("[data-share]"))) return current && shareReels([current.id], el.dataset.share);
@@ -3919,6 +4540,15 @@ document.addEventListener("click", async e => {
     case "slprev": return stepSlide(-1);
     case "slnext": return stepSlide(1);
     case "copyai": { try { const j = await api("/api/aiprompt", {id: current.id}); copyText(j.text, "AI prompt + transcript copied - paste it into ChatGPT or Claude"); } catch (err) { alert(err.message); } return; }
+    case "trbtn": return runTranscripts();
+    case "ppause": return trControl($("#ppause").textContent === "Resume" ? "resume" : "pause");
+    case "pstop": { if (confirm("Stop after the current video? What is done stays; Resume on the channel goes on from there later.")) trControl("stop"); return; }
+    case "trget": return tr.current && trGet(tr.current);
+    case "tropen": { const it = tr.current; if (!it || !it.full) return; setMode("reels"); return select(it.full); }
+    case "trcopylink": return tr.current && copyText(tr.current.url, "Link copied - paste it anywhere with Ctrl+V");
+    case "trcopytext": return tr.text && copyText(tr.text.lines.map(x => `${mmss(x.t)} ${x.text}`).join("\n"), "Transcript copied");
+    case "trai": { if (!tr.current) return; try { const j = await api("/api/transcripts/aiprompt", {channel: tr.current.ch, id: tr.current.id}); copyText(j.text, "AI prompt + transcript copied - paste it into ChatGPT or Claude"); } catch (err) { alert(err.message); } return; }
+    case "trrm1": return tr.current && trRemove(tr.current);
     case "lbplay": return seekTo(current.times[lb.list[lb.i]]);
     case "capstar": return capture(true);
     case "edrotl": return rotate(-1);
@@ -3935,7 +4565,7 @@ document.addEventListener("click", async e => {
     case "pclose": return $("#printsheet").classList.remove("show");
     case "pprint": return window.print();
     case "showlog": return $("#log").classList.add("show");
-    case "viewbtn": return setView(view === "gallery" ? "detail" : "gallery");
+    case "viewbtn": if (mode === "transcripts") setMode("reels"); return setView(view === "gallery" ? "detail" : "gallery");
     case "expandbtn": return toggleFull();
     case "closelog": return $("#log").classList.remove("show");
     case "savenotes": {
@@ -3972,7 +4602,7 @@ document.addEventListener("click", async e => {
 
 document.addEventListener("input", e => {
   if (e.target.id === "notes" && current) { $("#saved").hidden = true; return notesChanged(current, e.target.value); }
-  if (e.target.id === "search") return renderList();
+  if (e.target.id === "search") return renderList();   // in Transcripts: the catalogue (renderList hands over)
   if (e.target.classList.contains("favtext")) {
     const f = current.state.favorites[+e.target.dataset.i];
     f.text = e.target.value;
@@ -3984,6 +4614,11 @@ document.addEventListener("input", e => {
 });
 document.addEventListener("change", async e => {
   if (e.target.tagName === "SELECT" && e.target.closest("#editor") === null) setTimeout(() => e.target.blur(), 0);
+  if ((e.target.id === "groupby" || e.target.id === "sortby") && mode === "transcripts") {
+    trGroupBy = $("#groupby").value; sortBy = $("#sortby").value;
+    try { localStorage.setItem("rh-trgroupby", trGroupBy); localStorage.setItem("rh-sortby", sortBy); } catch (err) {}
+    return renderTrList();
+  }
   if (e.target.id === "groupby" || e.target.id === "sortby") {
     groupBy = $("#groupby").value; sortBy = $("#sortby").value;
     try { localStorage.setItem("rh-groupby", groupBy); localStorage.setItem("rh-sortby", sortBy); } catch (err) {}
@@ -3998,6 +4633,7 @@ document.addEventListener("change", async e => {
     moveReels([...selected], cat); return clearSel();
   }
   if (e.target.id === "catsel") setCategory(current, e.target.value);
+  if (e.target.id === "trcat" && tr.current) trSetCategory(tr.current, e.target.value);
   if (e.target.matches && e.target.matches("[data-icat]")) { const it = e.target.closest("[data-iid]"); if (it) inboxCat[it.dataset.iid] = e.target.value; }
   if (["pcols","ptitle","pnums"].includes(e.target.id)) renderPaper();
 });
@@ -4007,6 +4643,10 @@ document.addEventListener("dragstart", e => {
   const h = e.target.closest && e.target.closest(".favimg");
   if (h) { dragFav = +h.closest(".fav").dataset.i; h.closest(".fav").classList.add("dragging"); e.dataTransfer.setData("text/plain", "fav"); e.dataTransfer.effectAllowed = "move"; return; }
   const it = e.target.closest && (e.target.closest(".item") || e.target.closest(".gcard"));
+  if (it && it.dataset.tid) {                                // a transcript: onto a category group
+    e.dataTransfer.setData("text/plain", "tr:" + JSON.stringify([it.dataset.tid])); e.dataTransfer.effectAllowed = "move";
+    it.classList.add("dragging"); return;
+  }
   if (it) {
     const id = it.dataset.id || it.dataset.open;
     const ids = selected.has(id) ? [...selected] : [id];
@@ -4050,6 +4690,11 @@ document.addEventListener("drop", e => {
     moveReels(ids, target.dataset.cat);
     if (ids.length > 1) clearSel();
   }
+  if (target && target.hasAttribute("data-cat") && data.startsWith("tr:")) {
+    e.preventDefault();
+    let tids = []; try { tids = JSON.parse(data.slice(3)); } catch (err) {}
+    tids.forEach(tid => { const [ch, id] = splitTid(tid); const it = tr.items.find(x => x.ch === ch && x.id === id); if (it && trCatOf(it) !== target.dataset.cat) trSetCategory(it, target.dataset.cat); });
+  }
   document.querySelectorAll(".drop").forEach(x => x.classList.remove("drop"));
 });
 
@@ -4078,6 +4723,10 @@ document.addEventListener("keydown", e => {
   if ($("#lightbox").classList.contains("show") && !mod && (e.key === "e" || e.key === "E") && !/TEXTAREA|INPUT|SELECT/.test(document.activeElement.tagName)) { e.preventDefault(); return openEditor(lb.list[lb.i]); }
   if (/TEXTAREA|INPUT|SELECT/.test(document.activeElement.tagName)) return;
   if ($("#printsheet").classList.contains("show")) { if (e.key === "Escape") $("#printsheet").classList.remove("show"); return; }
+  if (mode === "transcripts" && !$("#lightbox").classList.contains("show") && !$("#confirm").classList.contains("show")) {
+    if (!mod && (e.key === "ArrowLeft" || e.key === "ArrowRight")) { e.preventDefault(); trMove(e.key === "ArrowLeft" ? -1 : 1); }
+    return;                                                // the catalogue: no snapshot keys, no reel deleting
+  }
   const open = $("#lightbox").classList.contains("show");
   if (e.key === "Escape" && !open && favFull) return toggleFull(false);
   if ($("#confirm").classList.contains("show")) {
@@ -4246,14 +4895,248 @@ const hms = sec => { sec = Math.max(0, Math.round(sec)); const h = Math.floor(se
   return h ? `${h}:${String(m).padStart(2,"0")}:${String(x).padStart(2,"0")}` : `${m}:${String(x).padStart(2,"0")}`; };
 function showProgress(s){
   const p = s.progress, box = $("#prog");
+  $("#pbtns").hidden = !(s.running && s.transcripts);
+  $("#ppause").textContent = s.paused ? "Resume" : "Pause";
+  $("#ppause").disabled = !!s.stopping; $("#pstop").disabled = !!s.stopping;
   if (!s.running || !p) { box.hidden = !s.running; if (s.running) { $("#pstage").textContent = "Starting..."; $("#peta").textContent = ""; $("#pfill").style.width = "0%"; $("#pvid").textContent = ""; $("#pel").textContent = ""; } return; }
   box.hidden = false;
   $("#pstage").textContent = `${p.label} ${p.stage_pct ? Math.round(p.stage_pct) + "%" : ""}`;
-  $("#peta").textContent = p.eta == null ? "estimating..." : (p.eta_partial ? `download ~${hms(p.eta)} left` : `~${hms(p.eta)} left`);
+  $("#peta").textContent = p.stage === "paused" ? "paused" : s.stopping ? "stopping after this video" : p.eta == null ? "estimating..." : (p.eta_partial ? `download ~${hms(p.eta)} left` : `~${hms(p.eta)} left`);
   $("#pfill").style.width = `${Math.min(100, p.stage_pct || 0)}%`;
   $("#pfill").dataset.stage = p.stage;
   $("#pvid").textContent = p.n > 1 ? `Video ${p.i} of ${p.n}` : "This video";
   $("#pel").textContent = `${hms(p.elapsed)} elapsed`;
+}
+
+/* ---------- transcripts: the catalogue of transcript-only videos (by channel) ---------- */
+const splitTid = s => { const i = s.indexOf("/"); return [s.slice(0, i), s.slice(i + 1)]; };
+const srcBadge = it => /whisper/i.test(it.source) ? `<span class="srcb w" title="Transcribed with Whisper (no captions on the site)">W</span>`
+  : /automatic/i.test(it.source) ? `<span class="srcb" title="The site's automatic captions">AUTO</span>`
+  : /caption/i.test(it.source) ? `<span class="srcb cc" title="The site's captions (the creator's on YouTube)">CC</span>` : "";
+const SITE = {youtube: "YouTube", tiktok: "TikTok", instagram: "Instagram", x: "X"};
+const srcText = it => { const s = String(it.source || ""); if (/whisper/i.test(s)) return "Whisper (no captions on " + (SITE[(it.platform || "").toLowerCase()] || it.platform || "the site") + ")";
+  const site = SITE[s.split(" ")[0]] || s.split(" ")[0]; return s ? `${site} captions${/automatic/i.test(s) ? " (automatic)" : site === "YouTube" ? " (the creator's)" : ""}` : ""; };
+const atTime = (url, t) => /youtube\.com|youtu\.be/.test(url || "") ? url.replace(/([?&])t=\d+s?&?/, "$1").replace(/[?&]$/, "") + (url.includes("?") ? "&" : "?") + `t=${Math.floor(t)}s` : url;
+function setMode(m){
+  mode = m; try { localStorage.setItem("rh-mode", m); } catch (e) {}
+  const trm = m === "transcripts";
+  document.querySelectorAll(".mode").forEach(b => { const on = b.dataset.mode === m; b.classList.toggle("on", on); b.setAttribute("aria-selected", on); });
+  document.querySelector("aside").classList.toggle("trmode", trm);
+  setGroupOptions(m);
+  $("#search").placeholder = trm ? "Search transcripts" : "Search";
+  if (trm) { clearSel(); renderTrList(); renderTrMain(); loadTr().catch(() => {}); }
+  else { renderList(); setView(view); }
+}
+async function loadTr(){
+  const j = await api("/api/transcripts");
+  tr.channels = j.channels || []; tr.items = (j.items || []).map(it => ({...it, label: it.title, version: 1}));
+  const n = tr.items.length; $("#trcount").textContent = n; $("#trcount").hidden = !n;
+  if (tr.current) tr.current = tr.items.find(it => it.ch === tr.current.ch && it.id === tr.current.id) || null;
+  if (mode !== "transcripts") return;
+  renderTrList();
+  if (!tr.current) { if (tr.items[0]) selectTr(tr.items[0].ch, tr.items[0].id, false); else renderTrMain(); }
+  else if (JSON.stringify(tr.current) !== tr.shown) renderTrMain();     // its note or video appeared: redraw
+}
+const trCatOf = it => cats.includes(it.category) ? it.category : "";
+const chanName = key => { const c = tr.channels.find(x => x.key === key); return c ? c.name : key; };
+function saveTrFilters(){ try { localStorage.setItem("rh-trfilters", JSON.stringify({ch: [...tfChan], c: [...tfCat]})); } catch (e) {} }
+function trMatches(it, q){
+  if (tfChan.size && !tfChan.has(it.ch)) return false;
+  if (tfCat.size && !tfCat.has(trCatOf(it))) return false;
+  if (!q) return true;
+  const ch = tr.channels.find(c => c.key === it.ch);
+  return `${it.title} ${it.author} ${it.date} ${ch ? ch.name + " " + ch.handle : ""} ${it.category}`.toLowerCase().includes(q);
+}
+function renderTrFilters(){
+  [...tfChan].forEach(k => tr.channels.some(c => c.key === k) || tfChan.delete(k));
+  [...tfCat].forEach(c => (c === "" || cats.includes(c)) || tfCat.delete(c));
+  const count = pred => tr.items.filter(pred).length;
+  const chip = (attr, val, label, on, n) => `<button class="chip ${on?"on":""}" ${attr}="${esc(val)}">${label}<span class="cn">${n}</span></button>`;
+  const active = tfChan.size + tfCat.size;
+  $("#filters").innerHTML = (tr.channels.length > 1 || tfChan.size ? `<div class="frow"><span class="fl">Channel</span>${tr.channels.map(c =>
+      chip("data-tfchan", c.key, esc(c.name), tfChan.has(c.key), c.count)).join("")}</div>` : "")
+    + `<div class="frow"><span class="fl">Category</span>${[...cats, ""].map(c =>
+      chip("data-tfcat", c, c ? esc(c) : "Unassigned", tfCat.has(c), count(it => trCatOf(it) === c))).join("")}</div>`
+    + (active ? `<div class="frow"><button class="link" id="tfclear">Clear filters (${active})</button></div>` : "");
+}
+function trGroups(){
+  if (trGroupBy === "category")
+    return [...cats.map(c => ({key: "cat:" + c, label: c, cat: c, kind: "cat", test: it => trCatOf(it) === c})),
+            {key: "cat:", label: "Unassigned", cat: "", kind: "cat", test: it => trCatOf(it) === ""}];
+  if (trGroupBy === "none") return [{key: "all", label: "All transcripts", kind: "none", test: () => true}];
+  return tr.channels.map(ch => ({key: "ch:" + ch.key, label: ch.name, kind: "channel", ch, test: it => it.ch === ch.key}));
+}
+function renderTrList(){
+  const q = $("#search").value.trim().toLowerCase();
+  renderTrFilters();
+  const filtering = q || tfChan.size || tfCat.size;
+  let html = "";
+  const groups = trGroups();
+  groups.forEach((g, gi) => {
+    if (g.kind === "cat" && tfCat.size && !tfCat.has(g.cat)) return;
+    const items = sortReels(tr.items.filter(it => g.test(it) && trMatches(it, q)));
+    if (g.kind === "channel" && !items.length && filtering) return;
+    if (g.kind === "cat" && !g.cat && !items.length && cats.length && filtering) return;
+    const closed = trCollapsed.has(g.key);
+    const ch = g.ch;
+    html += `<div class="group ${closed?"closed":""}" data-trkey="${esc(g.key)}" ${g.kind === "cat" ? `data-cat="${esc(g.cat)}"` : ""} ${ch ? `data-trch="${esc(ch.key)}"` : ""}>
+      <span class="gname" data-trtoggle title="${esc(ch ? (ch.handle || ch.name) : g.label)}"><span class="caret">&#9662;</span>${ch && ch.platform ? pbadge({platform: ch.platform}) + " " : ""}${esc(g.label)}</span>
+      <span class="gcount">${ch && items.length !== ch.count ? `${items.length} / ${ch.count}` : items.length}</span>
+      ${ch && ch.note ? `<a class="ico" href="${esc(ch.note.uri)}" title="Open the channel note in Obsidian (${esc(ch.note.path)})">&#128196;</a>` : ""}
+      ${ch && ch.url ? `<a class="ico" href="${esc(ch.url)}" target="_blank" rel="noopener" title="Open the channel on ${esc(ch.platform || "YouTube")}">&#8599;</a>` : ""}
+      ${ch ? `<button class="ico" data-trrm="${esc(ch.key)}" title="Remove this channel's transcripts">&#10005;</button>` : ""}
+      ${g.kind === "cat" && g.cat ? `<button class="ico" data-catmove="-1" title="Move up" ${gi===0?"disabled":""}>&#8593;</button>
+                  <button class="ico" data-catmove="1" title="Move down" ${gi===cats.length-1?"disabled":""}>&#8595;</button>
+                  <button class="ico" data-rename title="Rename">&#9998;</button>
+                  <button class="ico" data-delcat title="Delete category">&#10005;</button>` : ""}
+    </div>${ch ? runLine(ch) : ""}`;
+    if (!closed) html += items.length ? items.map(it => `
+      <div class="item tr ${tr.current && tr.current.ch === it.ch && tr.current.id === it.id ? "active" : ""}" data-tid="${esc(it.ch)}/${esc(it.id)}" draggable="true">
+        <div><div class="t">${esc(it.title)}</div>
+        <div class="s">${g.kind !== "channel" ? esc(chanName(it.ch)) + " · " : ""}${esc(it.date)}${it.duration ? ` · ${mmss(+it.duration)}` : ""} · ${srcBadge(it)}${g.kind !== "cat" && trCatOf(it) ? ` · <span class="tcat">${esc(trCatOf(it))}</span>` : ""}${it.full ? ` · <span class="fc" title="This video is in Videos, in full">&#9654; video</span>` : ""}${it.note || !vault.ok ? "" : ` · <span title="No Obsidian note yet">no note</span>`}</div></div>
+      </div>`).join("") : `<div class="gempty">${g.kind === "cat" && g.cat ? "Drag transcripts here or pick this category on a transcript" : "Nothing here"}</div>`;
+  });
+  $("#list").innerHTML = html || `<div class="empty">${tr.items.length ? "No matches" : "No transcripts yet.<br><br>Paste a YouTube channel link, a playlist link or video links above and press <b>Transcripts</b>."}</div>`;
+}
+const trCatSelect = it => `<select id="trcat">${["", ...cats].map(c => `<option value="${esc(c)}" ${trCatOf(it)===c?"selected":""}>${c?esc(c):"Unassigned"}</option>`).join("")}</select>`;
+async function trSetCategory(it, cat){
+  try { await api("/api/transcripts/state", {channel: it.ch, id: it.id, category: cat}); } catch (err) { return alert(err.message); }
+  it.category = cat;
+  renderTrList();
+  const sel = $("#trcat"); if (sel && tr.current === it) sel.value = cat;
+}
+function runLine(ch){                       // under a channel: how far its last transcripts run got, and Resume
+  const r = ch.run; if (!r) return "";
+  const nxt = r.next ? ` · next: ${esc(r.next)}` : "";
+  const resume = (k, label) => `<button class="btn small" data-trresume="${esc(k)}" title="Lists the channel again and does what is not here yet">${label}</button>`;
+  if (r.state === "running") return `<div class="gstat">Running · ${r.done} of ${r.todo} done${r.failed ? `, ${r.failed} failed` : ""}${nxt}</div>`;
+  if (r.state === "stopped" || r.state === "interrupted")
+    return `<div class="gstat"><span class="warn">${r.state === "stopped" ? "Stopped" : "Interrupted"} after ${r.done + r.failed} of ${r.todo}</span>${nxt}${r.left ? ` · ${r.left} left ${resume(ch.key, "Resume")}` : ""}</div>`;
+  if (r.state === "finished") return `<div class="gstat">Last run ${esc(r.at || "")}: ${r.listed} on the channel, ${ch.count} here${r.failed ? `, <span class="warn">${r.failed} failed</span> ${resume(ch.key, "Retry")}` : ""}</div>`;
+  return "";
+}
+async function trResume(key){
+  const ch = tr.channels.find(c => c.key === key); if (!ch || !ch.run || !ch.run.url) return;
+  let j;
+  try { j = await api("/api/run", {urls: ch.run.url, transcripts: true}); } catch (err) { return alert(err.message); }
+  toast(j.queued ? `Queued: ${queuedText(j.queued)}` : "Resuming - see the Log"); ensurePoll();
+}
+async function trControl(action){
+  try { await api("/api/transcripts/control", {action}); } catch (err) { return toast(err.message); }
+  toast(action === "pause" ? "Pausing after the current video" : action === "resume" ? "Resumed" : "Stopping after the current video");
+  ensurePoll();
+}
+function selectTr(ch, id, scroll=true){
+  const it = tr.items.find(x => x.ch === ch && x.id === id); if (!it) return;
+  tr.current = it;
+  document.querySelectorAll(".item.tr").forEach(el => el.classList.toggle("active", el.dataset.tid === `${ch}/${id}`));
+  if (scroll) { const el = document.querySelector(`.item.tr[data-tid="${CSS.escape(ch + "/" + id)}"]`); el && el.scrollIntoView({block: "nearest"}); }
+  renderTrMain();
+}
+function trMove(d){
+  const order = [...document.querySelectorAll(".item.tr")].map(el => el.dataset.tid);
+  if (!order.length) return;
+  const i = tr.current ? order.indexOf(`${tr.current.ch}/${tr.current.id}`) : -1, j = i < 0 ? 0 : i + d;
+  if (j >= 0 && j < order.length) { const [ch, id] = splitTid(order[j]); selectTr(ch, id); }
+}
+function renderTrMain(){
+  tr.text = null;
+  const it = tr.current;
+  tr.shown = it ? JSON.stringify(it) : "";
+  if (!it) {
+    $("#main").innerHTML = `<div class="empty">${tr.items.length ? "Pick a video on the left." : "No transcripts yet.<br><br>Paste a YouTube channel link, a playlist link or video links on the left and press <b>Transcripts</b>: each video gets its transcript as a note in Obsidian, without downloading the video."}</div>`;
+    return;
+  }
+  const ch = tr.channels.find(c => c.key === it.ch);
+  $("#main").innerHTML = `
+  <div class="trview">
+    <h2>${esc(it.title)}</h2>
+    <div class="meta">${esc(ch ? ch.name : it.author)} · ${esc(it.date)}${it.duration ? ` · ${mmss(+it.duration)}` : ""}${it.lang ? ` · ${esc(it.lang)}` : ""} · ${srcBadge(it)} ${esc(srcText(it))}${it.url ? ` · <a href="${esc(it.url)}" target="_blank" rel="noopener">Open on ${esc(it.platform)}</a> · <button class="link" id="trcopylink" title="${esc(it.url)}">Copy link</button>` : ""}</div>
+    <div class="meta">${it.note ? `Obsidian note: <a href="${esc(it.note.uri)}" title="${esc(it.note.path)}">${esc(it.note.name)}</a>` : (vault.ok ? "No Obsidian note yet (it is made when the run finishes this video)" : "Obsidian vault not set: see Settings")}${it.full ? ` · <span class="from" title="Processed in full: video, snapshots, on-screen text">&#9654; in your videos</span>` : ""}</div>
+    <label class="catsel">Category ${trCatSelect(it)}</label>
+    <div class="rowbtns">
+      ${it.full ? `<button class="btn small" id="tropen" title="Open this video under Videos">&#9654; Open the video</button>`
+                : `<button class="btn small" id="trget" title="Download the video and process it in full (Whisper transcript, snapshots, on-screen text). Its Obsidian note is kept: the caption text is replaced by Whisper's transcript.">&#11015; Get the video</button>`}
+      <button class="btn small" id="trcopytext" title="Copy the transcript as text">Copy transcript</button>
+      <button class="btn small" id="trai" title="Copies your Obsidian AI prompt with this transcript - paste it into ChatGPT or Claude">Copy AI prompt</button>
+      <button class="btn small danger" id="trrm1" title="Take this transcript out of the catalogue">Remove</button>
+    </div>
+    <div class="card">
+      <div class="tabs"><div class="tab active" data-ttab="text">Transcript<span class="n">${it.lines || ""}</span></div><div class="tab" data-ttab="desc">Description</div></div>
+      <div class="pane active" data-tpane="text" id="trtext"><span class="meta">Loading...</span></div>
+      <div class="pane trdesc" data-tpane="desc" id="trdesc"></div>
+    </div>
+  </div>`;
+  loadTrText(it);
+}
+async function loadTrText(it){
+  let j;
+  try { j = await api("/api/transcripts/text", {channel: it.ch, id: it.id}); }
+  catch (e) { const box = $("#trtext"); if (box) box.innerHTML = `<span class="meta">${esc(e.message)}</span>`; return; }
+  if (!tr.current || tr.current.id !== it.id || tr.current.ch !== it.ch || !$("#trtext")) return;
+  tr.text = j;
+  $("#trtext").innerHTML = j.lines.length ? j.lines.map(x => `<div class="trline"><a class="ts" href="${esc(atTime(it.url, x.t))}" target="_blank" rel="noopener" title="Open the video at this moment">${mmss(x.t)}</a><span>${esc(x.text)}</span></div>`).join("")
+    : `<span class="meta">No transcript</span>`;
+  $("#trdesc").textContent = j.caption || "No description";
+}
+async function runTranscripts(){
+  if (runBusy) return;
+  runBusy = true; $("#trbtn").disabled = true;
+  try {
+    let j;
+    try { j = await api("/api/run", {urls: $("#urls").value, transcripts: true}); } catch (err) { return alert(err.message); }
+    const left = j.skipped ? ` (${j.skipped} link${j.skipped > 1 ? "s were" : " was"} already running or waiting, left out)` : "";
+    $("#urls").value = "";
+    if (j.queued) toast(`Queued: ${queuedText(j.queued)}${left}`);
+    else { toast("Getting transcripts - see the Log" + left); $("#log").classList.add("show"); }
+    ensurePoll();
+    if (mode !== "transcripts") setMode("transcripts");
+  } finally { runBusy = false; $("#trbtn").disabled = false; }
+}
+async function trGet(it){
+  let j;
+  try { j = await api("/api/run", {urls: it.url, max_shots: shotsValue(), existing: "skip"}); } catch (err) { return alert(err.message); }
+  if (j.queued) toast(`Queued: ${queuedText(j.queued)}`);
+  else { toast("Downloading the video - it shows under Videos when it is done"); $("#log").classList.add("show"); }
+  ensurePoll();
+}
+function askConfirm(title, msg, obsLabel, yes){
+  return new Promise(res => {
+    $("#ctitle").textContent = title; $("#cmsg").textContent = msg;
+    const lab = $("#cobs").closest("label");
+    $("#cobs").checked = false; lab.hidden = !obsLabel; lab.lastChild.textContent = " " + (obsLabel || "");
+    $("#cyes").textContent = yes || "Remove";
+    $("#confirm").classList.add("show");
+    if (document.activeElement) document.activeElement.blur();
+    setTimeout(() => $("#cno").focus(), 0);
+    const done = v => { $("#confirm").classList.remove("show"); $("#cyes").onclick = $("#cno").onclick = null; res(v); };
+    $("#cyes").onclick = () => done({ok: true, obsidian: $("#cobs").checked});
+    $("#cno").onclick = () => done({ok: false});
+  });
+}
+async function trRemove(it){
+  if ($("#confirm").classList.contains("show")) return;
+  const ans = await askConfirm("Remove this transcript?", `${it.title}\n\nIts folder moves to _trash\\_transcripts in the reels folder, so you can still restore it.`,
+    it.note && !it.full && vault.ok ? "Also move its Obsidian note to the vault's trash" : null);
+  if (!ans.ok) return;
+  let j;
+  try { j = await api("/api/transcripts/remove", {channel: it.ch, ids: [it.id], obsidian: ans.obsidian}); } catch (err) { return alert(err.message); }
+  if (j.errors && j.errors.length) alert(j.errors.join("\n"));
+  tr.current = null;
+  try { await loadTr(); } catch (err) {}
+  toast("Removed");
+}
+async function trRemoveChannel(key){
+  const ch = tr.channels.find(c => c.key === key); if (!ch || $("#confirm").classList.contains("show")) return;
+  const ans = await askConfirm(`Remove all ${ch.count} transcripts of ${ch.name}?`, `Their folders move to _trash\\_transcripts in the reels folder, so you can still restore them. Videos you processed in full stay under Videos.`,
+    vault.ok ? "Also move their Obsidian notes (and the channel note) to the vault's trash" : null);
+  if (!ans.ok) return;
+  let j;
+  try { j = await api("/api/transcripts/remove", {channel: key, all: true, obsidian: ans.obsidian}); } catch (err) { return alert(err.message); }
+  if (j.errors && j.errors.length) alert(j.errors.join("\n"));
+  if (tr.current && tr.current.ch === key) tr.current = null;
+  try { await loadTr(); } catch (err) {}
+  toast(`Removed ${j.removed.length} transcript${j.removed.length === 1 ? "" : "s"}`);
 }
 
 /* ---------- run polling ---------- */
@@ -4276,7 +5159,7 @@ async function poll(){
   const q = s.queue || [];
   $("#logtext").textContent = s.log.join("\n") || "(waiting for output)";
   $("#logtext").scrollTop = 1e9;
-  $("#status").textContent = s.running ? `Running · ${s.done || 0} / ${s.urls.length} done` : (s.finished ? "Finished" : "Idle");
+  $("#status").textContent = s.running ? `Running · ${s.done || 0} / ${s.total != null ? s.total : s.urls.length} done` : (s.finished ? "Finished" : "Idle");
   showProgress(s); showQueue(q);
   $("#status").classList.toggle("on", s.running);
   $("#logtitle").textContent = s.running ? "Run log · working (first run downloads models)" : "Run log";
@@ -4284,6 +5167,7 @@ async function poll(){
   const ended = syncBusy(s, q, ep);                       // a re-process that finished, even with more in line
   if (s.running || q.length) {
     wasRunning = true; refreshQuiet().catch(() => {});
+    if (s.transcripts && ++trTick % 5 === 0) loadTr().catch(() => {});   // the catalogue fills up as it runs
     if (fresh.size || ended.length) reloadChanged(new Set([...fresh, ...ended]));
     setTimeout(poll, 1000); return;
   }
@@ -4295,6 +5179,7 @@ async function poll(){
     await reloadChanged(changed);
     lastRunTargets = new Set();
     refreshInbox();
+    loadTr().catch(() => {});                              // a transcripts run adds videos; a full Run marks one
   }
 }
 async function reloadChanged(ids){       // reels a run changed: take the server's copy (others keep your edits)
@@ -4347,8 +5232,7 @@ async function refreshQuiet(){
   }
 }
 
-$("#groupby").value = groupBy; $("#sortby").value = sortBy;
-if (!$("#groupby").value) { groupBy = "category"; $("#groupby").value = groupBy; }
+setGroupOptions("reels"); $("#sortby").value = sortBy;
 if (!$("#sortby").value) { sortBy = "posted-new"; $("#sortby").value = sortBy; }
 try { const m = localStorage.getItem("rh-maxshots"); if (m && [...$("#maxshots").options].some(o => o.value === m)) $("#maxshots").value = m;
   const e = parseFloat(localStorage.getItem("rh-everyn")); if (e >= 0.5 && e <= 600) $("#everyn").value = e; } catch (e) {}
@@ -4398,6 +5282,9 @@ async function saveSetup(){
   pingSoon(5000);                            // status at the top right: is the server on this PC answering?
   try { const c = await api("/api/config"); if (!c.configured) await openSetup(true); } catch (e) {}
   await loadReels(); setView(view); poll();
+  try { await loadTr(); } catch (e) {}
+  let m = ""; try { m = localStorage.getItem("rh-mode") || ""; } catch (e) {}
+  if (m === "transcripts" && tr.items.length) setMode("transcripts");
   if (me.share && me.share.on) await api("/api/inbox/check", {}).catch(() => {});   // opening the app looks for shares
   refreshInbox(true);
 })();
