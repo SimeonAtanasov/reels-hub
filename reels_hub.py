@@ -2870,6 +2870,7 @@ PAGE = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Reels Hub</title>
+<link rel="icon" id="favicon" type="image/svg+xml" href="data:,">
 <style>
 :root{
   --bg:#0f1214; --panel:#171b1e; --panel2:#1d2226; --line:#2a3035; --text:#e6e8ea; --muted:#8b949b;
@@ -2881,8 +2882,9 @@ body{background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-syste
 button,textarea,input,select{font:inherit;color:inherit}
 [hidden]{display:none!important}
 header{display:flex;flex-wrap:wrap;align-items:center;gap:12px;row-gap:8px;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--panel)}
-header h1{font-size:16px;margin:0;font-weight:600;letter-spacing:.2px;cursor:pointer}
+header h1{display:flex;align-items:center;gap:8px;font-size:16px;margin:0;font-weight:600;letter-spacing:.2px;cursor:pointer}
 header h1:hover{color:var(--accent)}
+.logo{width:26px;height:26px;flex:none;display:block;pointer-events:none}
 header .count{color:var(--muted);font-size:13px}
 header .spacer{flex:1}
 .conn{flex:none;margin-left:auto;font-size:12px;color:var(--muted);white-space:nowrap}
@@ -3278,7 +3280,7 @@ body:has(#bulkbar.show) #log{bottom:84px}
 </head>
 <body>
 <header>
-  <h1 id="home" title="Home: back to the start">Reels Hub</h1><span class="count" id="count"></span>
+  <h1 id="home" title="Home: back to the start"><svg class="logo" id="logo" viewBox="0 0 64 64" aria-hidden="true" focusable="false"><rect x="4" y="4" width="56" height="56" rx="14" fill="#2a3860"/><rect x="14" y="16" width="36" height="32" rx="6" fill="none" stroke="#9db4ff" stroke-width="4"/><path d="M28 25 L40 32 L28 39 Z" fill="#f2c879"/><path d="M14 23 H22 M14 41 H22 M42 23 H50 M42 41 H50" stroke="#9db4ff" stroke-width="3" stroke-linecap="round"/></svg>Reels Hub</h1><span class="count" id="count"></span>
   <span class="who" id="who" title="Whose Reels Hub this is"></span>
   <span class="spacer"></span>
   <span class="status"><kbd>&larr;</kbd> <kbd>&rarr;</kbd> switch reels</span>
@@ -3502,6 +3504,11 @@ function setConn(up){
   c.title = up ? `Reels Hub runs on this PC (${location.host}); only this computer can reach it`
                : "Double-click Reels Hub on the desktop, or reels-hub.bat in the app folder. This page connects again by itself.";
   if (!up) pingSoon(2000);
+}
+function setFavicon(){                     // the tab icon = the header logo (one copy of the drawing, in the page)
+  const s = $("#logo").cloneNode(true);
+  s.removeAttribute("class"); s.removeAttribute("id");
+  $("#favicon").href = "data:image/svg+xml," + encodeURIComponent(new XMLSerializer().serializeToString(s));
 }
 function pingSoon(ms){ clearTimeout(connTimer); connTimer = setTimeout(ping, ms); }
 async function ping(){                     // heartbeat: every 5 s, every 2 s while the server does not answer
@@ -5279,6 +5286,7 @@ async function saveSetup(){
   finally { b.disabled = false; }
 }
 (async () => {
+  setFavicon();
   pingSoon(5000);                            // status at the top right: is the server on this PC answering?
   try { const c = await api("/api/config"); if (!c.configured) await openSetup(true); } catch (e) {}
   await loadReels(); setView(view); poll();
