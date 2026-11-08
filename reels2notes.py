@@ -928,6 +928,32 @@ def new_version(out, workdir, video, info):
     return dest, dest / video.name
 
 
+def channel_category(out, workdir, info, url):
+    """A new video starts in a category named after its channel or creator (made if missing), written before the
+    note so the app and the vault note see it at once. Only for videos without hub.json (new downloads)."""
+    name = re.sub(r"\s+", " ", tr_name(info, url)).strip()[:100]
+    if not name or name.lower() in ("unassigned", "channel") or name.isdigit():
+        return
+    f = out / "_categories.json"
+    try:
+        cats = json.loads(f.read_text(encoding="utf-8")).get("categories", []) if f.exists() else []
+    except (OSError, ValueError):
+        return                                               # unreadable: leave it to the app
+    raw = json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
+    ch = list(raw.get("channels") or [])
+    if name not in cats or name not in ch:
+        if name not in cats:
+            cats.append(name)
+        if name not in ch:
+            ch.append(name)                                  # shown under the Channels group
+        raw.update(categories=cats, channels=ch)
+        tmp = f.with_name("._categories.json.tmp")
+        tmp.write_text(json.dumps(raw, indent=1, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, f)
+    (workdir / "hub.json").write_text(json.dumps({"category": name, "favorites": []}, indent=1, ensure_ascii=False), encoding="utf-8")
+    print(f"  category: {name}")
+
+
 def fmt_dur(sec):
     sec = int(round(sec))
     return f"{sec // 60}m {sec % 60:02d}s" if sec >= 60 else f"{sec}s"
@@ -1002,6 +1028,8 @@ def _process(url, args, i=1, n=1, stats=None):
         workdir = Path(args.out) / f"{info.get('upload_date', '')}_{info['id']}"
         tmp.rename(workdir)
         video = workdir / video.name
+    if args.channel_category and not (workdir / "hub.json").exists():
+        channel_category(Path(args.out), workdir, info, url)
     shots_dir = workdir / "shots"
     if shots_dir.exists():
         shutil.rmtree(shots_dir)                             # also removes edited originals in shots/_orig
@@ -1210,17 +1238,31 @@ LANG3 = {"en": "eng", "es": "spa", "de": "deu", "fr": "fra", "it": "ita", "pt": 
          "vi": "vie", "th": "tha", "ca": "cat", "sr": "srp", "hr": "hrv", "sk": "slk", "sl": "slv"}
 
 
-def pick_caption(info):
+def pick_caption(info, prefer=""):
     """Which caption track to take: ("subs"|"auto", code), or None when the site has none in the video's language.
     YouTube: the creator's subtitles come first, then the automatic ones ("xx-orig" is the untranslated track; the
     other automatic languages are machine translations and are never taken). Other sites (TikTok has captions on most
     videos): the track in the video's language, else the first one."""
     subs = {k: v for k, v in (info.get("subtitles") or {}).items() if v and k != "live_chat"}
     auto = {k: v for k, v in (info.get("automatic_captions") or {}).items() if v}
+    prefer = (prefer or "").strip().lower()
+    if prefer and platform_of(info.get("webpage_url") or "", info) == "YouTube":
+        # a language set in Settings wins over YouTube's language field, which can point at an automatic dub
+        k = next((k for k in subs if k.lower() == prefer or k.lower().startswith(prefer + "-")), None)
+        if k:
+            return "subs", k
+        k = next((k for k in auto if k.lower() == f"{prefer}-orig"), None)
+        if k:
+            return "auto", k
     if platform_of(info.get("webpage_url") or "", info) != "YouTube":
         if not subs:
             return None
         lang = (info.get("language") or "").lower()
+        if prefer:
+            p3 = LANG3.get(prefer, prefer)
+            k = next((k for k in subs if k.lower() in (prefer, p3) or k.lower().startswith((prefer + "-", p3 + "-"))), None)
+            if k:
+                return "subs", k
         wanted = {lang, LANG3.get(lang, lang)} if lang else set()        # TikTok codes are 3 letters (eng-US)
         k = next((k for k in subs if any(w and (k.lower() == w or k.lower().startswith(w + "-")) for w in wanted)), None)
         return "subs", k or next(iter(subs))
@@ -1396,7 +1438,7 @@ def transcript_one(url, args, out, prog, source_hint="link"):
         shutil.rmtree(tmp)
         print(f"  already done: {title}")
         return {"url": url, "folder": f"{TR_DIR}/{key}/{dest.name}", "skipped": True, "transcripts": True, "channel": key}
-    pick = pick_caption(info)
+    pick = pick_caption(info, getattr(args, "prefer_lang", ""))
     lang, source = "-", ""
     if pick:
         kind, code = pick
@@ -1663,6 +1705,8 @@ def main():
     ap.add_argument("--new-version", action="store_true", help="process already-done videos again as a new copy (_v2, _v3)")
     ap.add_argument("--target", help="reel folder name to use (with --redo or --new-version)")
     ap.add_argument("--out", default=str(Path.home() / "Downloads" / "reels"))
+    ap.add_argument("--channel-category", action="store_true", help="put a new video in a category named after its channel")
+    ap.add_argument("--prefer-lang", default="", help="transcripts: take captions in this language first (e.g. en)")
     ap.add_argument("--transcripts", action="store_true",
                     help="transcripts only (no video, no snapshots): links can be videos, YouTube channels or playlists")
     args = ap.parse_args()

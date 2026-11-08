@@ -112,8 +112,11 @@ def save_config(body):
     with CONFIG_LOCK:
         old = load_config() or {}
         cloud, changed = cloud_from_form(body, old.get("cloud") or {})
+        sub_lang = str(body.get("sub_lang", old.get("sub_lang", "en")) or "").strip().lower()
+        if sub_lang and not re.fullmatch(r"[a-z]{2,3}(-[a-z0-9]{2,8})?", sub_lang):
+            raise ValueError("Transcript language: a language code like en, es or bg, or empty")
         cfg = {"name": name, "person": person_id(name), "out": str(out_p.resolve()), "vault": vault,
-               "saved": time.strftime("%Y-%m-%d %H:%M")}
+               "sub_lang": sub_lang, "saved": time.strftime("%Y-%m-%d %H:%M")}
         if "can_delete" in old:
             cfg["can_delete"] = old["can_delete"]        # set by the Cloudflare inbox (PEOPLE), not by this form
         if cloud:
@@ -482,14 +485,16 @@ def read_state(folder):
            "note_name": s.get("note_name", "") or "", "note_path": s.get("note_path", "") or "", "sent": s.get("sent", "") or "",
            # sharing: who shared this video with you {person, name, at}; whom you shared it with [{to, name, at}]
            "shared_by": s["shared_by"] if isinstance(s.get("shared_by"), dict) else None,
-           "shared": [x for x in s["shared"] if isinstance(x, dict)][-10:] if isinstance(s.get("shared"), list) else []}
+           "shared": [x for x in s["shared"] if isinstance(x, dict)][-10:] if isinstance(s.get("shared"), list) else [],
+           "tags": _clean_tags(s.get("tags")), "tag_tokens": [str(t) for t in s.get("tag_tokens") or [] if isinstance(t, str)],
+           "cat_tag": str(s.get("cat_tag") or "")}
     if bad:
         out["_bad"] = True
     return out
 
 
 def write_state(folder, state):
-    state = {k: v for k, v in state.items() if not k.startswith("_") and not (k in ("shared_by", "shared") and not v)}
+    state = {k: v for k, v in state.items() if not k.startswith("_") and not (k in ("shared_by", "shared", "tags", "tag_tokens", "cat_tag") and not v)}
     atomic_write(folder / "hub.json", json.dumps(state, indent=1, ensure_ascii=False))
 
 
@@ -626,7 +631,7 @@ def _ensure_vault_note(folder, r):
             return {"pending": True}       # a video being added from the inbox: its note waits for the share's notes
         rel = _adopt_transcript_note(folder, r)      # the same video as a transcript-only note: keep that note
     if not rel:
-        dname = vault_dir(r["platform"])
+        dname = note_home(r["platform"], state["category"] if state["category"] in read_cats() else "")
         base = NOTE_PREFIX.get(r["platform"], "") + clean_name(r["label"], r["id"]) + (f" (v{r['version']})" if r["version"] > 1 else "")
         name, k = base, 2
         while (VAULT / dname / f"{name}.md").exists():
@@ -685,6 +690,7 @@ def vault_note_text(folder, r, state, tonly=None):
     plat = r["platform"]
     creator_url = info.get("uploader_url") or info.get("channel_url") or ""
     tag_cat = ("#" + re.sub(r"[^0-9A-Za-z]+", "", state["category"].title())) if state["category"] else ""
+    tag_cat = " ".join(dict.fromkeys([t for t in [tag_cat] + [_tag_token(x) for x in state.get("tags") or []] if t]))
     lines = [time.strftime("%Y-%m-%d"), time.strftime("%H:%M"),
              f"**Title:** {r['title'] or r['label']}",
              f"**Source**: {r['url']}",
@@ -930,6 +936,8 @@ def tr_item(folder, key):
         it["note_path"] = st.get("note_path") or ""
         it["full_flag"] = st.get("full") or ""
         it["category"] = str(st.get("category") or "")[:100]
+        it["tags"] = _clean_tags(st.get("tags"))
+        it["cat_set"] = "category" in st or st.get("from") == "link"    # a channel's video with no category yet: see _auto_category
         TR_CACHE[str(folder)] = (mt, dict(it))
     rel = it.pop("note_path")
     it["note"] = {"name": Path(rel).stem, "path": rel, "uri": obsidian_uri(rel)} if rel and (VAULT / rel).is_file() else None
@@ -946,40 +954,99 @@ def list_transcripts():
     """The catalogue: channels (folders in _transcripts) and their transcript-only videos."""
     root = OUT / TR_DIR
     chans, items = [], []
-    if not root.is_dir():
-        return {"channels": chans, "items": items}
-    for cdir in sorted(root.iterdir()):
+    for cdir in (sorted(root.iterdir()) if root.is_dir() else []):
         if not cdir.is_dir() or cdir.name.startswith((".", "_")):
             continue
         meta = _channel_meta(cdir)
         n = 0
         for f in _tr_folders(cdir):
             it = tr_item(f, cdir.name)
+            if it and not it["cat_set"] and meta.get("run"):     # a channel run's video: the channel is its category
+                try:
+                    _auto_category(f)
+                    it = tr_item(f, cdir.name) or it
+                except Exception as e:
+                    print(f"  {f.name}: category not set ({e})")
             if it:
                 items.append(it); n += 1
         rel = meta.get("note_path") or ""
         note = {"name": Path(rel).stem, "path": rel, "uri": obsidian_uri(rel)} if rel and (VAULT / rel).is_file() else None
         chans.append({"key": cdir.name, "name": meta.get("name") or cdir.name, "handle": meta.get("handle", ""),
                       "url": meta.get("url", ""), "platform": meta.get("platform", ""), "count": n, "note": note,
-                      "run": tr_run_state(meta.get("run"))})
+                      "run": tr_run_state(meta.get("run")),
+                      "wrong_lang": sum(1 for it in items if it["ch"] == cdir.name and _pref_lang() and "caption" in (it["source"] or "")
+                                        and not it["full"] and not _lang_ok(it["lang"], _pref_lang()))})
+    _add_reels(chans, items)
     items.sort(key=lambda x: (x["date"], x["id"]), reverse=True)
-    return {"channels": chans, "items": items}
+    return {"channels": chans, "items": items, "channel_cats": channel_cats(), "tags": read_tags()}
 
 
-def _tr_set_category(folder, cat):
-    """A transcript-only video's category: hub.json, and in its note the #Category tag on the **Tags** line (the
-    tag the app set before is taken out) plus the **Category** line where the note has one."""
+def _video_id(folder_name):
+    """The site's video id from a folder name <date>_<id>[_vN]."""
+    return re.sub(r"_v\d+$", "", folder_name).split("_", 1)[-1]
+
+
+def _add_reels(chans, items):
+    """Downloaded videos in the catalogue too (2026-11-07): one entry per video, under its channel, marked as a video.
+    A transcript of the same video (same id from the link) is joined to it: the entry then shows the video's
+    transcript, category and note, so a Re-process of the video updates it. Clicking opens the video."""
+    import reels2notes as r2n
+    reels = {}
+    for f in sorted(OUT.iterdir()):                       # sorted: the original before _v2, _v3
+        if f.is_dir() and not f.name.startswith(("_", ".")) and (f / "note.md").is_file():
+            reels.setdefault(_video_id(f.name), f)
+    if not reels:
+        return
+    by_vid = {_video_id(it["id"]): it for it in items}
+    known = {c["key"]: c for c in chans}
+    for vid, f in reels.items():
+        rk = tr_item(f, "")
+        if not rk:
+            continue
+        st = read_state(f)
+        it = by_vid.get(vid)
+        if it:                                            # joined: the video's data wins
+            for k in ("title", "duration", "lang", "lines", "url", "date"):
+                if rk.get(k):
+                    it[k] = rk[k]
+            it.update(reel=f.name, full=f.name, category=st["category"], tags=st["tags"], source="video")
+            if rk.get("note"):
+                it["note"] = rk["note"]
+            continue
+        info = _info(f)
+        has_ch = info and any(info.get(k) for k in ("channel", "uploader", "uploader_id"))
+        url = rk.get("url") or (info.get("webpage_url") if info else "") or ""
+        key = r2n.tr_key(info, url) if has_ch else "_unknown"
+        if key not in known:
+            known[key] = {"key": key, "name": r2n.tr_name(info, url) if has_ch else "Unknown channel",
+                          "handle": ("@" + r2n._handle(info, url).lstrip("@")) if has_ch else "",
+                          "url": r2n._channel_url(url, info) if has_ch else "", "platform": rk.get("platform") or "",
+                          "count": 0, "note": None, "run": None, "wrong_lang": 0, "videos_only": True}
+            chans.append(known[key])
+        known[key]["count"] += 1
+        rk.update(ch=key, reel=f.name, full=f.name, category=st["category"], tags=st["tags"], source="video")
+        items.append(rk)
+
+
+def _tr_set_category(folder, cat, prev=None):
+    """A video's category (transcript folder or reel): hub.json, and in its note the #Category tag on the **Tags**
+    line (the tag the app set before is taken out) plus the **Category** line where the note has one; then the note
+    moves to <platform>/<category>/ (move_note)."""
     with DATA_LOCK:
         st = _hub(folder)
+        if not st and (folder / "hub.json").is_file() and read_text(folder / "hub.json").strip():
+            raise ValueError(f"{folder.name}/hub.json can't be read - not changing it")
+        old_cat = str(st.get("category") or "") if prev is None else prev
         st["category"] = cat
         tag = ("#" + re.sub(r"[^0-9A-Za-z]+", "", cat.title())) if cat else ""
         old_tag = st.get("cat_tag") or ""
+        gone = {t for t in (old_tag, _tag_token(old_cat) if old_cat else "") if t} - set(st.get("tag_tokens") or [])
         rel = st.get("note_path") or ""
         if vault_ok() and rel and (VAULT / rel).is_file():
             text = read_text(VAULT / rel)
             if has_marker(text, folder.name):
                 def tags(m):
-                    parts = [t for t in m.group(1).split() if not (old_tag and t == old_tag) and t != tag]
+                    parts = [t for t in m.group(1).split() if t not in gone and t != tag]
                     return "**Tags**: " + " ".join(parts + ([tag] if tag else []))
                 new = re.sub(r"^\*\*Tags\*\*:(.*)$", tags, text, count=1, flags=re.M)
                 new = re.sub(r"^\*\*Category\*\*:.*$", lambda m: f"**Category**: {cat or '-'}", new, count=1, flags=re.M)
@@ -988,7 +1055,255 @@ def _tr_set_category(folder, cat):
         st["cat_tag"] = tag
         atomic_write(folder / "hub.json", json.dumps(st, indent=1, ensure_ascii=False))
         TR_CACHE.pop(str(folder), None)
+        try:
+            move_note(folder, cat, extra=[old_cat])
+        except Exception as e:
+            print(f"  {folder.name}: note not moved ({e})")
     return cat
+
+
+def _auto_category(folder):
+    """A transcript from a channel run starts in a category named after the channel (made if missing), so it never
+    sits in Unassigned; a category you set yourself, Unassigned included, is left alone (the key is then present)."""
+    st = _hub(folder)
+    if "category" in st or st.get("from") == "link":
+        return None
+    meta = _channel_meta(folder.parent)
+    kept = (meta.get("keep_cats") or {}).get(folder.name.split("_", 1)[-1])
+    if kept is not None:                                   # the category it had before a redo
+        if kept and kept not in read_cats():
+            with DATA_LOCK:
+                write_cats(read_cats() + [kept])
+        return _tr_set_category(folder, kept)
+    name = str(meta.get("name") or folder.parent.name).strip()[:100]
+    if not name or name.lower() == "unassigned":
+        return None
+    with DATA_LOCK:
+        cats = read_cats()
+        if name not in cats:
+            cats.append(name)
+            write_cats(cats)
+    mark_channel(name)
+    return _tr_set_category(folder, name)
+
+
+# ---------------------------------------------------------------- note folders by category (2026-11-07)
+# Simeon: changing a video's category moves its note to <platform>/<category>/ (Unassigned: back to <platform>/).
+# Only notes still in the app's own folders move (the platform folder, <platform>/<a category>, <platform>/<a
+# channel's name>); a note you filed somewhere else stays where it is. The file name is kept (links by name keep
+# working); a note of the same name already in the target folder: not moved. Empty folders are left in place.
+
+def _note_platform(folder):
+    try:
+        with open(folder / "note.md", encoding="utf-8", errors="replace") as fh:
+            head = fh.read(3000)
+    except OSError:
+        return ""
+    m = re.search(r"^platform:\s*(.+?)\s*$", head, re.M)
+    if m:
+        return m.group(1).strip().strip('"')
+    m = re.search(r"^source:\s*(.+?)\s*$", head, re.M)
+    return platform_of(m.group(1).strip().strip('"')) if m else ""
+
+
+CH_DIR = "Channels"          # channel categories: <platform>/Channels/<channel>/, as the app's Channels group
+
+
+def note_home(platform, cat):
+    base = vault_dir(platform)
+    sub = clean_name(cat, "") if cat else ""
+    if sub and cat in channel_cats():
+        return f"{base}/{CH_DIR}/{sub}"
+    return f"{base}/{sub}" if sub else base
+
+
+def _app_dirs(platform, extra=()):
+    base = vault_dir(platform)
+    names = list(read_cats()) + [c for c in extra if c]
+    root = OUT / TR_DIR
+    if root.is_dir():
+        for cdir in root.iterdir():
+            if cdir.is_dir() and not cdir.name.startswith((".", "_")):
+                names.append(str(_channel_meta(cdir).get("name") or cdir.name))
+    subs = [clean_name(n, "") for n in names if clean_name(n, "")]
+    return {base} | {f"{base}/{x}" for x in subs} | {f"{base}/{CH_DIR}/{x}" for x in subs}
+
+
+def _move_file(src, dst):
+    for i in range(40):
+        try:
+            os.rename(src, dst)
+            return
+        except PermissionError:
+            time.sleep(0.05)
+    raise PermissionError(f"could not move {Path(src).name} (open in another program?)")
+
+
+def _plan_move(folder, cat, extra=()):
+    """(old rel, new rel) for this video's note, or None (no vault, no note, filed by you, already there, clash)."""
+    if not vault_ok():
+        return None
+    st = _hub(folder)
+    rel = st.get("note_path") or ""
+    if not rel or not (VAULT / rel).is_file():
+        return None
+    plat = _note_platform(folder)
+    cur = rel.rsplit("/", 1)[0] if "/" in rel else ""
+    if cur.casefold() not in {d.casefold() for d in _app_dirs(plat, extra)}:   # Windows: case does not matter
+        return None
+    dest_dir = note_home(plat, cat)
+    if cur == dest_dir:
+        return None
+    new = f"{dest_dir}/{rel.rsplit('/', 1)[-1]}"
+    if cur.casefold() == dest_dir.casefold():      # same folder, other case (a channel first known by its handle)
+        return None
+    if (VAULT / new).exists():
+        return ("clash", new)
+    try:
+        if not has_marker(read_text(VAULT / rel), folder.name):
+            return None
+    except OSError:
+        return None
+    return (rel, new)
+
+
+def move_note(folder, cat, extra=()):
+    """Move this video's note to its category folder. Returns the new path or None."""
+    with DATA_LOCK:
+        plan = _plan_move(folder, cat, extra)
+        if not plan or plan[0] == "clash":
+            if plan:
+                print(f"  {folder.name}: note not moved, {plan[1]} already exists")
+            return None
+        old, new = plan
+        (VAULT / new).parent.mkdir(parents=True, exist_ok=True)
+        _move_file(VAULT / old, VAULT / new)
+        st = _hub(folder); st["note_path"] = new; st["note_name"] = Path(new).stem
+        atomic_write(folder / "hub.json", json.dumps(st, indent=1, ensure_ascii=False))
+        TR_CACHE.pop(str(folder), None)
+        keys = set()
+        root = OUT / TR_DIR                      # the same video's transcript folder points to the same note
+        if root.is_dir():
+            for cdir in root.iterdir():
+                rec = cdir / folder.name
+                if cdir.is_dir() and not cdir.name.startswith((".", "_")) and (rec / "hub.json").is_file():
+                    h = _hub(rec)
+                    if h.get("note_path") == old:
+                        h["note_path"] = new; h["note_name"] = Path(new).stem
+                        atomic_write(rec / "hub.json", json.dumps(h, indent=1, ensure_ascii=False))
+                        TR_CACHE.pop(str(rec), None)
+                    if rec == folder or h.get("note_path") == new:
+                        keys.add(cdir.name)
+        for k in keys:                            # the channel note links by path
+            if _channel_meta(OUT / TR_DIR / k).get("note_path"):
+                try:
+                    channel_note(k)
+                except Exception as e:
+                    print(f"  channel note {k} not refreshed ({e})")
+    return new
+
+
+def sort_notes(dry=False):
+    """Settings > Move notes to category folders: every video's note that is still in the app's folders goes to
+    <platform>/<category>/ (Unassigned: <platform>/). dry: count and examples only."""
+    if JOB["running"] or RUNQ:
+        raise ValueError("Wait for the current run (and the ones waiting) to finish")
+    if not vault_ok():
+        raise ValueError("No Obsidian vault set (Settings)")
+    folders = [f for f in OUT.iterdir() if f.is_dir() and not f.name.startswith((".", "_")) and (f / "note.md").is_file()]
+    root = OUT / TR_DIR
+    if root.is_dir():
+        for cdir in root.iterdir():
+            if cdir.is_dir() and not cdir.name.startswith((".", "_")):
+                folders += [f for f in _tr_folders(cdir) if not (OUT / f.name / "note.md").is_file()]
+    cats = read_cats()
+    moves, clashes, mine = [], [], 0
+    for f in folders:
+        st = _hub(f)
+        cat = str(st.get("category") or "")
+        cat = cat if cat in cats else ""
+        plan = _plan_move(f, cat)
+        if plan is None:
+            rel = st.get("note_path") or ""
+            if rel and vault_ok() and (VAULT / rel).is_file() and (rel.rsplit("/", 1)[0] if "/" in rel else "").casefold() not in {d.casefold() for d in _app_dirs(_note_platform(f))}:
+                mine += 1
+            continue
+        (clashes if plan[0] == "clash" else moves).append((f, cat, plan))
+    chmoves = []                                   # the channel notes go with their channel's folder
+    if root.is_dir():
+        for cdir in root.iterdir():
+            if not cdir.is_dir() or cdir.name.startswith((".", "_")):
+                continue
+            meta = _channel_meta(cdir)
+            rel = meta.get("note_path") or ""
+            if not rel or not (VAULT / rel).is_file():
+                continue
+            plat = meta.get("platform") or "YouTube"
+            cname = clean_name(meta.get("name") or cdir.name, cdir.name)
+            cur, dest = rel.rsplit("/", 1)[0], f"{vault_dir(plat)}/{CH_DIR}/{cname}"
+            if cur.casefold() == dest.casefold() or cur.casefold() != f"{vault_dir(plat)}/{cname}".casefold():
+                continue
+            new = f"{dest}/{rel.rsplit('/', 1)[-1]}"
+            if (VAULT / new).exists():
+                clashes.append(None); continue
+            if f"<!-- reels-hub:channel={cdir.name} -->" in read_text(VAULT / rel):
+                chmoves.append((cdir, meta, rel, new))
+    if dry:
+        return {"count": len(moves) + len(chmoves), "clashes": len(clashes), "yours": mine,
+                "examples": [f"{p[0]}  ->  {p[1].rsplit('/', 1)[0]}/" for _, _, p in moves[:8]]
+                            + [f"{r}  ->  {n.rsplit('/', 1)[0]}/" for _, _, r, n in chmoves[:2]]}
+    done = 0
+    for cdir, meta, rel, new in chmoves:
+        try:
+            with DATA_LOCK:
+                (VAULT / new).parent.mkdir(parents=True, exist_ok=True)
+                _move_file(VAULT / rel, VAULT / new)
+                meta["note_path"] = new
+                _save_channel_meta(cdir, meta)
+            done += 1
+        except Exception as e:
+            print(f"  channel note {cdir.name} not moved ({e})")
+    for f, cat, _ in moves:
+        try:
+            if move_note(f, cat):
+                done += 1
+        except Exception as e:
+            print(f"  {f.name}: note not moved ({e})")
+    return {"count": done, "clashes": len(clashes), "yours": mine}
+
+
+def sort_by_channel(dry=False):
+    """Unassigned videos -> a category named after their channel or creator (made if missing). Videos with a
+    category are left alone. dry: only count."""
+    if JOB["running"] or RUNQ:
+        raise ValueError("Wait for the current run (and the ones waiting) to finish")
+    import reels2notes as r2n
+    plan = []
+    for f in sorted(OUT.iterdir()):
+        if not f.is_dir() or f.name.startswith(("_", ".")) or not (f / "note.md").is_file():
+            continue
+        st = read_state(f)
+        if st.get("_bad") or (st["category"] and st["category"] in read_cats()):
+            continue
+        info = _info(f)
+        known = info and any(info.get(k) for k in ("channel", "uploader", "uploader_id"))   # never a title as a name
+        name = re.sub(r"\s+", " ", r2n.tr_name(info, info.get("webpage_url") or "")).strip()[:100] if known else ""
+        if name and name.lower() not in ("unassigned", "channel") and not name.isdigit():
+            plan.append((f, name))
+    if dry:
+        return {"count": len(plan), "categories": sorted(set(n for _, n in plan))}
+    with DATA_LOCK:
+        cats = read_cats()
+        cats += [n for n in dict.fromkeys(n for _, n in plan) if n not in cats]
+        write_cats(cats, channel_cats() + [n for _, n in plan])
+    done = 0
+    for f, name in plan:
+        try:
+            _tr_set_category(f, name)                       # hub.json + the note's tag and Category line
+            done += 1
+        except Exception as e:
+            print(f"  {f.name}: not sorted ({e})")
+    return {"count": done, "categories": sorted(set(n for _, n in plan))}
 
 
 def tr_set_category(key, rid, cat):
@@ -996,6 +1311,187 @@ def tr_set_category(key, rid, cat):
     if cat and cat not in read_cats():
         raise ValueError("No such category")
     return {"category": _tr_set_category(tr_dir(key, rid), cat)}
+
+
+# ---------------------------------------------------------------- tags (2026-11-07)
+# A video has one main category and any number of tags (Simeon: "training" as the category, "kettlebell" as a tag).
+# The tag list is in _categories.json "tags"; a video's tags in its hub.json "tags" (reels and transcript folders
+# alike). Each tag also goes on the note's **Tags** line as #Tag; the tokens the app wrote are kept in "tag_tokens"
+# so a removed tag takes out only its own token (never the platform's or the category's, never one you typed).
+
+def _clean_tags(v):
+    out, seen = [], set()
+    for t in v if isinstance(v, list) else []:
+        t = re.sub(r"\s+", " ", str(t).replace("#", "")).strip()[:60]
+        if t and t.lower() not in seen and t.lower() != "unassigned":
+            seen.add(t.lower()); out.append(t)
+    return out[:30]
+
+
+def _tag_token(name):
+    return ("#" + re.sub(r"[^0-9A-Za-z]+", "", str(name).title())) if re.sub(r"[^0-9A-Za-z]+", "", str(name)) else ""
+
+
+def read_tags():
+    return _clean_tags(_cats_raw().get("tags"))
+
+
+def write_tags(tags):
+    raw = _cats_raw()
+    raw.setdefault("categories", read_cats())
+    raw["tags"] = _clean_tags(tags)
+    atomic_write(cats_file(), json.dumps(raw, indent=1, ensure_ascii=False))
+
+
+def _write_item_tags(folder, tags):
+    """hub.json "tags" and the note's Tags line. Caller holds DATA_LOCK."""
+    st = _hub(folder)
+    if not st and (folder / "hub.json").is_file() and read_text(folder / "hub.json").strip():
+        raise ValueError(f"{folder.name}/hub.json can't be read - not changing it")
+    tags = _clean_tags(tags)
+    old = [t for t in st.get("tag_tokens") or [] if isinstance(t, str)]
+    want = [t for t in dict.fromkeys(_tag_token(x) for x in tags) if t]
+    keep = set(want) | {st.get("cat_tag") or "", _tag_token(st.get("category") or "")}
+    rel = st.get("note_path") or ""
+    if vault_ok() and rel and (VAULT / rel).is_file():
+        text = read_text(VAULT / rel)
+        if has_marker(text, folder.name):
+            def line(m):
+                parts = [t for t in m.group(1).split() if not (t in old and t not in keep)]
+                return "**Tags**: " + " ".join(parts + [t for t in want if t not in parts])
+            new = re.sub(r"^\*\*Tags\*\*:(.*)$", line, text, count=1, flags=re.M)
+            if new != text:
+                atomic_write(VAULT / rel, new)
+    st["tags"], st["tag_tokens"] = tags, want
+    if not tags:
+        st.pop("tags"); st.pop("tag_tokens")
+    atomic_write(folder / "hub.json", json.dumps(st, indent=1, ensure_ascii=False))
+    TR_CACHE.pop(str(folder), None)
+    return tags
+
+
+def set_tags(body):
+    """POST /api/tags/set {id (a reel) | channel + id (a transcript), tags}: new names join the tag list."""
+    if body.get("channel"):
+        folder = tr_dir(body.get("channel"), body.get("id"))
+    else:
+        folder = reel_dir(body.get("id"))
+        if not (folder / "note.md").exists():
+            raise ValueError("unknown reel")
+        busy_check(folder.name)
+    tags = _clean_tags(body.get("tags"))
+    with DATA_LOCK:
+        known = read_tags()
+        low = {t.lower(): t for t in known}
+        tags = [low.get(t.lower(), t) for t in tags]          # same spelling as the list
+        new = [t for t in tags if t.lower() not in low]
+        if new:
+            write_tags(known + new)
+        tags = _write_item_tags(folder, tags)
+    return {"tags": tags, "all": read_tags()}
+
+
+def _all_tagged():
+    for f in OUT.iterdir() if OUT.is_dir() else []:
+        if f.is_dir() and not f.name.startswith((".", "_")) and (f / "hub.json").is_file():
+            yield f
+    root = OUT / TR_DIR
+    if root.is_dir():
+        for cdir in root.iterdir():
+            if cdir.is_dir() and not cdir.name.startswith((".", "_")):
+                for f in cdir.iterdir():
+                    if f.is_dir() and (f / "hub.json").is_file():
+                        yield f
+
+
+def change_tags(body):
+    """POST /api/tags {action add | rename | delete, name, new}: rename and delete reach every video and its note."""
+    action = body.get("action")
+    name = _clean_tags([body.get("name")])
+    name = name[0] if name else ""
+    if not name:
+        raise ValueError("Tag name is empty")
+    with DATA_LOCK:
+        tags = read_tags()
+        low = [t.lower() for t in tags]
+        if action == "add":
+            if name.lower() not in low:
+                write_tags(tags + [name])
+            return read_tags()
+        if name.lower() not in low:
+            raise ValueError("No such tag")
+        name = tags[low.index(name.lower())]
+        if action == "rename":
+            new = _clean_tags([body.get("new")])
+            if not new:
+                raise ValueError("Invalid new name")
+            new = new[0]
+            if new.lower() in low and new.lower() != name.lower():
+                raise ValueError("That tag already exists")
+            tags[tags.index(name)] = new
+        elif action == "delete":
+            tags.remove(name); new = None
+        else:
+            raise ValueError("Unknown action")
+        write_tags(tags)
+        for f in _all_tagged():
+            st = _hub(f)
+            cur = _clean_tags(st.get("tags"))
+            if name in cur:
+                try:
+                    _write_item_tags(f, [x for x in (new if x == name else x for x in cur) if x])
+                except Exception as e:
+                    print(f"  {f.name}: tag not changed ({e})")
+        return read_tags()
+
+
+def _pref_lang():
+    return str(CONFIG.get("sub_lang", "en") if "sub_lang" in CONFIG else "en").lower()
+
+
+def _lang_ok(lang, pref):
+    l = str(lang or "").lower()
+    return not pref or l == pref or l.startswith(pref + "-") or l.startswith(pref + "_")
+
+
+def tr_wrong_lang(key):
+    """A channel's transcript-only videos whose text came from captions in another language than the one set
+    (Whisper hears the spoken language, so those are left out; so are videos in the library in full)."""
+    pref = _pref_lang()
+    out = []
+    for f in _tr_folders(tr_cdir(key)):
+        it = tr_item(f, key)
+        if it and pref and "caption" in (it["source"] or "") and not it["full"] and not _lang_ok(it["lang"], pref):
+            out.append({"id": it["id"], "title": it["title"], "lang": it["lang"]})
+    return {"lang": pref, "items": out}
+
+
+def tr_redo_lang(body):
+    """Redo the listed videos: their folders to _trash/_transcripts, their notes (id marker only) to the vault's
+    .trash, the category each had kept for the new copy, then the channel's listing runs again (only what is
+    missing is done)."""
+    key = body.get("channel")
+    cdir = tr_cdir(key)
+    meta = _channel_meta(cdir)
+    url = (meta.get("run") or {}).get("url") or meta.get("url")
+    if not url:
+        raise ValueError("This channel has no link to run again")
+    wanted = set(str(x) for x in (body.get("ids") or []))
+    ids = [x["id"] for x in tr_wrong_lang(key)["items"] if x["id"] in wanted]
+    if not ids:
+        raise ValueError("Nothing to redo")
+    keep = meta.get("keep_cats") or {}
+    for rid in ids:
+        st = _hub(tr_dir(key, rid))
+        if "category" in st:
+            keep[rid.split("_", 1)[-1]] = st["category"]
+    meta["keep_cats"] = keep
+    _save_channel_meta(cdir, meta)
+    res = remove_transcripts({"channel": key, "ids": ids, "obsidian": True})
+    ahead = queue_run({"kind": "run", "urls": [url], "max_shots": "auto", "redo": False, "flags": ["--transcripts"],
+                       "target": "", "label": "Transcripts again: " + tr_label(url), "platform": platform_of(url),
+                       "transcripts": True})
+    return {"removed": res["removed"], "errors": res["errors"], "queued": ahead}
 
 
 def tr_run_state(run):
@@ -1089,7 +1585,7 @@ def transcript_note(folder, from_channel):
         dname = vault_dir(r["platform"])
         if from_channel:
             cm = _channel_meta(folder.parent)
-            dname = f"{dname}/{clean_name(cm.get('name') or folder.parent.name, folder.parent.name)}"
+            dname = f"{dname}/{CH_DIR}/{clean_name(cm.get('name') or folder.parent.name, folder.parent.name)}"
         base = NOTE_PREFIX.get(r["platform"], "") + clean_name(r["label"], r["id"])
         name, k = base, 2
         while (VAULT / dname / f"{name}.md").exists():
@@ -1099,7 +1595,7 @@ def transcript_note(folder, from_channel):
         text = template_note_text(folder, r) if r["platform"] in TEMPLATE_FILES else \
             vault_note_text(folder, r, read_state(folder), tonly={"label": label, "video": TR_VIDEO_LINE})
         atomic_write(VAULT / rel, text)
-        st.update(note_path=rel, note_name=name)
+        st.update(note_path=rel, note_name=name, **{"from": "channel" if from_channel else "link"})
         atomic_write(folder / "hub.json", json.dumps(st, indent=1, ensure_ascii=False))
         return {"name": name, "path": rel, "uri": obsidian_uri(rel)}
 
@@ -1136,7 +1632,7 @@ def channel_note(key):
                 text = text.rstrip() + f"\n\n## Videos (Reels Hub)\n{VIDS_START}\n{block}\n{VIDS_END}\n"
         else:
             plat = meta.get("platform") or "YouTube"
-            dname = f"{vault_dir(plat)}/{cname}"
+            dname = f"{vault_dir(plat)}/{CH_DIR}/{cname}"
             rel = f"{dname}/{NOTE_PREFIX.get(plat, '')}{cname} (channel).md"
             if (VAULT / rel).is_file() and mark not in read_text(VAULT / rel):
                 rel = f"{dname}/{NOTE_PREFIX.get(plat, '')}{cname} (channel, Reels Hub).md"
@@ -1183,6 +1679,16 @@ def _adopt_transcript_note(folder, r):
         st["full"] = folder.name
         atomic_write(rec / "hub.json", json.dumps(st, indent=1, ensure_ascii=False))
         TR_CACHE.pop(str(rec), None)
+        # the category and tags you gave the transcript carry over to the video (instead of the channel's category
+        # the download started with), with the note tokens that go with them, so the note stays where it is
+        rh = _hub(folder)
+        if "category" in st or st.get("tags"):
+            if "category" in st:
+                rh["category"] = str(st.get("category") or "")
+            for k in ("tags", "tag_tokens", "cat_tag"):
+                if st.get(k):
+                    rh[k] = st[k]
+            atomic_write(folder / "hub.json", json.dumps(rh, indent=1, ensure_ascii=False))
         try:
             channel_note(rec.parent.name)                   # the channel's list now says the video is here in full
         except Exception as e:
@@ -1364,9 +1870,16 @@ def save_state(reel_id, state):
         _share_guard(old, page_sb.get("at") if isinstance(page_sb, dict) else None)
         clean = {"category": str(state.get("category", ""))[:100], "favorites": favs,
                  "note_name": old["note_name"], "note_path": old["note_path"], "sent": old["sent"],
-                 "shared_by": old["shared_by"], "shared": old["shared"]}
+                 "shared_by": old["shared_by"], "shared": old["shared"],
+                 "tags": old["tags"], "tag_tokens": old["tag_tokens"], "cat_tag": old["cat_tag"]}
         write_state(folder, clean)
         write_note_favorites(folder, favs)
+        if clean["category"] != old["category"]:          # the note follows at once: tag, Category line, folder
+            try:
+                _tr_set_category(folder, clean["category"], prev=old["category"])
+            except Exception as e:
+                print(f"  {folder.name}: note not updated for the category ({e})")
+            clean = {**clean, **{k: v for k, v in read_state(folder).items() if k in ("note_path", "note_name", "cat_tag")}}
     return clean
 
 
@@ -1419,8 +1932,69 @@ def read_cats():
     return []
 
 
-def write_cats(cats):
-    atomic_write(cats_file(), json.dumps({"categories": cats}, indent=1, ensure_ascii=False))
+def _cats_raw():
+    try:
+        d = json.loads(read_text(cats_file())) if cats_file().exists() else {}
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_cats(cats, channels=None):
+    """The category list; channels = the names that are channel categories (kept as they were when not given)."""
+    raw = _cats_raw()
+    ch = raw.get("channels") if channels is None else channels
+    ch = [c for c in dict.fromkeys(ch or []) if c in cats]
+    d = {"categories": cats, "channels": ch, "tags": read_tags()}
+    if raw.get("channels_checked"):
+        d["channels_checked"] = True
+    atomic_write(cats_file(), json.dumps(d, indent=1, ensure_ascii=False))
+
+
+def mark_channel(name):
+    with DATA_LOCK:
+        cats = read_cats()
+        ch = channel_cats()
+        if name in cats and name not in ch:
+            write_cats(cats, ch + [name])
+
+
+def channel_cats():
+    """Categories made from a channel or creator name (shown under one Channels group). Categories made before
+    2026-11-07 are worked out once: a category whose videos or transcripts all come from a channel of that name."""
+    raw = _cats_raw()
+    cats = read_cats()
+    ch = [c for c in raw.get("channels") or [] if c in cats]
+    if raw.get("channels_checked"):
+        return ch
+    try:
+        import reels2notes as r2n
+        found, other = set(), set()
+        for f in OUT.iterdir():
+            if not f.is_dir() or f.name.startswith(("_", ".")) or not (f / "note.md").is_file():
+                continue
+            c = read_state(f)["category"]
+            if not c or c not in cats:
+                continue
+            info = _info(f)
+            name = re.sub(r"\s+", " ", r2n.tr_name(info, info.get("webpage_url") or "")).strip() if info else ""
+            (found if name == c else other).add(c)
+        root = OUT / TR_DIR
+        if root.is_dir():
+            for cdir in root.iterdir():
+                if cdir.is_dir() and not cdir.name.startswith((".", "_")):
+                    cname = str(_channel_meta(cdir).get("name") or cdir.name).strip()
+                    for tf in _tr_folders(cdir):
+                        c = _hub(tf).get("category") or ""
+                        if c in cats:
+                            (found if c == cname else other).add(c)
+        ch = list(dict.fromkeys(ch + [c for c in cats if c in found and c not in other]))
+        with DATA_LOCK:
+            raw = _cats_raw(); raw.update(categories=read_cats(), channels=ch, channels_checked=True)
+            atomic_write(cats_file(), json.dumps(raw, indent=1, ensure_ascii=False))
+    except Exception as e:
+        print(f"  channel categories not worked out: {e}")
+    return ch
 
 
 def recategorize(old, new):
@@ -1428,9 +2002,11 @@ def recategorize(old, new):
         f = folder / "hub.json"
         if folder.is_dir() and f.exists() and not folder.name.startswith((".", "_")):
             s = read_state(folder)
-            if s["category"] == old:
-                s["category"] = new
-                write_state(folder, s)
+            if s["category"] == old and not s.get("_bad"):
+                try:
+                    _tr_set_category(folder, new)          # hub.json, the note's tag and Category line, its folder
+                except Exception as e:
+                    print(f"  {folder.name}: category not changed ({e})")
     root = OUT / TR_DIR                                   # transcript-only videos keep their category in hub.json too
     if root.is_dir():
         for cdir in root.iterdir():
@@ -1626,6 +2202,8 @@ def change_cats(body):
                 raise ValueError("That category already exists")
             cats[cats.index(name)] = new
             recategorize(name, new)
+            write_cats(cats, [new if c == name else c for c in channel_cats()])
+            return cats
         elif action == "delete":
             if name in cats:
                 cats.remove(name)
@@ -2505,8 +3083,12 @@ def _transcript_done(d, channels):
         note = transcript_note(folder, from_channel)
         if note.get("path"):
             JOB["log"].append(f"  Obsidian note: {note['path']}")
-            if from_channel:
-                channels.add(parts[1])
+        if from_channel:
+            channels.add(parts[1])
+            try:
+                _auto_category(folder)
+            except Exception as e:
+                JOB["log"].append(f"  category not set: {e}")
         elif note.get("error") and not JOB.get("vault_warned"):
             JOB["log"].append(f"  Obsidian: {note['error']} (no notes this run)")
             JOB["vault_warned"] = True
@@ -2522,6 +3104,10 @@ def _run_job(urls, max_shots, redo, flags, target, share, done):
     if redo:
         cmd.append("--redo")
     cmd += list(flags)
+    if not share and not redo and "--transcripts" not in flags:   # an inbox Add takes the sender's category instead
+        cmd.append("--channel-category")
+    if "--transcripts" in flags:
+        cmd += ["--prefer-lang", str(CONFIG.get("sub_lang", "en") if "sub_lang" in CONFIG else "en")]
     cookies = HERE / "cookies.txt"          # optional: login cookies next to the app (git-ignored)
     if cookies.exists():
         cmd += ["--cookies", str(cookies)]
@@ -2654,6 +3240,7 @@ class Handler(BaseHTTPRequestHandler):
             cl = CONFIG.get("cloud") or {}
             seq = CHANGED["seq"]                     # read before listing: later fill-ins count as changed
             self.send_json({"reels": list_reels() if CONFIG.get("name") else [], "categories": read_cats(),
+                            "channel_cats": channel_cats(), "tags": read_tags(),
                             "boot": BOOT, "changed_seq": seq,
                             "me": {"name": CONFIG.get("name", ""), "person": CONFIG.get("person", ""),
                                    "can_delete": can_delete(),
@@ -2769,6 +3356,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, **remove_transcripts(body)})
             elif path == "/api/transcripts/control":
                 self.send_json({"ok": True, **tr_control(str(body.get("action") or ""))})
+            elif path == "/api/transcripts/wronglang":
+                self.send_json({"ok": True, **tr_wrong_lang(body.get("channel"))})
+            elif path == "/api/transcripts/redo":
+                self.send_json({"ok": True, **tr_redo_lang(body)})
+            elif path == "/api/sortchannels":
+                self.send_json({"ok": True, **sort_by_channel(bool(body.get("dry")))})
+            elif path == "/api/notes/sortfolders":
+                self.send_json({"ok": True, **sort_notes(bool(body.get("dry")))})
+            elif path == "/api/tags":
+                self.send_json({"ok": True, "tags": change_tags(body)})
+            elif path == "/api/tags/set":
+                self.send_json({"ok": True, **set_tags(body)})
             elif path == "/api/transcripts/state":
                 self.send_json({"ok": True, **tr_set_category(body.get("channel"), body.get("id"), body.get("category"))})
             elif path == "/api/shots/capture":
@@ -2788,7 +3387,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Nothing to delete")
                 self.send_json({"ok": True, **delete_reels(ids, bool(body.get("obsidian")))})
             elif path == "/api/categories":
-                self.send_json({"ok": True, "categories": change_cats(body)})
+                self.send_json({"ok": True, "categories": change_cats(body), "channel_cats": channel_cats(), "tags": read_tags()})
             elif path == "/api/share":
                 self.send_json({"ok": True, **share_reels(body.get("ids"), str(body.get("to") or ""))})
             elif path == "/api/inbox/check":
@@ -2870,7 +3469,6 @@ PAGE = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Reels Hub</title>
-<link rel="icon" id="favicon" type="image/svg+xml" href="data:,">
 <style>
 :root{
   --bg:#0f1214; --panel:#171b1e; --panel2:#1d2226; --line:#2a3035; --text:#e6e8ea; --muted:#8b949b;
@@ -2882,9 +3480,8 @@ body{background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-syste
 button,textarea,input,select{font:inherit;color:inherit}
 [hidden]{display:none!important}
 header{display:flex;flex-wrap:wrap;align-items:center;gap:12px;row-gap:8px;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--panel)}
-header h1{display:flex;align-items:center;gap:8px;font-size:16px;margin:0;font-weight:600;letter-spacing:.2px;cursor:pointer}
+header h1{font-size:16px;margin:0;font-weight:600;letter-spacing:.2px;cursor:pointer}
 header h1:hover{color:var(--accent)}
-.logo{width:26px;height:26px;flex:none;display:block;pointer-events:none}
 header .count{color:var(--muted);font-size:13px}
 header .spacer{flex:1}
 .conn{flex:none;margin-left:auto;font-size:12px;color:var(--muted);white-space:nowrap}
@@ -2900,15 +3497,44 @@ header .spacer{flex:1}
 .ico{background:none;border:0;color:var(--muted);cursor:pointer;padding:2px 5px;border-radius:5px;font-size:13px;line-height:1}
 .ico:hover{color:var(--text);background:var(--panel2)}
 .link{background:none;border:0;color:var(--accent);cursor:pointer;padding:0;font-size:12px;text-decoration:underline}
-.layout{flex:1;display:grid;grid-template-columns:clamp(240px,var(--side-w,310px),100% - 560px) 0 minmax(0,1fr);min-height:0}
-aside{border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0;background:var(--panel)}
+.layout{flex:1;display:grid;--fpc:clamp(180px,var(--filt-w,240px),28%);--lsc:clamp(240px,var(--side-w,310px),100% - 560px);
+  grid-template-columns:var(--fpc) 0 var(--lsc) 0 minmax(0,1fr);min-height:0}
+.layout.fp-closed{--fpc:44px}
+.layout.ls-closed{--lsc:44px}
+.layout.fp-closed .split[data-split="filt"],.layout.ls-closed .split[data-split="side"]{visibility:hidden}
+/* panes fold to a rail, as in the town map: a ‹ in the title row folds, the › on the rail opens */
+.fpane{display:flex;flex-direction:column;min-height:0;background:var(--panel);border-right:1px solid var(--line);overflow:hidden}
+.phead{display:flex;align-items:center;gap:8px;padding:10px 12px 6px}
+.pttl{flex:1;font-weight:700;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.pbody{flex:1;min-height:0;overflow-y:auto;padding-bottom:12px}
+.pbtn{flex:none;width:28px;height:28px;border-radius:7px;border:1px solid var(--line);background:var(--panel2);color:var(--text);cursor:pointer;font-size:17px;line-height:1;padding:0}
+.pbtn:hover{border-color:var(--accent);color:var(--accent)}
+.prail{display:none;flex-direction:column;align-items:center;gap:12px;padding:10px 0}
+.rail-label{writing-mode:vertical-rl;transform:rotate(180deg);font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);cursor:pointer}
+.layout.fp-closed .fpane > :not(.prail),.layout.ls-closed aside > :not(.prail){display:none}
+.layout.fp-closed .fpane > .prail,.layout.ls-closed aside > .prail{display:flex}
+.fpane .listtools{padding:4px 12px 6px}
+.fpane .sortbar{flex-direction:column;gap:6px}
+.fpane .sortbar label{justify-content:space-between}
+.fpane .sortbar select{flex:0 1 150px}
+.fpane #filters{border-bottom:0}
+.flist .fdlist{max-height:none}
+.fdsep{font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;padding:8px 5px 3px;border-top:1px solid var(--line);margin-top:4px}
+.chgroup{margin-left:10px;border-left:1px solid var(--line);padding-left:4px}
+.cgroup .gname{color:var(--text)}
+.gchan{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin:22px 0 4px}
+.gsec.gsub{margin-left:14px;padding-left:12px;border-left:1px solid var(--line)}
+.fsec{display:flex;flex-direction:column;gap:5px}
+aside{border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0;background:var(--panel);overflow:hidden}
+#sidetop{flex:none;height:var(--top-h,auto);max-height:calc(100% - 140px);overflow-y:auto}
+.vsplit[data-split="top"]{flex:none;margin:0;height:9px;border-top:1px solid var(--line)}
 /* drag handles: list | video column | text, and the bar under the video (sizes in --side-w, --player-w, --video-h) */
 .split{position:relative;z-index:3;align-self:stretch;cursor:col-resize;touch-action:none;outline:none}
 .split::before{content:"";position:absolute;top:0;bottom:0;left:50%;width:2px;margin-left:-1px;transition:background .15s}
 .split::after{content:"";display:block;width:4px;height:40px;border-radius:2px;background:var(--line);transition:background .15s}
-.split[data-split="side"]{margin:0 -6px 0 -2px}
-.split[data-split="side"]::before{left:1px;margin-left:0}
-.split[data-split="side"]::after{position:absolute;top:50%;left:0;margin-top:-20px}
+:is(.split[data-split="side"],.split[data-split="filt"]){margin:0 -6px 0 -2px}
+:is(.split[data-split="side"],.split[data-split="filt"])::before{left:1px;margin-left:0}
+:is(.split[data-split="side"],.split[data-split="filt"])::after{position:absolute;top:50%;left:0;margin-top:-20px}
 .split[data-split="player"]::after{position:sticky;top:calc(50vh - 45px);margin:0 auto}
 .vsplit{position:relative;height:12px;margin:-10px 0 -8px;cursor:row-resize;touch-action:none;outline:none}
 .vsplit::before{content:"";position:absolute;left:0;right:0;top:50%;height:2px;margin-top:-1px;transition:background .15s}
@@ -2938,7 +3564,7 @@ body.resizing-y,body.resizing-y *{cursor:row-resize!important;user-select:none}
 #qlist .ql{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #qlist .ico{flex:none}
 .runbox .row{flex-wrap:wrap}
-.modebar{display:flex;gap:4px;padding:10px 12px 0}
+.modebar{display:flex;gap:4px;padding:10px 12px 0;align-items:center}
 .item.tr .tcat{color:var(--accent)}
 .group a.ico{text-decoration:none;line-height:1}
 .mode{flex:1;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:5px 8px;cursor:pointer;color:var(--muted);font-size:12px;font-weight:600;letter-spacing:.4px;text-transform:uppercase;display:flex;justify-content:center;align-items:center;gap:6px}
@@ -2969,6 +3595,23 @@ body.resizing-y,body.resizing-y *{cursor:row-resize!important;user-select:none}
 .sortbar select{flex:1;min-width:0;background:var(--panel2);border:1px solid var(--line);border-radius:7px;padding:3px 5px;font-size:12px;text-transform:none;letter-spacing:0;color:var(--text)}
 #filters{padding:0 12px 6px;display:flex;flex-direction:column;gap:5px;border-bottom:1px solid var(--line)}
 #filters:empty{display:none}
+/* scroll bars everywhere: thin, a soft grey bar on the dark background instead of the white system ones */
+*{scrollbar-width:thin;scrollbar-color:#4a5058 transparent}
+.fdrop{display:flex;flex-direction:column;gap:4px}
+.fdbtn{display:flex;align-items:center;gap:8px;width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:4px 9px;cursor:pointer;color:var(--text);font-size:12px;text-align:left}
+.fdrop.open .fdbtn{border-color:var(--accent)}
+.fdbtn .fl2{font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;flex:none}
+.fdbtn .fdv{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fdbtn .caret{color:var(--muted);flex:none}
+.fdpanel{border:1px solid var(--line);border-radius:8px;background:var(--bg);padding:6px;display:flex;flex-direction:column;gap:5px}
+.fdq{width:100%;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:4px 8px;font-size:12px;color:var(--text)}
+.fdlist{max-height:220px;overflow-y:auto;display:flex;flex-direction:column}
+.fdopt{display:flex;align-items:center;gap:7px;padding:3px 5px;border-radius:5px;cursor:pointer;font-size:12px}
+.fdopt[hidden]{display:none}
+.fdopt:hover{background:var(--panel2)}
+.fdopt input{margin:0;pointer-events:none;accent-color:var(--accent)}
+.fdopt .fdl{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fdopt .cn{font-size:10.5px;color:var(--muted)}
 .frow{display:flex;flex-wrap:wrap;gap:5px;align-items:center}
 .fl{font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;width:100%}
 .chip{display:inline-flex;align-items:center;gap:5px;font-size:12px;padding:2px 9px;border-radius:14px;border:1px solid var(--line);background:var(--panel2);cursor:pointer;color:var(--muted)}
@@ -2976,7 +3619,7 @@ body.resizing-y,body.resizing-y *{cursor:row-resize!important;user-select:none}
 .chip.on{background:#1f2c2b;border-color:var(--accent);color:var(--text)}
 .chip .cn{font-size:10.5px;opacity:.7}
 #search{flex:1;min-width:0;padding:6px 10px;background:var(--bg);border:1px solid var(--line);border-radius:8px}
-#list{overflow:auto;flex:1;padding:0 6px 12px}
+#list{overflow:auto;flex:1;min-height:120px;padding:0 6px 12px}
 .group{display:flex;align-items:center;gap:4px;padding:10px 6px 4px;margin-top:4px;border-radius:6px;user-select:none}
 .group.drop{background:#1f2c2b;outline:1px dashed var(--accent)}
 .gname{flex:1;cursor:pointer;font-size:12px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;color:var(--muted);display:flex;gap:6px;align-items:center}
@@ -3005,6 +3648,19 @@ video{width:100%;max-height:min(var(--video-h, min(68vh, calc(100vh - 330px))), 
 .meta{font-size:12px;color:var(--muted)}
 .meta a{color:var(--accent)}
 .catsel{display:flex;gap:8px;align-items:center;font-size:12px;color:var(--muted)}
+.stsort{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:4px 0 10px}
+.stsort[hidden]{display:none}
+.tagbox{display:flex;flex-wrap:wrap;gap:5px;align-items:center;font-size:12px;color:var(--muted);margin-top:6px}
+.tagbox .tl{margin-right:4px}
+.tagc{display:inline-flex;align-items:center;gap:3px;background:var(--panel2);border:1px solid var(--line);border-radius:999px;padding:1px 4px 1px 8px;color:var(--text)}
+.tagc .x{background:none;border:0;color:var(--muted);cursor:pointer;font-size:10px;padding:0 3px;line-height:1}
+.tagc .x:hover{color:var(--text)}
+.tagin{flex:1;min-width:90px;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:4px 8px;color:var(--text);font-size:12px}
+.ttg{color:var(--muted);font-size:11px}
+.fhint{font-size:12px;color:var(--muted);padding:2px 0 4px}
+.fdopt .tgtools{visibility:hidden;display:inline-flex;margin-left:4px}
+.fdopt:hover .tgtools{visibility:visible}
+.fdopt .tgtools .ico{padding:0 3px;font-size:11px}
 .catsel select{flex:1;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:5px 8px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden}
 .cardhead{display:flex;align-items:center;gap:10px;padding:8px 10px 8px 14px;border-bottom:1px solid var(--line)}
@@ -3218,10 +3874,16 @@ kbd{background:var(--panel2);border:1px solid var(--line);border-bottom-width:2p
   header > .status{display:none}
 }
 @media (max-width:900px){
-  .layout{grid-template-columns:1fr}
+  .layout,.layout.fp-closed,.layout.ls-closed{grid-template-columns:1fr}
+  .fpane{border-right:0;border-bottom:1px solid var(--line);max-height:45vh}
+  .layout.fp-closed .fpane > .prail,.layout.ls-closed aside > .prail{flex-direction:row;padding:6px 12px}
+  .rail-label{writing-mode:horizontal-tb;transform:none}
   .split{display:none}
   aside{max-height:45vh;border-right:0;border-bottom:1px solid var(--line);overflow-y:auto}
-  #list{flex:none;overflow:visible}   /* the whole column scrolls: progress and Waiting can't squeeze the list away */
+  #list{flex:none;overflow:visible;height:auto;min-height:0}
+  aside{overflow-y:auto}
+  #sidetop{height:auto;max-height:none;overflow:visible}
+  .vsplit[data-split="top"]{display:none}   /* the whole column scrolls: progress and Waiting can't squeeze the list away */
   .detail{grid-template-columns:1fr}
   .player{position:static}
   .paper{width:100%;min-height:0}
@@ -3280,7 +3942,7 @@ body:has(#bulkbar.show) #log{bottom:84px}
 </head>
 <body>
 <header>
-  <h1 id="home" title="Home: back to the start"><svg class="logo" id="logo" viewBox="0 0 64 64" aria-hidden="true" focusable="false"><rect x="4" y="4" width="56" height="56" rx="14" fill="#2a3860"/><rect x="14" y="16" width="36" height="32" rx="6" fill="none" stroke="#9db4ff" stroke-width="4"/><path d="M28 25 L40 32 L28 39 Z" fill="#f2c879"/><path d="M14 23 H22 M14 41 H22 M42 23 H50 M42 41 H50" stroke="#9db4ff" stroke-width="3" stroke-linecap="round"/></svg>Reels Hub</h1><span class="count" id="count"></span>
+  <h1 id="home" title="Home: back to the start">Reels Hub</h1><span class="count" id="count"></span>
   <span class="who" id="who" title="Whose Reels Hub this is"></span>
   <span class="spacer"></span>
   <span class="status"><kbd>&larr;</kbd> <kbd>&rarr;</kbd> switch reels</span>
@@ -3290,8 +3952,28 @@ body:has(#bulkbar.show) #log{bottom:84px}
   <button class="btn" id="showlog">Log</button>
   <span class="conn" id="conn" role="status">Connecting</span>
 </header>
-<div class="layout">
+<div class="layout" id="layout">
+  <section class="fpane" id="fpane" aria-label="Filters">
+    <div class="prail"><button class="pbtn" id="fpOpen" aria-controls="fpane" title="Show the filters">&#8250;</button><span class="rail-label">Filters</span></div>
+    <div class="phead"><span class="pttl">Filters</span><button class="pbtn" id="fpFold" aria-controls="fpane" title="Fold the filters">&#8249;</button></div>
+    <div class="pbody">
+    <div class="listtools">
+      <input id="search" placeholder="Search">
+      <button class="btn small" id="addcat">+ Category</button>
+    </div>
+    <div class="sortbar">
+      <label>Group <select id="groupby"><option value="category">Category</option><option value="source">Source</option><option value="none">None</option></select></label>
+      <label>Sort <select id="sortby" title="Newest / Oldest: by the date it was posted. Just added: by when you added it here.">
+        <option value="posted-new">Newest</option><option value="posted-old">Oldest</option>
+        <option value="added-new">Just added</option><option value="title">A-Z</option></select></label>
+    </div>
+    <div id="filters"></div>
+    </div>
+  </section>
+  <div class="split" data-split="filt" role="separator" aria-orientation="vertical" aria-label="Width of the filters" tabindex="0" title="Drag to change the width · double-click for the standard width"></div>
   <aside>
+    <div class="prail"><button class="pbtn" id="lsOpen" title="Show the list">&#8250;</button><span class="rail-label" id="lsRail">Videos</span></div>
+    <div id="sidetop">
     <div class="runbox">
       <textarea id="urls" placeholder="Paste Instagram, TikTok, YouTube or X links, one per line. Transcripts also takes YouTube channel and playlist links."></textarea>
       <div class="row">
@@ -3323,18 +4005,10 @@ body:has(#bulkbar.show) #log{bottom:84px}
     <div class="modebar" role="tablist">
       <button class="mode on" data-mode="reels" role="tab" aria-selected="true" title="Your videos">Videos</button>
       <button class="mode" data-mode="transcripts" role="tab" aria-selected="false" title="Transcript-only videos, by channel">Transcripts<span class="cn" id="trcount" hidden></span></button>
+      <button class="pbtn" id="lsFold" title="Fold the list">&#8249;</button>
     </div>
-    <div class="listtools">
-      <input id="search" placeholder="Search">
-      <button class="btn small" id="addcat">+ Category</button>
     </div>
-    <div class="sortbar">
-      <label>Group <select id="groupby"><option value="category">Category</option><option value="source">Source</option><option value="none">None</option></select></label>
-      <label>Sort <select id="sortby" title="Newest / Oldest: by the date it was posted. Just added: by when you added it here.">
-        <option value="posted-new">Newest</option><option value="posted-old">Oldest</option>
-        <option value="added-new">Just added</option><option value="title">A-Z</option></select></label>
-    </div>
-    <div id="filters"></div>
+    <div class="vsplit" data-split="top" role="separator" aria-orientation="horizontal" aria-label="Height of the tools above the list" tabindex="0" title="Drag up for a longer list (the tools above then scroll) · double-click for the standard size"></div>
     <div id="list"></div>
   </aside>
   <div class="split" data-split="side" role="separator" aria-orientation="vertical" aria-label="Width of the list" tabindex="0" title="Drag to change the width · double-click for the standard width"></div>
@@ -3344,6 +4018,7 @@ body:has(#bulkbar.show) #log{bottom:84px}
 <div id="bulkbar">
   <span id="bulkcount"></span>
   <select id="bulkcat"></select>
+  <button class="btn small" id="bulktag" title="Add a tag to every selected video">+ Tag</button>
   <button class="btn small" id="bulkall">Select all shown</button>
   <span id="bulkshare" style="display:contents"></span>
   <button class="btn small danger" id="bulkdel">Delete</button>
@@ -3385,6 +4060,10 @@ body:has(#bulkbar.show) #log{bottom:84px}
   <label class="fld">Obsidian vault <span class="meta">- optional; leave empty if you don't use Obsidian</span>
     <input id="stvault" autocomplete="off" spellcheck="false" placeholder="C:\Users\you\Documents\Obsidian Vault"></label>
   <p class="meta sthelp">Tip: in File Explorer, open the folder, click the address bar and copy the path.</p>
+  <div class="stsort" id="stsortrow"><button class="btn small" id="sortnotes" type="button">Move notes to category folders</button>
+    <span class="meta">once, for notes made before: each goes to &lt;platform&gt;\&lt;category&gt;\ (asks first; notes you filed elsewhere stay)</span></div>
+  <label class="fld">Transcript language <span class="meta">- Transcripts takes YouTube captions in this language first (e.g. en); empty: the video's own</span>
+    <input id="stlang" autocomplete="off" spellcheck="false" maxlength="12" placeholder="en"></label>
   <div class="stshare">
     <h4>Sharing with another Reels Hub <span class="meta">(optional: leave empty if you don't share)</span></h4>
     <label class="fld">Cloudflare address<input id="stcurl" autocomplete="off" spellcheck="false" placeholder="https://name.pages.dev"></label>
@@ -3460,11 +4139,34 @@ const $ = s => document.querySelector(s);
 let reels = [], cats = [], filtered = [], current = null, tab = "transcript";
 let lb = {list: [], i: 0}, wasRunning = false, dragFav = null;
 let collapsed = new Set(), vault = {ok: false, path: ""}, view = "detail", favFull = false;
+let panes = {fp: true, ls: true};            // filters pane and list pane open (localStorage rh-panes)
+try { panes = {...panes, ...JSON.parse(localStorage.getItem("rh-panes") || "{}")}; } catch (e) {}
+function applyPanes(){
+  const L = $("#layout"); if (!L) return;
+  L.classList.toggle("fp-closed", !panes.fp); L.classList.toggle("ls-closed", !panes.ls);
+  try { localStorage.setItem("rh-panes", JSON.stringify(panes)); } catch (e) {}
+}
+let chanCats = new Set();                   // categories that are channels (under one "Channels" group)
+let tags = [];                              // the tag list (a video: one category, any number of tags)
+const CH_KEY = "\u2063channels";            // the Channels group's key in the collapsed sets
+function orderCats(list){ return [...list.filter(c => !chanCats.has(c)), ...list.filter(c => chanCats.has(c))]; }
+function assemble(parts, closedSet){        // the Channels group around the channel categories, Unassigned last
+  const normal = parts.filter(p => !p.chan && !p.unas), chans = parts.filter(p => p.chan), unas = parts.filter(p => p.unas);
+  let html = normal.map(p => p.html).join("");
+  if (chans.length) {
+    const closed = closedSet.has(CH_KEY), n = chans.reduce((a, p) => a + p.n, 0);
+    html += `<div class="group cgroup ${closed ? "closed" : ""}" data-label="${CH_KEY}" data-trkey="${CH_KEY}">
+      <span class="gname" data-chtoggle><span class="caret">&#9662;</span>Channels</span>
+      <span class="gcount" title="${chans.length} channels, ${n} items">${chans.length}</span></div>`;
+    if (!closed) html += `<div class="chgroup">${chans.map(p => p.html).join("")}</div>`;
+  }
+  return html + unas.map(p => p.html).join("");
+}
 let mode = "reels";                        // "reels" (the gallery) or "transcripts" (the catalogue of transcript-only videos)
 let tr = {channels: [], items: [], current: null, shown: ""}, trCollapsed = new Set(), trTick = 0;
-let trGroupBy = "channel", tfChan = new Set(), tfCat = new Set();   // the catalogue's own grouping and filters
+let trGroupBy = "channel", tfChan = new Set(), tfCat = new Set(), tfPlat = new Set(), tfTag = new Set();   // the catalogue's own grouping and filters
 try { trCollapsed = new Set(JSON.parse(localStorage.getItem("rh-trcollapsed") || "[]")); } catch (e) {}
-try { trGroupBy = localStorage.getItem("rh-trgroupby") || trGroupBy; const f = JSON.parse(localStorage.getItem("rh-trfilters") || "{}"); tfChan = new Set(f.ch || []); tfCat = new Set(f.c || []); } catch (e) {}
+try { trGroupBy = localStorage.getItem("rh-trgroupby") || trGroupBy; const f = JSON.parse(localStorage.getItem("rh-trfilters") || "{}"); tfCat = new Set(f.c || []); tfPlat = new Set(f.p || []); tfTag = new Set(f.t || []); } catch (e) {}
 const GROUP_OPTS = {reels: [["category", "Category"], ["source", "Source"], ["none", "None"]], transcripts: [["channel", "Channel"], ["category", "Category"], ["none", "None"]]};
 function setGroupOptions(m){            // the Group menu offers Channel in Transcripts and Source in Videos
   const sel = $("#groupby");
@@ -3504,11 +4206,6 @@ function setConn(up){
   c.title = up ? `Reels Hub runs on this PC (${location.host}); only this computer can reach it`
                : "Double-click Reels Hub on the desktop, or reels-hub.bat in the app folder. This page connects again by itself.";
   if (!up) pingSoon(2000);
-}
-function setFavicon(){                     // the tab icon = the header logo (one copy of the drawing, in the page)
-  const s = $("#logo").cloneNode(true);
-  s.removeAttribute("class"); s.removeAttribute("id");
-  $("#favicon").href = "data:image/svg+xml," + encodeURIComponent(new XMLSerializer().serializeToString(s));
 }
 function pingSoon(ms){ clearTimeout(connTimer); connTimer = setTimeout(ping, ms); }
 async function ping(){                     // heartbeat: every 5 s, every 2 s while the server does not answer
@@ -3553,7 +4250,7 @@ async function loadReels(keepId, changedIds){
     if (o && !(changedIds && changedIds.has(r.id))) { r.state = o.state; if (o.notesDraft !== undefined) r.notesDraft = o.notesDraft; }
     return r;
   });
-  cats = j.categories; vault = j.vault || vault; me = j.me || me;
+  cats = j.categories; chanCats = new Set(j.channel_cats || []); tags = j.tags || tags; vault = j.vault || vault; me = j.me || me;
   if (changedSeq === null) { changedSeq = j.changed_seq || 0; bootId = j.boot; }
   else if (j.boot && j.boot !== bootId) { bootId = j.boot; changedSeq = 0; }
   applyMe();
@@ -3621,29 +4318,108 @@ window.addEventListener("pagehide", () => {    // tab closing: send pending save
 
 /* ---------- sidebar ---------- */
 /* filters: empty set = show all */
-let fPlat = new Set(), fCat = new Set();
-try { const f = JSON.parse(localStorage.getItem("rh-filters") || "{}"); fPlat = new Set(f.p || []); fCat = new Set(f.c || []); } catch (e) {}
-function saveFilters(){ try { localStorage.setItem("rh-filters", JSON.stringify({p: [...fPlat], c: [...fCat]})); } catch (e) {} }
+let fPlat = new Set(), fCat = new Set(), fTag = new Set();
+try { const f = JSON.parse(localStorage.getItem("rh-filters") || "{}"); fPlat = new Set(f.p || []); fCat = new Set(f.c || []); fTag = new Set(f.t || []); } catch (e) {}
+function saveFilters(){ try { localStorage.setItem("rh-filters", JSON.stringify({p: [...fPlat], c: [...fCat], t: [...fTag]})); } catch (e) {} }
+const tagsOf = x => (x.state ? x.state.tags : x.tags) || [];
+const hasTag = (x, t) => tagsOf(x).some(y => y.toLowerCase() === t.toLowerCase());
+function tagList(kind, attr, sel, items, platOk){
+  // the Tags section of the filters pane: ticks with counts (any ticked tag matches), rename / delete on each row
+  [...sel].forEach(t => tags.includes(t) || sel.delete(t));
+  const opts = tags.map(t => ({val: t, label: t, html: "#" + esc(t), tools: `<span class="tgtools"><button class="ico" data-tagren="${esc(t)}" title="Rename this tag">&#9998;</button><button class="ico" data-tagdel="${esc(t)}" title="Delete this tag (taken off every video)">&#10005;</button></span>`,
+    n: items.filter(x => hasTag(x, t) && platOk(x)).length}));
+  return (tags.length ? flist(kind, "Tags", attr, opts, sel) : `<div class="fsec"><span class="fl">Tags</span><div class="fhint">No tags yet: add one on a video (Tags, under Category).</div></div>`)
+    + `<div class="frow"><button class="link" data-tagnew>+ New tag</button></div>`;
+}
+function tagBox(list, id){
+  const have = new Set(list.map(t => t.toLowerCase()));
+  const opts = [...tags, ...cats.filter(c => !tags.some(t => t.toLowerCase() === c.toLowerCase()))].filter(t => !have.has(t.toLowerCase()));
+  return `<div class="tagbox" id="${id}"><span class="tl">Tags</span>${list.map(t => `<span class="tagc">#${esc(t)}<button class="x" data-untag="${esc(t)}" title="Take this tag off">&#10005;</button></span>`).join("")}<input class="tagin" data-tagin="${id}" list="${id}-dl" placeholder="+ tag" autocomplete="off" maxlength="60" title="Type a tag (new or existing) and press Enter"><datalist id="${id}-dl">${opts.map(t => `<option value="${esc(t)}"></option>`).join("")}</datalist></div>`;
+}
+const tagTarget = id => id === "rtags" ? (current && {reel: current.id}) : (tr.current && (tr.current.reel && reels.some(r => r.id === tr.current.reel) ? {reel: tr.current.reel} : {ch: tr.current.ch, id: tr.current.id}));
+const targetTags = t => t.reel ? ((reels.find(r => r.id === t.reel) || {state: {}}).state.tags || []) : ((tr.items.find(x => x.ch === t.ch && x.id === t.id) || {}).tags || []);
+async function saveTags(t, list, quiet){
+  const body = t.reel ? {id: t.reel, tags: list} : {channel: t.ch, id: t.id, tags: list};
+  let j; try { j = await api("/api/tags/set", body); } catch (e) { if (!quiet) alert(e.message); return false; }
+  tags = j.all;
+  if (t.reel) { const r = reels.find(x => x.id === t.reel); if (r) r.state.tags = j.tags; tr.items.forEach(it => { if (it.reel === t.reel) it.tags = j.tags; }); }
+  else { const it = tr.items.find(x => x.ch === t.ch && x.id === t.id); if (it) it.tags = j.tags; }
+  if (!quiet) redrawTags();
+  return true;
+}
+function redrawTags(focus){
+  renderList();
+  if (current && $("#rtags")) $("#rtags").outerHTML = tagBox(current.state.tags || [], "rtags");
+  if (tr.current && $("#ttags")) $("#ttags").outerHTML = tagBox(tr.current.tags || [], "ttags");
+  const i = focus && document.querySelector(`[data-tagin="${focus}"]`); if (i) i.focus();
+}
+async function sortNotes(){
+  let j; try { j = await api("/api/notes/sortfolders", {dry: true}); } catch (e) { return alert(e.message); }
+  if (!j.count) return alert(`Nothing to move: every note is already in its category folder${j.yours ? ` (${j.yours} you filed yourself stay where they are)` : ""}${j.clashes ? `; ${j.clashes} not moved because a note of the same name is already there` : ""}.`);
+  $("#setup").classList.remove("show");          // the confirm dialog would sit under Settings
+  const a = await askConfirm(`Move ${j.count} note${j.count === 1 ? "" : "s"} to category folders?`,
+    `Each goes to <platform>\\<category>\\ in your vault (Unassigned: the platform folder); the file names stay. For example:\n${j.examples.join("\n")}${j.count > j.examples.length ? "\n..." : ""}`
+    + (j.yours ? `\n\n${j.yours} note${j.yours === 1 ? "" : "s"} you filed in your own folders stay where they are.` : "")
+    + (j.clashes ? `\n${j.clashes} not moved: a note of the same name is already in the target folder.` : ""), null, "Move");
+  if (!a.ok) return;
+  try { j = await api("/api/notes/sortfolders", {}); } catch (e) { return alert(e.message); }
+  toast(`Moved ${j.count} note${j.count === 1 ? "" : "s"}`);
+  loadReels(current && current.id).catch(() => {}); loadTr().catch(() => {});
+}
+async function tagAction(body){
+  let r; try { r = await api("/api/tags", body); } catch (e) { return alert(e.message); }
+  tags = r.tags;
+  const fix = l => l && (body.action === "rename" ? l.map(t => t === body.name ? body.new : t) : l.filter(t => t !== body.name));
+  if (body.action !== "add") {
+    reels.forEach(x => { x.state.tags = fix(x.state.tags); }); tr.items.forEach(x => { x.tags = fix(x.tags); });
+    for (const set of [fTag, tfTag]) if (set.delete(body.name) && body.action === "rename") set.add(body.new);
+    saveFilters(); saveTrFilters();
+  }
+  redrawTags();
+}
 const catShown = name => !fCat.size || fCat.has(name);
+let openDrop = "", dropQ = {};              // which filter drop-down is open, and its search text
+function flist(kind, label, attr, opts, sel){
+  // the pane has room: the whole list with ticks and counts, a find box when it is long
+  const q = (dropQ[kind] || "").toLowerCase();
+  return `<div class="fsec"><span class="fl">${label}${sel.size ? ` · <button class="link" data-fdclear="${kind}">show all</button>` : ""}</span>
+    <div class="fdpanel flist">${opts.length > 8 ? `<input class="fdq" data-fdq="${kind}" autocomplete="off" placeholder="Find ${label.toLowerCase()}" value="${esc(dropQ[kind] || "")}">` : ""}
+      <div class="fdlist">${opts.map((o, i) => (o.chan && !(opts[i - 1] || {}).chan ? `<div class="fdsep">Channels</div>` : "") + `<div class="fdopt" ${q && !o.label.toLowerCase().includes(q) ? "hidden" : ""} ${attr}="${esc(o.val)}"><input type="checkbox" ${sel.has(o.val) ? "checked" : ""} tabindex="-1"><span class="fdl">${o.html || esc(o.label)}</span><span class="cn">${o.n}</span>${o.tools || ""}</div>`).join("")}</div></div></div>`;
+}
+function fdrop(kind, label, attr, opts, sel){
+  // a compact multi-select: "Category: All" / "Category: 2 selected", a search box and a scrolling list of ticks
+  const chosen = opts.filter(o => sel.has(o.val));
+  const txt = !chosen.length ? "All" : chosen.length === 1 ? chosen[0].label : `${chosen.length} selected`;
+  const open = openDrop === kind, q = (dropQ[kind] || "").toLowerCase();
+  return `<div class="fdrop ${open ? "open" : ""}" data-fdrop="${kind}">
+    <button class="fdbtn" data-fdtoggle="${kind}" title="${esc(chosen.map(o => o.label).join(", ") || "All")}"><span class="fl2">${label}</span><span class="fdv">${esc(txt)}</span><span class="caret">&#9662;</span></button>
+    ${open ? `<div class="fdpanel"><input class="fdq" data-fdq="${kind}" placeholder="Find ${label.toLowerCase()}" value="${esc(dropQ[kind] || "")}">
+      <div class="fdlist">${opts.map(o => `<div class="fdopt" ${q && !o.label.toLowerCase().includes(q) ? "hidden" : ""} ${attr}="${esc(o.val)}"><input type="checkbox" ${sel.has(o.val) ? "checked" : ""} tabindex="-1"><span class="fdl">${o.html || esc(o.label)}</span><span class="cn">${o.n}</span></div>`).join("")}</div>
+      ${sel.size ? `<button class="link" data-fdclear="${kind}">Show all</button>` : ""}</div>` : ""}
+  </div>`;
+}
 function renderFilters(){
   const plats = [...new Set(reels.map(r => r.platform))].sort();
   [...fPlat].forEach(p => plats.includes(p) || fPlat.delete(p));
   [...fCat].forEach(c => (c === "" || cats.includes(c)) || fCat.delete(c));
   const count = (pred) => reels.filter(pred).length;
   const chip = (attr, val, label, on, n, extra="") => `<button class="chip ${on?"on":""}" ${attr}="${esc(val)}" ${extra}>${label}<span class="cn">${n}</span></button>`;
-  const active = fPlat.size + fCat.size;
+  [...fTag].forEach(t => tags.includes(t) || fTag.delete(t));
+  const active = fPlat.size + fCat.size + fTag.size;
   $("#filters").innerHTML = (plats.length > 1 || fPlat.size ? `<div class="frow"><span class="fl">Source</span>${plats.map(p =>
       chip("data-fplat", p, pbadge({platform: p}) + " " + esc(p), fPlat.has(p), count(r => r.platform === p))).join("")}</div>` : "")
-    + `<div class="frow"><span class="fl">Category</span>${[...cats, ""].map(c =>
-      chip("data-fcat", c, c ? esc(c) : "Unassigned", fCat.has(c), count(r => catOf(r) === c))).join("")}</div>`
+    + flist("cat", "Category", "data-fcat", [...orderCats(cats).filter(c => !chanCats.has(c)), "", ...orderCats(cats).filter(c => chanCats.has(c))].map(c => ({val: c, label: c || "Unassigned", chan: chanCats.has(c), n: count(r => catOf(r) === c && (!fPlat.size || fPlat.has(r.platform)))}))
+        .filter(o => !fPlat.size || o.n || fCat.has(o.val)), fCat)
+    + tagList("tag", "data-ftag", fTag, reels, r => !fPlat.size || fPlat.has(r.platform))
     + (active ? `<div class="frow"><button class="link" id="fclear">Clear filters (${active})</button></div>` : "");
 }
 
 function matches(r, q){
   if (fPlat.size && !fPlat.has(r.platform)) return false;
   if (fCat.size && !fCat.has(catOf(r))) return false;
+  if (fTag.size && ![...fTag].some(t => hasTag(r, t))) return false;
   if (!q) return true;
-  return [r.label, r.platform, r.caption, r.author, r.notes, fromName(r), ...r.transcript.map(x=>x.text), ...r.ocr.map(x=>x.text),
+  return [r.label, r.platform, r.caption, r.author, r.notes, fromName(r), ...tagsOf(r), ...r.transcript.map(x=>x.text), ...r.ocr.map(x=>x.text),
           ...r.state.favorites.map(f=>f.text)].join(" ").toLowerCase().includes(q);
 }
 let groupBy = "category", sortBy = "posted-new", shown = [];
@@ -3663,40 +4439,43 @@ function groupsFor(){
     return [...new Set(reels.map(r => r.platform))].sort().map(p => ({key: "src:" + p, label: p, kind: "source", test: r => r.platform === p}));
   }
   if (groupBy === "none") return [{key: "all", label: "All reels", kind: "none", test: () => true}];
-  return [...cats.map(c => ({key: c, label: c, cat: c, kind: "cat", test: r => catOf(r) === c})),
-          {key: "", label: "Unassigned", cat: "", kind: "cat", test: r => catOf(r) === ""}];
+  return [...orderCats(cats).map(c => ({key: c, label: c, cat: c, kind: "cat", chan: chanCats.has(c), test: r => catOf(r) === c})),
+          {key: "", label: "Unassigned", cat: "", kind: "cat", unas: true, test: r => catOf(r) === ""}];
 }
 function renderList(){
   if (mode === "transcripts") return renderTrList();      // the list shows the catalogue; reels keep their state
   const q = $("#search").value.trim().toLowerCase();
   const groups = groupsFor();
   filtered = []; shown = [];
-  let html = "";
+  const parts = [];
   renderFilters();
   groups.forEach((g, gi) => {
     if (g.kind === "cat" && !catShown(g.cat)) return;
     const items = sortReels(reels.filter(r => g.test(r) && matches(r, q)));
     filtered.push(...items);
-    if (!collapsed.has(g.label)) shown.push(...items);
-    if (g.kind === "cat" && !g.cat && !items.length && cats.length && (q || fPlat.size)) return;
+    if (!collapsed.has(g.label) && !(g.chan && collapsed.has(CH_KEY))) shown.push(...items);
+    if (g.kind === "cat" && !items.length && (q || fPlat.size || fTag.size)) return;     // filtering: empty categories are left out
     if (g.kind === "source" && !items.length) return;
     const closed = collapsed.has(g.label);
     const name = g.cat || "";
-    html += `<div class="group ${closed?"closed":""}" ${g.kind === "cat" ? `data-cat="${esc(g.cat)}"` : ""} data-label="${esc(g.label)}">
+    let html = `<div class="group ${closed?"closed":""}" ${g.kind === "cat" ? `data-cat="${esc(g.cat)}"` : ""} data-label="${esc(g.label)}">
       <span class="gname" data-toggle><span class="caret">&#9662;</span>${g.kind === "source" ? pbadge({platform: g.label}) + " " : ""}${esc(g.label)}</span>
       <span class="gcount">${items.length}</span>
       ${name ? `<button class="ico" data-catmove="-1" title="Move up" ${gi===0?"disabled":""}>&#8593;</button>
                   <button class="ico" data-catmove="1" title="Move down" ${gi===cats.length-1?"disabled":""}>&#8595;</button>
                   <button class="ico" data-rename title="Rename">&#9998;</button>
                   <button class="ico" data-delcat title="Delete category">&#10005;</button>` : ""}
+      ${g.kind === "cat" && !g.cat && items.length ? `<button class="btn small" data-sortch title="Put each unassigned video in a category named after its channel or creator">Sort by channel</button>` : ""}
     </div>`;
     if (!closed) html += items.length ? items.map(r => `
       <div class="item ${current && current.id===r.id?"active":""} ${selected.has(r.id)?"sel":""}" data-id="${esc(r.id)}" draggable="true">
         ${r.shots[0] ? `<img loading="lazy" src="${shotUrl(r, r.shots[0])}" alt="">` : `<img alt="">`}
         <div><div class="t">${esc(r.label)}</div>
-        <div class="s">${pbadge(r)}${vtag(r)} ${esc(r.author)} · ${esc(r.date)}${r.state.favorites.length?` · <span class="fc">&#9733; ${r.state.favorites.length}</span>`:""}${fromBadge(r)}</div></div>
+        <div class="s">${pbadge(r)}${vtag(r)} ${esc(r.author)} · ${esc(r.date)}${r.state.favorites.length?` · <span class="fc">&#9733; ${r.state.favorites.length}</span>`:""}${fromBadge(r)}${tagsOf(r).length ? ` · <span class="ttg">${tagsOf(r).map(t => "#" + esc(t)).join(" ")}</span>` : ""}</div></div>
       </div>`).join("") : `<div class="gempty">${name ? "Drag reels here or pick this category on a reel" : "Nothing here"}</div>`;
+    parts.push({html, chan: !!g.chan, unas: !!g.unas, n: items.length});
   });
+  const html = assemble(parts, collapsed);
   $("#list").innerHTML = html || `<div class="empty">No matches</div>`;
   if (view === "gallery") renderGallery();
 }
@@ -3757,6 +4536,7 @@ function goHome(){
   if (favFull) toggleFull(false);
   clearSel();
   if (mode === "transcripts") setMode("reels");
+  panes.ls = true; applyPanes();
   view = "detail"; try { localStorage.setItem("rh-view", view); } catch (e) {} $("#viewbtn").classList.remove("on");
   history.replaceState(null, "", location.pathname);
   $("#list").scrollTop = 0; document.querySelector("aside").scrollTop = 0;   // below 900 px the whole column scrolls
@@ -3942,11 +4722,13 @@ function renderGallery(){
   const q = $("#search").value.trim().toLowerCase();
   const groups = groupsFor();
   let html = "";
+  let chHead = false;
   for (const g of groups) {
     if (g.kind === "cat" && !catShown(g.cat)) continue;
     const items = sortReels(reels.filter(r => g.test(r) && matches(r, q)));
-    if (g.kind !== "cat" && !items.length) continue;
-    html += `<section class="gsec" ${g.kind === "cat" ? `data-cat="${esc(g.cat)}"` : ""}><h3>${g.kind === "source" ? pbadge({platform: g.label}) + " " : ""}${esc(g.label)} <span class="gcount">${items.length}</span></h3>
+    if (!items.length && (g.kind !== "cat" || q || fPlat.size)) continue;
+    if (g.chan && !chHead) { chHead = true; html += `<h2 class="gchan">Channels</h2>`; }
+    html += `<section class="gsec ${g.chan ? "gsub" : ""}" ${g.kind === "cat" ? `data-cat="${esc(g.cat)}"` : ""}><h3>${g.kind === "source" ? pbadge({platform: g.label}) + " " : ""}${esc(g.label)} <span class="gcount">${items.length}</span></h3>
       <div class="ggrid">${items.length ? items.map(r => `
         <div class="gcard ${current && current.id===r.id?"active":""} ${selected.has(r.id)?"sel":""}" data-open="${esc(r.id)}" tabindex="0" draggable="true">
           <span class="tick">&#10003;</span>
@@ -3983,7 +4765,7 @@ function setCategory(r, cat){
 }
 
 async function catAction(body){
-  try { cats = (await api("/api/categories", body)).categories; }
+  try { const r = await api("/api/categories", body); cats = r.categories; chanCats = new Set(r.channel_cats || []); tags = r.tags || tags; }
   catch (e) { return alert(e.message); }
   if (body.action === "rename") reels.forEach(r => { if (r.state.category === body.name) r.state.category = body.new; });
   if (body.action === "rename" && fCat.delete(body.name)) { fCat.add(body.new); saveFilters(); }
@@ -4025,6 +4807,7 @@ function render(r){
         <span class="pos" id="slpos">Slide 1 / ${r.slides.length}</span>
         <button class="btn" id="slnext" title="Next slide (.)">Slide &#9654;</button></div>` : ""}
       <label class="catsel">Category ${catSelect(r)}</label>
+      ${tagBox(r.state.tags || [], "rtags")}
       <div class="rowbtns">${shareTargets().map(p => `<button class="btn small" data-share="${esc(p.person)}" ${r.url ? "" : "disabled"} title="${r.url ? `Send the link, your favorites (times, text, edited images), notes and category to ${esc(p.name)}'s Reels Hub` : "This reel has no source link"}">&#8599; Share with ${esc(p.name)}</button>`).join("")}
         <button class="btn small" id="redo" title="Transcribe and take snapshots again, replacing this version">&#8635; Re-process</button>
         <button class="btn small" id="newver" title="Process the video again as a separate copy; this version and its favorites stay">+ New version</button>
@@ -4413,8 +5196,10 @@ function move(d){
 /* ---------- resizable panels: drag the edge between list, video and text, or the bar under the video ---------- */
 const SPLIT = {                      // handle -> CSS variable on <html>, direction, smallest size in px
   side:   {v: "--side-w",   x: true,  min: 240},
+  filt:   {v: "--filt-w",   x: true,  min: 180},
   player: {v: "--player-w", x: true,  min: 240},
-  video:  {v: "--video-h",  x: false, min: 180}
+  video:  {v: "--video-h",  x: false, min: 180},
+  top:    {v: "--top-h",    x: false, min: 60}
 };
 let panelPx = {}, splitDrag = null;
 try { panelPx = JSON.parse(localStorage.getItem("rh-panels") || "{}"); } catch (e) {}
@@ -4427,13 +5212,15 @@ function savePanels(){ try { localStorage.setItem("rh-panels", JSON.stringify(pa
 Object.keys(panelPx).forEach(n => { if (!SPLIT[n]) delete panelPx[n]; });
 Object.keys(SPLIT).forEach(n => setPanel(n, panelPx[n]));
 function panelBox(name){             // the element a handle resizes and the most room it may take (same limits as the CSS)
-  if (name === "side") return {el: $("aside"), max: $(".layout").clientWidth - 560};
+  if (name === "side") return {el: $("aside"), max: $(".layout").clientWidth - 560 - $("#fpane").offsetWidth};
+  if (name === "filt") return {el: $("#fpane"), max: Math.min(480, $(".layout").clientWidth - 560 - $("aside").offsetWidth)};
   if (name === "player") {
     const d = $(".detail"); if (!d) return null;
     const s = getComputedStyle(d);
     return {el: $(".player"), max: d.clientWidth - parseFloat(s.paddingLeft) - parseFloat(s.paddingRight) - 296};
   }
   if (name === "video") return $("#vid") ? {el: $("#vid"), max: innerHeight - 120} : null;
+  if (name === "top") return {el: $("#sidetop"), max: $("aside").clientHeight - 150};
   return null;
 }
 function resizePanel(name, px, box){ const m = SPLIT[name].min; setPanel(name, Math.max(m, Math.min(Math.max(m, box.max), px))); }
@@ -4477,15 +5264,44 @@ document.addEventListener("click", async e => {
   const t = e.target, c = sel => t.closest(sel);
   let el;
   if ((el = c("[data-seek]"))) { e.preventDefault(); e.stopPropagation(); return seekTo(+el.dataset.seek); }
+  if ((el = c("[data-fdtoggle]"))) { openDrop = openDrop === el.dataset.fdtoggle ? "" : el.dataset.fdtoggle; renderList();
+    const qi = openDrop && document.querySelector(`[data-fdq="${openDrop}"]`); if (qi) qi.focus(); return; }
+  if ((el = c("[data-fdclear]"))) { const k = el.dataset.fdclear;
+    if (k === "cat") { fCat.clear(); saveFilters(); } else if (k === "tcat") { tfCat.clear(); saveTrFilters(); } else if (k === "tag") { fTag.clear(); saveFilters(); } else if (k === "ttag") { tfTag.clear(); saveTrFilters(); } else { tfChan.clear(); saveTrFilters(); }
+    return renderList(); }
+  if (c(".fdq")) return;
+  if (openDrop && !c(".fdrop")) { openDrop = ""; renderList(); }
+  if (c("#fpOpen") || (c(".fpane .rail-label"))) { panes.fp = true; return applyPanes(); }
+  if (c("#fpFold")) { panes.fp = false; return applyPanes(); }
+  if (c("#lsOpen") || c("#lsRail")) { panes.ls = true; return applyPanes(); }
+  if (c("#lsFold")) { panes.ls = false; return applyPanes(); }
+  if (c("[data-chtoggle]")) { const set = mode === "transcripts" ? trCollapsed : collapsed; set.has(CH_KEY) ? set.delete(CH_KEY) : set.add(CH_KEY);
+    try { localStorage.setItem("rh-collapsed", JSON.stringify([...collapsed])); localStorage.setItem("rh-trcollapsed", JSON.stringify([...trCollapsed])); } catch (err) {}
+    return renderList(); }
+  if ((el = c("[data-tagren]"))) { const old = el.dataset.tagren; const n = prompt("Rename tag", old); if (n && n.trim() && n.trim() !== old) tagAction({action: "rename", name: old, new: n.trim()}); return; }
+  if ((el = c("[data-tagdel]"))) { const name = el.dataset.tagdel, n = reels.filter(r => hasTag(r, name)).length + tr.items.filter(it => !it.reel && hasTag(it, name)).length;
+    if (confirm(`Delete the tag #${name}? It is taken off ${n} video${n === 1 ? "" : "s"} and their notes.`)) tagAction({action: "delete", name}); return; }
+  if (c("[data-tagnew]")) { const n = prompt("New tag (e.g. Kettlebell)"); if (n && n.trim()) tagAction({action: "add", name: n.trim()}); return; }
+  if ((el = c("[data-untag]"))) { const box = el.closest(".tagbox"), t = tagTarget(box.id); if (t) saveTags(t, targetTags(t).filter(x => x !== el.dataset.untag)); return; }
+  if ((el = c("[data-ftag]"))) { const v = el.dataset.ftag; fTag.has(v) ? fTag.delete(v) : fTag.add(v); saveFilters(); return renderList(); }
+  if ((el = c("[data-tftag]"))) { const v = el.dataset.tftag; tfTag.has(v) ? tfTag.delete(v) : tfTag.add(v); saveTrFilters(); return renderTrList(); }
+  if (t.id === "sortnotes") return sortNotes();
+  if (t.id === "bulktag") { const n = prompt(`Tag to add to the ${selected.size} selected video${selected.size === 1 ? "" : "s"}`); if (!n || !n.trim()) return;
+    (async () => { for (const id of [...selected]) { const r = reels.find(x => x.id === id); if (r && !hasTag(r, n.trim())) await saveTags({reel: id}, [...(r.state.tags || []), n.trim()], true); } redrawTags(); })(); return; }
   if ((el = c("[data-mode]"))) return setMode(el.dataset.mode);
-  if ((el = c("[data-tid]"))) { const [ch, id] = splitTid(el.dataset.tid); return selectTr(ch, id, false); }
+  if ((el = c("[data-tid]"))) { const [ch, id] = splitTid(el.dataset.tid); const it = tr.items.find(x => x.ch === ch && x.id === id);
+    if (it && it.reel && reels.some(r => r.id === it.reel)) { tr.current = it; setMode("reels"); return select(it.reel); }   // a downloaded video: open it (remembered for the way back)
+    return selectTr(ch, id, false); }
   if ((el = c("[data-trtoggle]"))) { const k = el.closest(".group").dataset.trkey; trCollapsed.has(k) ? trCollapsed.delete(k) : trCollapsed.add(k);
     try { localStorage.setItem("rh-trcollapsed", JSON.stringify([...trCollapsed])); } catch (err) {} return renderTrList(); }
   if ((el = c("[data-tfchan]"))) { const v = el.dataset.tfchan; tfChan.has(v) ? tfChan.delete(v) : tfChan.add(v); saveTrFilters(); return renderTrList(); }
+  if ((el = c("[data-tfplat]"))) { const v = el.dataset.tfplat; tfPlat.has(v) ? tfPlat.delete(v) : tfPlat.add(v); saveTrFilters(); return renderTrList(); }
   if ((el = c("[data-tfcat]"))) { const v = el.dataset.tfcat; tfCat.has(v) ? tfCat.delete(v) : tfCat.add(v); saveTrFilters(); return renderTrList(); }
-  if (t.id === "tfclear") { tfChan.clear(); tfCat.clear(); saveTrFilters(); return renderTrList(); }
+  if (t.id === "tfclear") { tfChan.clear(); tfCat.clear(); tfPlat.clear(); tfTag.clear(); saveTrFilters(); return renderTrList(); }
   if ((el = c("[data-trrm]"))) return trRemoveChannel(el.dataset.trrm);
   if ((el = c("[data-trresume]"))) return trResume(el.dataset.trresume);
+  if ((el = c("[data-trredo]"))) return trRedo(el.dataset.trredo);
+  if (c("[data-sortch]")) return sortByChannel();
   if ((el = c("[data-ttab]"))) { document.querySelectorAll("[data-ttab]").forEach(x => x.classList.toggle("active", x === el));
     document.querySelectorAll("[data-tpane]").forEach(x => x.classList.toggle("active", x.dataset.tpane === el.dataset.ttab)); return; }
   if (c("#inboxbtn")) return openInbox();
@@ -4500,7 +5316,7 @@ document.addEventListener("click", async e => {
   if ((el = c("[data-open]"))) { if (e.ctrlKey || e.metaKey || e.shiftKey) { e.preventDefault(); return pick(el.dataset.open, e); } clearSel(); return select(el.dataset.open); }
   if ((el = c("[data-fplat]"))) { const v = el.dataset.fplat; fPlat.has(v) ? fPlat.delete(v) : fPlat.add(v); saveFilters(); return renderList(); }
   if ((el = c("[data-fcat]"))) { const v = el.dataset.fcat; fCat.has(v) ? fCat.delete(v) : fCat.add(v); saveFilters(); return renderList(); }
-  if (t.id === "fclear") { fPlat.clear(); fCat.clear(); saveFilters(); return renderList(); }
+  if (t.id === "fclear") { fPlat.clear(); fCat.clear(); fTag.clear(); saveFilters(); return renderList(); }
   if ((el = c("[data-mv]"))) { const [i, d] = el.dataset.mv.split(":").map(Number), favs = current.state.favorites, j = i + d;
     if (j >= 0 && j < favs.length) { favs.splice(j, 0, favs.splice(i, 1)[0]); saveState(current, true); renderFavs(current);
       const card = document.querySelector(`.fav[data-i="${j}"]`); card && card.scrollIntoView({block:"nearest", inline:"nearest"}); } return; }
@@ -4609,6 +5425,11 @@ document.addEventListener("click", async e => {
 
 document.addEventListener("input", e => {
   if (e.target.id === "notes" && current) { $("#saved").hidden = true; return notesChanged(current, e.target.value); }
+  if (e.target.classList && e.target.classList.contains("fdq")) {     // filter the drop-down's list without redrawing it
+    const k = e.target.dataset.fdq, q = e.target.value.toLowerCase(); dropQ[k] = e.target.value;
+    e.target.closest(".fdpanel").querySelectorAll(".fdopt").forEach(o => o.hidden = !!q && !o.querySelector(".fdl").textContent.toLowerCase().includes(q));
+    return;
+  }
   if (e.target.id === "search") return renderList();   // in Transcripts: the catalogue (renderList hands over)
   if (e.target.classList.contains("favtext")) {
     const f = current.state.favorites[+e.target.dataset.i];
@@ -4638,6 +5459,11 @@ document.addEventListener("change", async e => {
       await catAction({action: "add", name: n.trim()}); if (!cats.includes(n.trim())) return refreshSel(); cat = n.trim();
     } else cat = v.slice(4);
     moveReels([...selected], cat); return clearSel();
+  }
+  if (e.target.matches && e.target.matches("[data-tagin]")) {
+    const v = e.target.value.replace(/#/g, "").trim(), box = e.target.dataset.tagin, t = tagTarget(box); e.target.value = "";
+    if (v && t && !targetTags(t).some(x => x.toLowerCase() === v.toLowerCase())) saveTags(t, [...targetTags(t), v]).then(() => redrawTags(box));
+    return;
   }
   if (e.target.id === "catsel") setCategory(current, e.target.value);
   if (e.target.id === "trcat" && tr.current) trSetCategory(tr.current, e.target.value);
@@ -4707,6 +5533,7 @@ document.addEventListener("drop", e => {
 
 document.addEventListener("keydown", e => {
   if (ed) return edKey(e);
+  if (openDrop && e.key === "Escape") { e.preventDefault(); openDrop = ""; return renderList(); }
   if ($("#setup").classList.contains("show")) {
     if (e.key === "Enter" && document.activeElement && document.activeElement.closest("#setup") && document.activeElement.tagName === "INPUT") { e.preventDefault(); saveSetup(); }
     if (e.key === "Escape" && !setupFirst) $("#setup").classList.remove("show");
@@ -4917,17 +5744,19 @@ function showProgress(s){
 
 /* ---------- transcripts: the catalogue of transcript-only videos (by channel) ---------- */
 const splitTid = s => { const i = s.indexOf("/"); return [s.slice(0, i), s.slice(i + 1)]; };
-const srcBadge = it => /whisper/i.test(it.source) ? `<span class="srcb w" title="Transcribed with Whisper (no captions on the site)">W</span>`
+const srcBadge = it => it.source === "video" ? `<span class="srcb w" title="From the downloaded video (Whisper)">VID</span>`
+  : /whisper/i.test(it.source) ? `<span class="srcb w" title="Transcribed with Whisper (no captions on the site)">W</span>`
   : /automatic/i.test(it.source) ? `<span class="srcb" title="The site's automatic captions">AUTO</span>`
   : /caption/i.test(it.source) ? `<span class="srcb cc" title="The site's captions (the creator's on YouTube)">CC</span>` : "";
 const SITE = {youtube: "YouTube", tiktok: "TikTok", instagram: "Instagram", x: "X"};
-const srcText = it => { const s = String(it.source || ""); if (/whisper/i.test(s)) return "Whisper (no captions on " + (SITE[(it.platform || "").toLowerCase()] || it.platform || "the site") + ")";
+const srcText = it => { const s = String(it.source || ""); if (s === "video") return "From the downloaded video (Whisper)"; if (/whisper/i.test(s)) return "Whisper (no captions on " + (SITE[(it.platform || "").toLowerCase()] || it.platform || "the site") + ")";
   const site = SITE[s.split(" ")[0]] || s.split(" ")[0]; return s ? `${site} captions${/automatic/i.test(s) ? " (automatic)" : site === "YouTube" ? " (the creator's)" : ""}` : ""; };
 const atTime = (url, t) => /youtube\.com|youtu\.be/.test(url || "") ? url.replace(/([?&])t=\d+s?&?/, "$1").replace(/[?&]$/, "") + (url.includes("?") ? "&" : "?") + `t=${Math.floor(t)}s` : url;
 function setMode(m){
-  mode = m; try { localStorage.setItem("rh-mode", m); } catch (e) {}
+  mode = m; openDrop = ""; try { localStorage.setItem("rh-mode", m); } catch (e) {}
   const trm = m === "transcripts";
   document.querySelectorAll(".mode").forEach(b => { const on = b.dataset.mode === m; b.classList.toggle("on", on); b.setAttribute("aria-selected", on); });
+  $("#lsRail").textContent = trm ? "Transcripts" : "Videos";
   document.querySelector("aside").classList.toggle("trmode", trm);
   setGroupOptions(m);
   $("#search").placeholder = trm ? "Search transcripts" : "Search";
@@ -4936,6 +5765,8 @@ function setMode(m){
 }
 async function loadTr(){
   const j = await api("/api/transcripts");
+  if (j.channel_cats) chanCats = new Set(j.channel_cats);
+  if (j.tags) tags = j.tags;
   tr.channels = j.channels || []; tr.items = (j.items || []).map(it => ({...it, label: it.title, version: 1}));
   const n = tr.items.length; $("#trcount").textContent = n; $("#trcount").hidden = !n;
   if (tr.current) tr.current = tr.items.find(it => it.ch === tr.current.ch && it.id === tr.current.id) || null;
@@ -4946,52 +5777,59 @@ async function loadTr(){
 }
 const trCatOf = it => cats.includes(it.category) ? it.category : "";
 const chanName = key => { const c = tr.channels.find(x => x.key === key); return c ? c.name : key; };
-function saveTrFilters(){ try { localStorage.setItem("rh-trfilters", JSON.stringify({ch: [...tfChan], c: [...tfCat]})); } catch (e) {} }
+function saveTrFilters(){ try { localStorage.setItem("rh-trfilters", JSON.stringify({c: [...tfCat], p: [...tfPlat], t: [...tfTag]})); } catch (e) {} }
 function trMatches(it, q){
   if (tfChan.size && !tfChan.has(it.ch)) return false;
+  if (tfPlat.size && !tfPlat.has(it.platform)) return false;
   if (tfCat.size && !tfCat.has(trCatOf(it))) return false;
+  if (tfTag.size && ![...tfTag].some(t => hasTag(it, t))) return false;
   if (!q) return true;
   const ch = tr.channels.find(c => c.key === it.ch);
-  return `${it.title} ${it.author} ${it.date} ${ch ? ch.name + " " + ch.handle : ""} ${it.category}`.toLowerCase().includes(q);
+  return `${it.title} ${it.author} ${it.date} ${ch ? ch.name + " " + ch.handle : ""} ${it.category} ${tagsOf(it).join(" ")}`.toLowerCase().includes(q);
 }
 function renderTrFilters(){
-  [...tfChan].forEach(k => tr.channels.some(c => c.key === k) || tfChan.delete(k));
+  // Source chips as under Videos; the channels are in the category list (under Channels), so no separate Channel list
+  tfChan.clear();
+  const plats = [...new Set(tr.items.map(it => it.platform))].sort();
+  [...tfPlat].forEach(p => plats.includes(p) || tfPlat.delete(p));
   [...tfCat].forEach(c => (c === "" || cats.includes(c)) || tfCat.delete(c));
   const count = pred => tr.items.filter(pred).length;
   const chip = (attr, val, label, on, n) => `<button class="chip ${on?"on":""}" ${attr}="${esc(val)}">${label}<span class="cn">${n}</span></button>`;
-  const active = tfChan.size + tfCat.size;
-  $("#filters").innerHTML = (tr.channels.length > 1 || tfChan.size ? `<div class="frow"><span class="fl">Channel</span>${tr.channels.map(c =>
-      chip("data-tfchan", c.key, esc(c.name), tfChan.has(c.key), c.count)).join("")}</div>` : "")
-    + `<div class="frow"><span class="fl">Category</span>${[...cats, ""].map(c =>
-      chip("data-tfcat", c, c ? esc(c) : "Unassigned", tfCat.has(c), count(it => trCatOf(it) === c))).join("")}</div>`
+  [...tfTag].forEach(t => tags.includes(t) || tfTag.delete(t));
+  const active = tfPlat.size + tfCat.size + tfTag.size;
+  $("#filters").innerHTML = (plats.length > 1 || tfPlat.size ? `<div class="frow"><span class="fl">Source</span>${plats.map(p =>
+      chip("data-tfplat", p, pbadge({platform: p}) + " " + esc(p), tfPlat.has(p), count(it => it.platform === p))).join("")}</div>` : "")
+    + flist("tcat", "Category", "data-tfcat", [...orderCats(cats).filter(c => !chanCats.has(c)), "", ...orderCats(cats).filter(c => chanCats.has(c))].map(c => ({val: c, label: c || "Unassigned", chan: chanCats.has(c), n: count(it => trCatOf(it) === c && (!tfPlat.size || tfPlat.has(it.platform)))}))
+        .filter(o => !tfPlat.size || o.n || tfCat.has(o.val)), tfCat)
+    + tagList("ttag", "data-tftag", tfTag, tr.items, it => !tfPlat.size || tfPlat.has(it.platform))
     + (active ? `<div class="frow"><button class="link" id="tfclear">Clear filters (${active})</button></div>` : "");
 }
 function trGroups(){
   if (trGroupBy === "category")
-    return [...cats.map(c => ({key: "cat:" + c, label: c, cat: c, kind: "cat", test: it => trCatOf(it) === c})),
-            {key: "cat:", label: "Unassigned", cat: "", kind: "cat", test: it => trCatOf(it) === ""}];
+    return [...orderCats(cats).map(c => ({key: "cat:" + c, label: c, cat: c, kind: "cat", chan: chanCats.has(c), test: it => trCatOf(it) === c})),
+            {key: "cat:", label: "Unassigned", cat: "", kind: "cat", unas: true, test: it => trCatOf(it) === ""}];
   if (trGroupBy === "none") return [{key: "all", label: "All transcripts", kind: "none", test: () => true}];
   return tr.channels.map(ch => ({key: "ch:" + ch.key, label: ch.name, kind: "channel", ch, test: it => it.ch === ch.key}));
 }
 function renderTrList(){
   const q = $("#search").value.trim().toLowerCase();
   renderTrFilters();
-  const filtering = q || tfChan.size || tfCat.size;
-  let html = "";
+  const filtering = q || tfChan.size || tfCat.size || tfPlat.size || tfTag.size;
+  const parts = [];
   const groups = trGroups();
   groups.forEach((g, gi) => {
     if (g.kind === "cat" && tfCat.size && !tfCat.has(g.cat)) return;
     const items = sortReels(tr.items.filter(it => g.test(it) && trMatches(it, q)));
     if (g.kind === "channel" && !items.length && filtering) return;
-    if (g.kind === "cat" && !g.cat && !items.length && cats.length && filtering) return;
+    if (g.kind === "cat" && !items.length && filtering) return;
     const closed = trCollapsed.has(g.key);
     const ch = g.ch;
-    html += `<div class="group ${closed?"closed":""}" data-trkey="${esc(g.key)}" ${g.kind === "cat" ? `data-cat="${esc(g.cat)}"` : ""} ${ch ? `data-trch="${esc(ch.key)}"` : ""}>
+    let html = `<div class="group ${closed?"closed":""}" data-trkey="${esc(g.key)}" ${g.kind === "cat" ? `data-cat="${esc(g.cat)}"` : ""} ${ch ? `data-trch="${esc(ch.key)}"` : ""}>
       <span class="gname" data-trtoggle title="${esc(ch ? (ch.handle || ch.name) : g.label)}"><span class="caret">&#9662;</span>${ch && ch.platform ? pbadge({platform: ch.platform}) + " " : ""}${esc(g.label)}</span>
       <span class="gcount">${ch && items.length !== ch.count ? `${items.length} / ${ch.count}` : items.length}</span>
       ${ch && ch.note ? `<a class="ico" href="${esc(ch.note.uri)}" title="Open the channel note in Obsidian (${esc(ch.note.path)})">&#128196;</a>` : ""}
       ${ch && ch.url ? `<a class="ico" href="${esc(ch.url)}" target="_blank" rel="noopener" title="Open the channel on ${esc(ch.platform || "YouTube")}">&#8599;</a>` : ""}
-      ${ch ? `<button class="ico" data-trrm="${esc(ch.key)}" title="Remove this channel's transcripts">&#10005;</button>` : ""}
+      ${ch && !ch.videos_only ? `<button class="ico" data-trrm="${esc(ch.key)}" title="Remove this channel's transcripts (downloaded videos stay)">&#10005;</button>` : ""}
       ${g.kind === "cat" && g.cat ? `<button class="ico" data-catmove="-1" title="Move up" ${gi===0?"disabled":""}>&#8593;</button>
                   <button class="ico" data-catmove="1" title="Move down" ${gi===cats.length-1?"disabled":""}>&#8595;</button>
                   <button class="ico" data-rename title="Rename">&#9998;</button>
@@ -5000,19 +5838,51 @@ function renderTrList(){
     if (!closed) html += items.length ? items.map(it => `
       <div class="item tr ${tr.current && tr.current.ch === it.ch && tr.current.id === it.id ? "active" : ""}" data-tid="${esc(it.ch)}/${esc(it.id)}" draggable="true">
         <div><div class="t">${esc(it.title)}</div>
-        <div class="s">${g.kind !== "channel" ? esc(chanName(it.ch)) + " · " : ""}${esc(it.date)}${it.duration ? ` · ${mmss(+it.duration)}` : ""} · ${srcBadge(it)}${g.kind !== "cat" && trCatOf(it) ? ` · <span class="tcat">${esc(trCatOf(it))}</span>` : ""}${it.full ? ` · <span class="fc" title="This video is in Videos, in full">&#9654; video</span>` : ""}${it.note || !vault.ok ? "" : ` · <span title="No Obsidian note yet">no note</span>`}</div></div>
+        <div class="s">${g.kind !== "channel" ? esc(chanName(it.ch)) + " · " : ""}${esc(it.date)}${it.duration ? ` · ${mmss(+it.duration)}` : ""} · ${srcBadge(it)}${g.kind !== "cat" && trCatOf(it) ? ` · <span class="tcat">${esc(trCatOf(it))}</span>` : ""}${it.full ? ` · <span class="fc" title="This video is in Videos, in full">&#9654; video</span>` : ""}${it.note || !vault.ok ? "" : ` · <span title="No Obsidian note yet">no note</span>`}${tagsOf(it).length ? ` · <span class="ttg">${tagsOf(it).map(t => "#" + esc(t)).join(" ")}</span>` : ""}</div></div>
       </div>`).join("") : `<div class="gempty">${g.kind === "cat" && g.cat ? "Drag transcripts here or pick this category on a transcript" : "Nothing here"}</div>`;
+    parts.push({html, chan: !!g.chan || g.kind === "channel", unas: !!g.unas, n: items.length});
   });
+  const html = assemble(parts, trCollapsed);
   $("#list").innerHTML = html || `<div class="empty">${tr.items.length ? "No matches" : "No transcripts yet.<br><br>Paste a YouTube channel link, a playlist link or video links above and press <b>Transcripts</b>."}</div>`;
 }
 const trCatSelect = it => `<select id="trcat">${["", ...cats].map(c => `<option value="${esc(c)}" ${trCatOf(it)===c?"selected":""}>${c?esc(c):"Unassigned"}</option>`).join("")}</select>`;
 async function trSetCategory(it, cat){
+  if (it.reel) { const r = reels.find(x => x.id === it.reel); if (r) { setCategory(r, cat); it.category = cat; renderTrList(); } return; }
   try { await api("/api/transcripts/state", {channel: it.ch, id: it.id, category: cat}); } catch (err) { return alert(err.message); }
   it.category = cat;
   renderTrList();
   const sel = $("#trcat"); if (sel && tr.current === it) sel.value = cat;
 }
 function runLine(ch){                       // under a channel: how far its last transcripts run got, and Resume
+  const wl = ch.wrong_lang ? `<div class="gstat"><span class="warn">${ch.wrong_lang} from captions in another language</span> <button class="btn small" data-trredo="${esc(ch.key)}" title="List them, then redo them with the language set in Settings">Redo</button></div>` : "";
+  return wl + runLine0(ch);
+}
+async function sortByChannel(){
+  let j;
+  try { j = await api("/api/sortchannels", {dry: true}); } catch (err) { return alert(err.message); }
+  if (!j.count) return toast("No unassigned video has a known channel");
+  const names = j.categories.slice(0, 10).join(", ") + (j.categories.length > 10 ? ` and ${j.categories.length - 10} more` : "");
+  const ans = await askConfirm(`Sort ${j.count} unassigned video${j.count > 1 ? "s" : ""} by channel?`,
+    `Each goes into a category named after its channel or creator: ${names}. Missing categories are made. Videos that already have a category are not touched.`, null, "Sort");
+  if (!ans.ok) return;
+  try { j = await api("/api/sortchannels", {}); } catch (err) { return alert(err.message); }
+  await loadReels(current && current.id, new Set(reels.map(r => r.id)));
+  toast(`Sorted ${j.count} video${j.count === 1 ? "" : "s"}`);
+}
+async function trRedo(key){
+  let j;
+  try { j = await api("/api/transcripts/wronglang", {channel: key}); } catch (err) { return alert(err.message); }
+  if (!j.items.length) return toast("Nothing to redo");
+  const list = j.items.slice(0, 12).map(x => `• [${x.lang}] ${x.title}`).join("\n") + (j.items.length > 12 ? `\n• and ${j.items.length - 12} more` : "");
+  const ans = await askConfirm(`Redo ${j.items.length} transcript${j.items.length > 1 ? "s" : ""} in "${j.lang}"?`,
+    `${list}\n\nTheir folders move to _trash\\_transcripts and their Obsidian notes to the vault's trash (notes you edited too: copy what you wrote first). Then the channel runs again and makes them new, with the same category. Videos with no ${j.lang} captions come back in their own language.`, null, "Redo");
+  if (!ans.ok) return;
+  let r;
+  try { r = await api("/api/transcripts/redo", {channel: key, ids: j.items.map(x => x.id)}); } catch (err) { return alert(err.message); }
+  if (r.errors && r.errors.length) alert(r.errors.join("\n"));
+  toast(r.queued ? `Queued: ${queuedText(r.queued)}` : "Redoing - see the Log"); ensurePoll(); loadTr().catch(() => {});
+}
+function runLine0(ch){
   const r = ch.run; if (!r) return "";
   const nxt = r.next ? ` · next: ${esc(r.next)}` : "";
   const resume = (k, label) => `<button class="btn small" data-trresume="${esc(k)}" title="Lists the channel again and does what is not here yet">${label}</button>`;
@@ -5061,12 +5931,13 @@ function renderTrMain(){
     <div class="meta">${esc(ch ? ch.name : it.author)} · ${esc(it.date)}${it.duration ? ` · ${mmss(+it.duration)}` : ""}${it.lang ? ` · ${esc(it.lang)}` : ""} · ${srcBadge(it)} ${esc(srcText(it))}${it.url ? ` · <a href="${esc(it.url)}" target="_blank" rel="noopener">Open on ${esc(it.platform)}</a> · <button class="link" id="trcopylink" title="${esc(it.url)}">Copy link</button>` : ""}</div>
     <div class="meta">${it.note ? `Obsidian note: <a href="${esc(it.note.uri)}" title="${esc(it.note.path)}">${esc(it.note.name)}</a>` : (vault.ok ? "No Obsidian note yet (it is made when the run finishes this video)" : "Obsidian vault not set: see Settings")}${it.full ? ` · <span class="from" title="Processed in full: video, snapshots, on-screen text">&#9654; in your videos</span>` : ""}</div>
     <label class="catsel">Category ${trCatSelect(it)}</label>
+    ${tagBox(it.tags || [], "ttags")}
     <div class="rowbtns">
       ${it.full ? `<button class="btn small" id="tropen" title="Open this video under Videos">&#9654; Open the video</button>`
                 : `<button class="btn small" id="trget" title="Download the video and process it in full (Whisper transcript, snapshots, on-screen text). Its Obsidian note is kept: the caption text is replaced by Whisper's transcript.">&#11015; Get the video</button>`}
       <button class="btn small" id="trcopytext" title="Copy the transcript as text">Copy transcript</button>
       <button class="btn small" id="trai" title="Copies your Obsidian AI prompt with this transcript - paste it into ChatGPT or Claude">Copy AI prompt</button>
-      <button class="btn small danger" id="trrm1" title="Take this transcript out of the catalogue">Remove</button>
+      ${it.reel && it.id === it.reel ? "" : `<button class="btn small danger" id="trrm1" title="Take this transcript out of the catalogue">Remove</button>`}
     </div>
     <div class="card">
       <div class="tabs"><div class="tab active" data-ttab="text">Transcript<span class="n">${it.lines || ""}</span></div><div class="tab" data-ttab="desc">Description</div></div>
@@ -5078,7 +5949,9 @@ function renderTrMain(){
 }
 async function loadTrText(it){
   let j;
-  try { j = await api("/api/transcripts/text", {channel: it.ch, id: it.id}); }
+  const r = it.reel && reels.find(x => x.id === it.reel);
+  if (r) j = {lines: r.transcript, caption: r.caption, lang: r.lang, title: r.title, url: r.url};   // the video's own transcript
+  else try { j = await api("/api/transcripts/text", {channel: it.ch, id: it.id}); }
   catch (e) { const box = $("#trtext"); if (box) box.innerHTML = `<span class="meta">${esc(e.message)}</span>`; return; }
   if (!tr.current || tr.current.id !== it.id || tr.current.ch !== it.ch || !$("#trtext")) return;
   tr.text = j;
@@ -5240,6 +6113,8 @@ async function refreshQuiet(){
 }
 
 setGroupOptions("reels"); $("#sortby").value = sortBy;
+try { if (innerWidth <= 900 && localStorage.getItem("rh-panes") === null) panes.fp = false; } catch (e) {}   // small screens start with the filters folded
+applyPanes();
 if (!$("#sortby").value) { sortBy = "posted-new"; $("#sortby").value = sortBy; }
 try { const m = localStorage.getItem("rh-maxshots"); if (m && [...$("#maxshots").options].some(o => o.value === m)) $("#maxshots").value = m;
   const e = parseFloat(localStorage.getItem("rh-everyn")); if (e >= 0.5 && e <= 600) $("#everyn").value = e; } catch (e) {}
@@ -5254,7 +6129,9 @@ async function openSetup(first){
   $("#sttitle").textContent = first ? "Welcome to Reels Hub" : "Settings";
   $("#stintro").textContent = first ? "Tell the app who you are and where to keep things. You can change this later under Settings."
                                     : "Your name and folders on this computer.";
+  $("#stsortrow").hidden = !cfg.name || !(cfg.vault || "").trim();
   $("#stname").value = cfg.name || ""; $("#stout").value = cfg.out || ""; $("#stvault").value = cfg.vault || "";
+  $("#stlang").value = cfg.sub_lang !== undefined ? cfg.sub_lang : "en";
   const cl = (c.configured && c.config.cloud) || {};
   $("#stcurl").value = cl.url || ""; $("#stcid").value = cl.id || ""; $("#stcsec").value = "";
   $("#stcsec").placeholder = cl.has_secret ? "Saved - leave empty to keep it" : "";
@@ -5269,7 +6146,7 @@ async function openSetup(first){
 async function saveSetup(){
   const b = $("#stsave"); b.disabled = true;
   try {
-    const j = await api("/api/config", {name: $("#stname").value, out: $("#stout").value, vault: $("#stvault").value,
+    const j = await api("/api/config", {name: $("#stname").value, out: $("#stout").value, vault: $("#stvault").value, sub_lang: $("#stlang").value,
       cloud_url: $("#stcurl").value, cloud_id: $("#stcid").value, cloud_secret: $("#stcsec").value});
     if (j.warning) { $("#sterr").textContent = j.warning; $("#sterr").className = "sterr stwarn"; $("#sterr").hidden = false; }
     const bad = j.cloud_test && !j.cloud_test.ok;
@@ -5286,7 +6163,6 @@ async function saveSetup(){
   finally { b.disabled = false; }
 }
 (async () => {
-  setFavicon();
   pingSoon(5000);                            // status at the top right: is the server on this PC answering?
   try { const c = await api("/api/config"); if (!c.configured) await openSetup(true); } catch (e) {}
   await loadReels(); setView(view); poll();
