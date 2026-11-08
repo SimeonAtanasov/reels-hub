@@ -629,6 +629,20 @@ def old_owner(note):
     return m.group(1) if m else ""
 
 
+
+def replace_retry(src, dst, tries=60):
+    """os.replace that waits while Windows has the target open for a moment (Reels Hub reading _channel.json for
+    the Transcripts tab, an antivirus or indexer): up to about 6 s, then the error as before."""
+    for i in range(tries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i == tries - 1:
+                raise
+            time.sleep(0.05 if i < 20 else 0.2)
+
+
 def write_note(workdir, url, info, shots, transcript, lang, ocr_lines, owner="", slides=None, extra=()):
     author = info.get("uploader") or info.get("channel") or "unknown"
     caption = (info.get("description") or "").strip()
@@ -662,7 +676,7 @@ def write_note(workdir, url, info, shots, transcript, lang, ocr_lines, owner="",
            "## My notes", NOTES_S, old_notes(note), NOTES_E, ""]
     tmp = note.with_name(".note.md.tmp")
     tmp.write_text("\n".join(md), encoding="utf-8")
-    os.replace(tmp, note)
+    replace_retry(tmp, note)
     return note
 
 
@@ -949,7 +963,7 @@ def channel_category(out, workdir, info, url):
         raw.update(categories=cats, channels=ch)
         tmp = f.with_name("._categories.json.tmp")
         tmp.write_text(json.dumps(raw, indent=1, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, f)
+        replace_retry(tmp, f)
     (workdir / "hub.json").write_text(json.dumps({"category": name, "favorites": []}, indent=1, ensure_ascii=False), encoding="utf-8")
     print(f"  category: {name}")
 
@@ -1476,7 +1490,7 @@ def transcript_one(url, args, out, prog, source_hint="link"):
                 meta["name"] = name
                 tmp_c = chan.with_name("._channel.json.tmp")
                 tmp_c.write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
-                os.replace(tmp_c, chan)
+                replace_retry(tmp_c, chan)
         except (OSError, ValueError):
             pass
     if not chan.exists():
@@ -1485,7 +1499,7 @@ def transcript_one(url, args, out, prog, source_hint="link"):
                                     "url": _channel_url(url, info),
                                     "platform": platform_of(url, info), "at": time.strftime("%Y-%m-%d %H:%M")},
                                    ensure_ascii=False, indent=1), encoding="utf-8")
-    os.replace(tmp, dest)
+    replace_retry(tmp, dest)
     took = time.time() - t_start
     if source != "whisper":
         learn(str(out), prog.stats, "cap_secs", took)
@@ -1567,7 +1581,14 @@ class RunRecord:
         meta["run"] = self.rec
         tmp = f.with_name("._channel.json.tmp")
         tmp.write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
-        os.replace(tmp, f)
+        try:
+            replace_retry(tmp, f)
+        except OSError as e:          # only the "where it got to" line in the app: never worth stopping the run for
+            print(f"  (could not update {f.name}: {e}; the run goes on)")
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
     def step(self, k, ok):
         """Video number k of this listing (1-based) finished (ok) or failed."""

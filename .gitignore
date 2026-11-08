@@ -46,3 +46,4 @@ cloud/.dev.vars
 cloud/node_modules/
 cloud/.wrangler/
 DEPLOY.md
+_queue.json
