@@ -174,8 +174,17 @@ def learn(out, stats, key, value, weight=0.6):
     if value <= 0:
         return
     stats[key] = round(stats[key] * (1 - weight) + value * weight, 4)
-    try:
-        (Path(out) / "_stats.json").write_text(json.dumps(stats, indent=1), encoding="utf-8")
+    f = Path(out) / "_stats.json"
+    try:                      # only this key: a run going at the same time (the other lane) keeps what it learned
+        try:
+            cur = json.loads(f.read_text(encoding="utf-8"))
+            cur = cur if isinstance(cur, dict) else {}
+        except (OSError, ValueError):
+            cur = {k: v for k, v in stats.items()}
+        cur[key] = stats[key]
+        tmp = f.with_name(f"._stats.json.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(cur, indent=1), encoding="utf-8")
+        replace_retry(tmp, f)
     except OSError:
         pass
 
@@ -1029,11 +1038,15 @@ def _process(url, args, i=1, n=1, stats=None):
             shutil.rmtree(tmp)
         tmp.mkdir(parents=True)
         prog.start("download")
-        post = probe_post(url, args.browser, args.cookies) if platform_of(url) == "Instagram" else None
-        if post and is_slideshow(post):
-            video, info = download_slideshow(url, post, tmp, args.browser, args.cookies, prog)
-        else:
-            video, info = download(url, tmp, args.browser, args.cookies, prog)
+        video_take_turn(args.out, platform_of(url).lower())   # a transcripts run on the same site waits meanwhile
+        try:
+            post = probe_post(url, args.browser, args.cookies) if platform_of(url) == "Instagram" else None
+            if post and is_slideshow(post):
+                video, info = download_slideshow(url, post, tmp, args.browser, args.cookies, prog)
+            else:
+                video, info = download(url, tmp, args.browser, args.cookies, prog)
+        finally:
+            flag_clear(args.out, YIELD)
         workdir = Path(args.out) / f"{info.get('upload_date', '')}_{info['id']}"
         tmp.rename(workdir)
         video = workdir / video.name
@@ -1114,6 +1127,18 @@ INFO_KEEP = ("id", "title", "description", "upload_date", "timestamp", "duration
              "categories", "thumbnail", "chapters", "availability", "live_status", "playable_in_embed")
 AUDIO_FORMAT = "ba[ext=m4a]/ba/b"    # for Whisper: the audio only (the video would be downloaded for nothing)
 CONTROL = "_control.json"            # in _transcripts: {"pause": bool, "stop": bool}, written by Reels Hub's Pause / Stop
+# Two lanes (2026-11-09): Reels Hub runs a transcripts run and a normal run at the same time. They take turns on one
+# site only: while the normal run downloads from a site, a transcripts run on the same site waits before its next
+# video. Two small files in _transcripts, each {"pid", "site", "at"}:
+#   _yield.json   the normal run is downloading from <site> (written before the download, removed after it)
+#   _trbusy.json  the transcripts run is fetching from <site> (one video's lookup and captions or audio; no file
+#                 between videos and while Whisper runs)
+# Each side writes its own file first and reads the other's after, so at least one of them sees the other: the
+# transcripts run then waits, or the download waits until the transcripts run's current video has its captions.
+YIELD = "_yield.json"
+TRBUSY = "_trbusy.json"
+YIELD_MAX = float(os.environ.get("REELS_HUB_YIELD_MAX", 1800))      # transcripts never wait longer than this
+TRBUSY_MAX = float(os.environ.get("REELS_HUB_TRBUSY_MAX", 120))     # a download never waits longer than this
 
 
 def yt_video_id(url):
@@ -1396,7 +1421,7 @@ class TrProgress:
     def __init__(self, n, stats, out):
         self.n, self.stats, self.out, self.i = n, stats, out, 0
         self.t0, self.last, self.stage, self.base, self.frac = time.time(), 0, "captions", time.time(), 0.0
-        self.dl_eta, self.est, self.tx = None, {}, 0.0
+        self.dl_eta, self.est, self.tx, self.wait_site = None, {}, 0.0, ""
     def plan(self, dur):                 # Whisper for this video: same estimate as a normal run
         wd = whisper_device()
         self.tx = self.stats[skey("model_load", wd)] + dur * self.stats[skey("tx_factor", wd)]
@@ -1417,6 +1442,9 @@ class TrProgress:
         rest = left_videos * self.stats["cap_secs"]
         if self.stage == "paused":
             label, pct, eta = "Paused", 100.0 * (self.i - 1) / max(1, self.n), None
+        elif self.stage == "waiting":            # the other lane is downloading from the same site
+            label = f"Waiting: a video is downloading from {SITE_NAME.get(self.wait_site, self.wait_site or 'the same site')}"
+            pct, eta = 100.0 * (self.i - 1) / max(1, self.n), None
         elif self.stage == "captions":
             label, pct, eta = "Getting captions", 100.0 * (self.i - 1) / max(1, self.n), self.stats["cap_secs"] + rest
         elif self.stage == "download":
@@ -1463,6 +1491,7 @@ def transcript_one(url, args, out, prog, source_hint="link"):
         print("  downloading the audio for Whisper")
         prog.start("download")
         audio = fetch_audio(tmp, url, args.browser, args.cookies, prog)
+        flag_clear(out, TRBUSY)                       # Whisper works on this PC: the other lane may download now
         dur = video_duration(audio) or float(info.get("duration") or 0)
         prog.plan(dur)
         prog.start("transcribe")
@@ -1543,6 +1572,140 @@ def hold_if_paused(out, prog, i):
         prog.emit()
 
 
+SITE_NAME = {"youtube": "YouTube", "tiktok": "TikTok", "instagram": "Instagram", "x": "X"}
+
+
+def pid_alive(pid):
+    """Is that process still running? On Windows asked with OpenProcess: os.kill(pid, 0) would stop it there."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            k = ctypes.WinDLL("kernel32", use_last_error=True)   # its own copy: the types set here stay here
+            k.OpenProcess.restype = wintypes.HANDLE
+            k.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+            k.GetExitCodeProcess.restype = wintypes.BOOL
+            k.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+            k.CloseHandle.argtypes = (wintypes.HANDLE,)
+            h = k.OpenProcess(0x1000, False, pid)              # PROCESS_QUERY_LIMITED_INFORMATION
+            if not h:
+                return False
+            try:
+                code = wintypes.DWORD()
+                return bool(k.GetExitCodeProcess(h, ctypes.byref(code))) and code.value == 259   # STILL_ACTIVE
+            finally:
+                k.CloseHandle(h)
+        except Exception:
+            return False                                       # unsure: don't wait for it
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def flag_set(out, name, site):
+    """Write this run's flag (YIELD or TRBUSY): {"pid", "site", "at"}."""
+    f = Path(out) / TR_DIR / name
+    try:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        tmp = f.with_name(f".{name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"pid": os.getpid(), "site": site, "at": time.time()}), encoding="utf-8")
+        replace_retry(tmp, f)
+    except OSError:
+        pass                    # never worth stopping a run for: the two lanes just don't take turns this time
+
+
+def flag_get(out, name):
+    """The other run's flag, or None: no file, or left over from a run that has ended."""
+    try:
+        d = json.loads((Path(out) / TR_DIR / name).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(d, dict) or d.get("pid") == os.getpid() or not pid_alive(d.get("pid")):
+        return None
+    return d
+
+
+def flag_clear(out, name):
+    """Remove this run's own flag (never another run's)."""
+    f = Path(out) / TR_DIR / name
+    try:
+        d = json.loads(f.read_text(encoding="utf-8"))
+        if isinstance(d, dict) and d.get("pid") == os.getpid():
+            f.unlink()
+    except (OSError, ValueError):
+        pass
+
+
+def _site_of(d):
+    return str((d or {}).get("site") or "").lower()
+
+
+def video_take_turn(out, site):
+    """A normal run is about to download from <site>: a transcripts run on the same site waits before its next video
+    (YIELD); if it is in the middle of one, let that one get its captions first (up to TRBUSY_MAX seconds)."""
+    site = str(site or "").lower()
+    flag_set(out, YIELD, site)
+    t0, said = time.time(), False
+    while time.time() - t0 < TRBUSY_MAX:
+        b = flag_get(out, TRBUSY)
+        if not b or _site_of(b) != site:
+            break
+        if not said:
+            print(f"  the transcripts run is getting one video from {SITE_NAME.get(site, site)}: downloading right after it", flush=True)
+            said = True
+        time.sleep(0.5)
+
+
+def tr_take_turn(out, site, prog=None, i=0, pause_ok=True):
+    """Before a transcripts video (or a listing) on <site>: mark it busy (TRBUSY), unless a normal run is downloading
+    from the same site; then wait until that download is done (at most YIELD_MAX). Returns "go" (TRBUSY set),
+    "stop" (Stop pressed meanwhile) or "paused" (Pause pressed meanwhile: the caller holds there first)."""
+    site = str(site or "").lower()
+    deadline, waited = time.time() + YIELD_MAX, False
+    while True:
+        flag_set(out, TRBUSY, site)                    # first ours, then read theirs (see YIELD)
+        y = flag_get(out, YIELD)
+        if not y or _site_of(y) != site or time.time() > deadline:
+            if waited:
+                print("  the download is done: going on", flush=True)
+                if prog:
+                    prog.video(i)
+            return "go"
+        flag_clear(out, TRBUSY)
+        if not waited:
+            print(f"  waiting: the other lane is downloading a video from {SITE_NAME.get(site, site)} - going on when it is done", flush=True)
+            waited = True
+            if prog:
+                prog.wait_site, prog.i = site, i
+                prog.start("waiting")
+        while True:
+            time.sleep(1)
+            c = control(out)
+            if c.get("stop"):
+                return "stop"
+            y = flag_get(out, YIELD)
+            if not y or _site_of(y) != site or time.time() > deadline:
+                break
+            if prog:
+                prog.emit()
+        if pause_ok and control(out).get("pause"):
+            return "paused"
+
+
 class RunRecord:
     """What a channel (or playlist) run did, kept in its _channel.json under "run" so Reels Hub can say where it
     stopped and offer Resume: listed, here (already done before), todo, done, failed, last, next, state."""
@@ -1612,10 +1775,17 @@ def transcripts_main(urls, args):
         if is_listing(url):
             lurl = listing_url(url)
             print(f"\n== listing {lurl}")
+            if tr_take_turn(out, platform_of(lurl).lower(), pause_ok=False) == "stop":
+                print("  stopped by you before the listing")
+                for rec in records:
+                    rec.end("stopped")
+                return 0
             try:
                 data, entries = list_videos(lurl, args.browser, args.cookies)
             except Exception as e:
                 print(f"  FAILED to list it: {e}"); failed_lists.append(url); continue
+            finally:
+                flag_clear(out, TRBUSY)
             seen = set(x[0] for x in todo)
             new = [e for e in entries if e["id"] not in done and e["url"] not in seen]
             print(f"  {data.get('title') or lurl}: {len(entries)} videos, {len(entries) - len(new)} already here, {len(new)} to do")
@@ -1640,7 +1810,15 @@ def transcripts_main(urls, args):
     prog = TrProgress(len(todo), stats, args.out)
     failed, consecutive_429, channels, ended, tried = [], 0, {}, "finished", 0
     for i, (url, origin, title, rec, k) in enumerate(todo, 1):
-        if hold_if_paused(out, prog, i):
+        site, turn = platform_of(url).lower(), "go"
+        while True:                                  # Pause first, then wait for the other lane's download if any
+            if hold_if_paused(out, prog, i):
+                turn = "stop"; break
+            turn = tr_take_turn(out, site, prog, i)
+            if turn != "paused":
+                break
+        if turn == "stop":
+            flag_clear(out, TRBUSY)
             ended = "stopped"
             print(f"\n  stopped by you after {i - 1} of {len(todo)}: next would be {title or url} - "
                   "Resume on the channel (or the same link again) goes on from here", flush=True)
@@ -1655,6 +1833,7 @@ def transcripts_main(urls, args):
             except (YtdlpError, RuntimeError) as e:
                 if not _is_429(e):
                     raise
+                flag_clear(out, TRBUSY)              # the other lane need not wait while this one waits
                 consecutive_429 += 1
                 if consecutive_429 >= 3:
                     print("  YouTube keeps refusing (429 Too Many Requests): stopping here, run it again later - "
@@ -1665,7 +1844,8 @@ def transcripts_main(urls, args):
                         rec.step(k, False)
                     break
                 print(f"  YouTube is limiting requests (429): waiting {TR_RETRY_WAIT:g} s and trying once more")
-                if wait_or_stop(out, TR_RETRY_WAIT):
+                if wait_or_stop(out, TR_RETRY_WAIT) or tr_take_turn(out, site, prog, i, pause_ok=False) == "stop":
+                    flag_clear(out, TRBUSY)
                     ended = "stopped"
                     print(f"  stopped by you after {i - 1} of {len(todo)}: next would be {title or url}", flush=True)
                     break
@@ -1677,6 +1857,8 @@ def transcripts_main(urls, args):
                 channels[d["channel"]] = channels.get(d["channel"], 0) + 1
         except Exception as e:
             print(f"  FAILED: {e}"); failed.append(url)
+        finally:
+            flag_clear(out, TRBUSY)                  # between videos the other lane may download
         if rec:
             rec.step(k, ok)
         if i < len(todo):

@@ -215,6 +215,7 @@ def tr_source_label(source):
     return f"{names.get(site, site.title())} {rest}".strip() if rest else names.get(site, site.title())
 TR_CACHE = {}                            # transcript folder -> (note mtime, hub mtime, item) for the catalogue
 TR_CONTROL = "_control.json"             # in _transcripts: {"pause", "stop"} for the transcripts run (reels2notes reads it)
+TR_YIELD, TR_TRBUSY = "_yield.json", "_trbusy.json"   # in _transcripts: the two lanes taking turns (reels2notes YIELD, TRBUSY)
 TEMPLATE_FILES = {"YouTube": "'YouTube Template.md", "TikTok": "`TikTok Template.md"}   # in the vault's Templates folder
 TEMPLATE_FALLBACK = {                    # copies of those templates (2026-11-05), used when the vault has none
     "YouTube": "{{date}}\n{{time}}\n**Title:** \n**Source**:\n**Tags**: #YouTube \n"
@@ -230,10 +231,27 @@ TEMPLATE_FALLBACK = {                    # copies of those templates (2026-11-05
               "# **Content**:\n\n# **Original text:**\n"}
 
 JOB = {"running": False, "log": [], "started": None, "finished": None, "urls": [], "progress": None, "busy": set(),
-       "share": None, "mark": 0, "done": 0}   # share: id of the inbox item being added; mark: where this run's lines
-                                         # start in log (it runs on across queued runs); done: links finished in this run
-JOB_LOCK = threading.Lock()              # the run slot: one run at a time (taken after INBOX_LOCK, never before it)
+       "share": None, "mark": 0, "done": 0, "lane": "video"}   # share: id of the inbox item being added; mark: where
+                                         # this run's lines start in log (it runs on across queued runs); done: links
+                                         # finished in this run
+# Two lanes (2026-11-09): JOB is the video lane (Run, Re-process, New version, inbox Adds), TRJOB the transcripts lane
+# (Transcripts runs). They run at the same time; inside a lane one run at a time, as before. A transcripts run waits
+# while the video lane downloads from the same site (reels2notes YIELD / TRBUSY).
+TRJOB = {"running": False, "log": [], "started": None, "finished": None, "urls": [], "progress": None, "busy": set(),
+         "share": None, "mark": 0, "done": 0, "lane": "tr"}
+JOBS = {"video": JOB, "tr": TRJOB}
+LANES = ("video", "tr")
+JOB_LOCK = threading.Lock()              # the run slots, one per lane (taken after INBOX_LOCK, never before it)
 RUNQ = []                                # Runs pressed while another run was going wait here (guarded by INBOX_LOCK)
+
+
+def lane_of(task):
+    """Which lane a waiting task runs in: Transcripts runs in "tr", everything else in "video"."""
+    return "tr" if task.get("kind", "run") == "run" and (task.get("transcripts") or "--transcripts" in (task.get("flags") or ())) else "video"
+
+
+def any_running():
+    return JOB["running"] or TRJOB["running"]
 QSEQ = itertools.count(1)                # one order for all that waits (Runs and inbox Adds): first come, first served
 LOG_KEEP = 1500                          # lines of the earlier runs kept when the next run in line starts
 DONE_LINE = re.compile(r"\s*done( in [^>]*)? ->")   # reels2notes' line for a finished link
@@ -503,7 +521,7 @@ def write_state(folder, state):
 def list_reels():
     if not OUT.exists():
         return []
-    ensure_homes()
+    start_homes()
     items = []
     for f in OUT.iterdir():
         if not f.is_dir() or f.name.startswith(("_", ".")):
@@ -896,16 +914,32 @@ def _hub(folder):
         return {}
 
 
+CH_META = {}                                # str(cdir) -> (mtime, _channel.json as a dict): read once per change
+
+
 def _channel_meta(cdir):
+    """_channel.json of a channel folder (a copy; cached by the file's time, since the listings and the note moves
+    read it for every video)."""
+    p = cdir / "_channel.json"
     try:
-        d = json.loads(read_text(cdir / "_channel.json"))
-        return d if isinstance(d, dict) else {}
+        mt = p.stat().st_mtime
+    except OSError:
+        return {}
+    hit = CH_META.get(str(cdir))
+    if hit and hit[0] == mt:
+        return json.loads(hit[1])
+    try:
+        d = json.loads(read_text(p))
+        d = d if isinstance(d, dict) else {}
     except (OSError, ValueError):
         return {}
+    CH_META[str(cdir)] = (mt, json.dumps(d))
+    return json.loads(CH_META[str(cdir)][1])
 
 
 def _save_channel_meta(cdir, meta):
     atomic_write(cdir / "_channel.json", json.dumps(meta, indent=1, ensure_ascii=False))
+    CH_META.pop(str(cdir), None)
 
 
 def tr_item(folder, key):
@@ -960,7 +994,7 @@ def _tr_folders(cdir):
 
 def list_transcripts():
     """The catalogue: channels (folders in _transcripts) and their transcript-only videos."""
-    ensure_homes()
+    start_homes()
     root = OUT / TR_DIR
     chans, items = [], []
     homes = read_homes()
@@ -1474,22 +1508,34 @@ def tr_run_state(run):
         return None
     r = {k: run.get(k) for k in ("url", "title", "started", "at", "listed", "here", "todo", "done", "failed", "last", "next", "state")}
     r["left"] = max(0, int(run.get("todo") or 0) - int(run.get("done") or 0) - int(run.get("failed") or 0))
-    going = JOB["running"] and JOB.get("transcripts") and JOB.get("pid") and run.get("pid") == JOB.get("pid")
+    going = TRJOB["running"] and TRJOB.get("pid") and run.get("pid") == TRJOB.get("pid")
     if r["state"] == "running" and not going:
         r["state"] = "interrupted"
     return r
 
 
+def _drop_lane_flag(pid, name):
+    """A run's process has ended: remove its lane flag if it left one (reels2notes removes its own; this covers a
+    run that broke off). Only that process's flag, never the other lane's."""
+    f = OUT / TR_DIR / name
+    try:
+        d = json.loads(read_text(f))
+        if isinstance(d, dict) and d.get("pid") == pid:
+            f.unlink()
+    except (OSError, ValueError):
+        pass
+
+
 def tr_control(action):
     """Pause, Resume or Stop the transcripts run that is going: reels2notes reads the control file before each video."""
-    if not (JOB["running"] and JOB.get("transcripts")):
+    if not (TRJOB["running"] and TRJOB.get("transcripts")):
         raise ValueError("No transcripts run is going")
     if action not in ("pause", "resume", "stop"):
         raise ValueError("Bad request")
     atomic_write(OUT / TR_DIR / TR_CONTROL, json.dumps({"pause": action == "pause", "stop": action == "stop"}))
-    JOB["paused"] = action == "pause"
-    JOB["stopping"] = action == "stop"
-    return {"paused": JOB["paused"], "stopping": JOB["stopping"]}
+    TRJOB["paused"] = action == "pause"
+    TRJOB["stopping"] = action == "stop"
+    return {"paused": TRJOB["paused"], "stopping": TRJOB["stopping"]}
 
 
 def transcript_text(key, rid):
@@ -1680,7 +1726,7 @@ def remove_transcripts(body):
     """Take transcript-only videos, or a whole channel, out of the catalogue: their folders go to
     _trash/_transcripts/<channel>, and with obsidian=true their notes to the vault's .trash (only notes that carry
     the video's id marker, and never the note of a video that is in the library in full)."""
-    if JOB["running"]:
+    if any_running():
         raise ValueError("Wait for the current run to finish before removing")
     key = body.get("channel")
     cdir = tr_cdir(key)
@@ -1743,6 +1789,27 @@ def tr_listing(url):
     if re.search(r"youtube\.com/(@[^/?]+|channel/|c/|user/|playlist\?)", u, re.I):
         return True
     return bool(re.search(r"tiktok\.com/@[\w.-]+/?(?:$|[?])", u, re.I))
+
+
+BATCH = 10                                  # a channel or playlist Run waits in line in groups of this many videos
+
+
+def list_channel(url):
+    """Run on a channel, playlist or profile link (2026-11-09): what is in it, for the page to choose from. Each
+    video with its state here: "full" (downloaded), "tr" (transcript only) or "" (nothing yet). yt-dlp lists it
+    without downloading (newest first for a channel tab; playlist order for a playlist)."""
+    import reels2notes as r2n
+    url = str(url or "").strip()
+    if not tr_listing(url):
+        raise ValueError("Not a channel, playlist or profile link")
+    cookies = HERE / "cookies.txt"
+    data, entries = r2n.list_videos(r2n.listing_url(url), None, str(cookies) if cookies.exists() else None)
+    done = r2n.tr_done(OUT)
+    vids = [{"url": e["url"], "title": e["title"] or e["id"], "state": {"reel": "full", "transcript": "tr"}.get((done.get(e["id"]) or ("",))[0], "")}
+            for e in entries]
+    title = str(data.get("channel") or data.get("uploader") or data.get("title") or tr_label(url)).strip()[:100]
+    return {"url": url, "title": title, "playlist": "list=" in url,
+            "count": len(vids), "videos": vids}
 
 
 def tr_label(url):
@@ -2152,6 +2219,35 @@ def set_channel_home(key, cat):
     return {"homes": read_homes(), "moved": moved, "category": cat, "old": old}
 
 
+HOMES = {"state": "", "done": 0, "total": 0, "error": ""}   # the one-time change below, shown by /api/status
+HOMES_GUARD = threading.Lock()
+
+
+def start_homes():
+    """Run ensure_homes once, in the background: on a big library it takes a while (every note's Tags line is
+    rewritten, in OneDrive), and a page load must never wait for it. The first version of 2026-11-09 ran it inside
+    /api/reels and /api/transcripts: the page stayed empty for minutes and every reload started another copy. Called
+    at app start and by the listings; at most one runs; after an error it waits for the next app start."""
+    with HOMES_GUARD:
+        if HOMES["state"] in ("running", "done", "error"):
+            return
+        try:
+            if not OUT.is_dir() or not cats_file().exists() or _cats_raw().get("homes_v1") or line_busy():
+                return
+        except OSError:
+            return
+        HOMES.update(state="running", done=0, total=0, error="")
+
+    def go():
+        try:
+            ensure_homes()
+            HOMES["state"] = "done"
+        except Exception as e:
+            HOMES.update(state="error", error=str(e))
+            print(f"Channel groups: stopped ({e}). It goes on where it stopped at the next start.", flush=True)
+    threading.Thread(target=go, daemon=True).start()
+
+
 def ensure_homes():
     """Once (homes_v1, 2026-11-09): the channel categories made since 2026-11-07 become channel groups. A category
     named after its channel: its videos go to Unassigned, where they show under their channel, and the category goes.
@@ -2180,6 +2276,9 @@ def ensure_homes():
                         if c in chs:
                             items.append((tf, c, cdir.name, cname))
     gone, homes, done, stay = [], read_homes(), 0, []
+    HOMES.update(total=len(items), done=0)
+    if items:
+        print(f"Channel groups: turning {len(chs)} channel categories into channel groups ({len(items)} videos, one time)...", flush=True)
     for c in chs:
         its = [x for x in items if x[1] == c]
         names = {norm(x[3]) for x in its}
@@ -2189,9 +2288,13 @@ def ensure_homes():
                     _tr_set_category(f, "", refresh=False)
                     done += 1
                 except Exception as e:
-                    print(f"  {f.name}: not moved to Unassigned ({e})")
+                    print(f"  {f.name}: not moved to Unassigned ({e})", flush=True)
+                HOMES["done"] += 1
+                if HOMES["done"] % 50 == 0:
+                    print(f"Channel groups: {HOMES['done']} of {HOMES['total']} videos", flush=True)
             gone.append(c)
         else:                                       # yours now; the channel it is about gets it as its home
+            HOMES["done"] += len(its)
             keys = {x[2] for x in its if x[2]}
             for k in keys:
                 if any(norm(x[3]) == norm(c) for x in its if x[2] == k) or len(keys) == 1:
@@ -2211,7 +2314,7 @@ def ensure_homes():
     if chs:
         _move_channel_notes(gone)
         print(f"Channels are now groups inside your categories: {len(gone)} channel categor{'y' if len(gone) == 1 else 'ies'} "
-              f"removed, {done} video{'' if done == 1 else 's'} to Unassigned (shown there under their channel)")
+              f"removed, {done} video{'' if done == 1 else 's'} to Unassigned (shown there under their channel)", flush=True)
     return {"removed": gone, "videos": done}
 
 
@@ -2371,7 +2474,7 @@ def delete_reels(ids, with_obsidian):
     """Move reels to <out>/_trash (and optionally their vault notes to Obsidian's .trash)."""
     if not can_delete():
         raise PermissionError("Deleting videos is turned off for you on this laptop (set in the Cloudflare inbox)")
-    if JOB["running"]:
+    if any_running():
         raise ValueError("Wait for the current run to finish before deleting")
     done, errors = [], []
     trash = OUT / "_trash"
@@ -2850,7 +2953,7 @@ def inbox_status():
             it["have"] = sorted(have.get(it["id"], []))
         return {"on": bool(cloud_settings()), "items": items, "checked": INBOX["checked"], "error": INBOX["error"],
                 "busy": INBOX["busy"], "last": INBOX["last"], "as": (CONFIG.get("cloud") or {}).get("name", ""),
-                "running": JOB["running"], "changed": CHANGED["list"], "boot": BOOT}
+                "running": any_running(), "changed": CHANGED["list"], "boot": BOOT}
 
 
 def inbox_add(body):
@@ -2895,7 +2998,7 @@ def inbox_add(body):
         task["seq"] = next(QSEQ)
         INBOX["queue"].append(task)
         _qsave()
-        n = sum(1 for t in INBOX["queue"] + RUNQ if not t.get("held")) + bool(JOB["running"])   # this one and all before it
+        n = sum(1 for t in INBOX["queue"] + RUNQ if not t.get("held") and lane_of(t) == "video") + bool(JOB["running"])   # this one and all before it in its lane
     start_next()
     return {"queued": n}
 
@@ -2918,10 +3021,12 @@ def inbox_dismiss(body):
 
 
 # ---------------------------------------------------------------- run queue
-# One run at a time (Whisper and OCR keep the processor busy). Run, Re-process, New version and inbox Adds pressed
-# while a run is going wait in line and start by themselves, first come first served. When a run ends it hands the
-# slot straight to the next one (JOB["running"] stays true, so the page sees one long run) and the log keeps the
-# earlier lines, so a video that failed further up can still be read.
+# One run at a time per lane (Whisper and OCR keep the processor busy). Two lanes since 2026-11-09: the video lane
+# (JOB: Run, Re-process, New version, inbox Adds) and the transcripts lane (TRJOB: Transcripts runs, mostly captions
+# with pauses, light on the processor), side by side. What is pressed while its lane is busy waits in line and starts
+# by itself, first come first served within the lane. When a run ends it hands its slot straight to the next one of
+# its lane (running stays true, so the page sees one long run) and the lane's log keeps the earlier lines, so a video
+# that failed further up can still be read.
 def short_url(u):
     """A link as the waiting list shows it: no https://, www., query or trailing slash (a YouTube ?v= stays)."""
     u = str(u or "")
@@ -2932,10 +3037,10 @@ def short_url(u):
     return s if len(s) <= 70 else s[:67] + "..."
 
 
-def _take_next():
-    """With INBOX_LOCK and JOB_LOCK held: the first task in line (a Run or an inbox Add) that is not set for Later,
-    out of its line."""
-    cands = [t for t in RUNQ + INBOX["queue"] if not t.get("held")]
+def _take_next(lane="video"):
+    """With INBOX_LOCK and JOB_LOCK held: the first task of that lane in line (a Run or an inbox Add) that is not set
+    for Later, out of its line."""
+    cands = [t for t in RUNQ + INBOX["queue"] if not t.get("held") and lane_of(t) == lane]
     if not cands:
         return None
     t = min(cands, key=lambda x: x.get("seq", 0))
@@ -2967,9 +3072,10 @@ def _qsave():
     """Write the line to disk (call with INBOX_LOCK held, or when nothing else changes it)."""
     try:
         items = []
-        cur = JOB.get("task")
-        if JOB["running"] and cur:
-            items.append({**_qpublic(cur), "held": True, "was_running": True})
+        for job in (JOB, TRJOB):                       # what runs now comes back first, set for Later
+            cur = job.get("task")
+            if job["running"] and cur:
+                items.append({**_qpublic(cur), "held": True, "was_running": True})
         items += [_qpublic(t) for t in sorted(RUNQ + INBOX["queue"], key=lambda x: x.get("seq", 0))]
         f = OUT / QUEUE_FILE
         if items:
@@ -3020,7 +3126,7 @@ def queue_restore():
 
 def line_busy():
     """A run going, or something waiting that is not set for Later."""
-    return JOB["running"] or any(not t.get("held") for t in RUNQ + INBOX["queue"])
+    return any_running() or any(not t.get("held") for t in RUNQ + INBOX["queue"])
 
 
 def _find_queued(seq):
@@ -3049,32 +3155,40 @@ def queue_hold(body):
 
 
 def queue_move(body):
-    """Move a waiting item: {seq, to: position from 0} or {seq, dir: -1 | 1}. The whole line is renumbered."""
+    """Move a waiting item within its lane: {seq, to: position from 0 among that lane's items} or {seq, dir: -1 | 1}.
+    The other lane's items keep their places; the whole line is renumbered."""
     try:
         seq = int(body.get("seq"))
     except (TypeError, ValueError):
         raise ValueError("Bad request")
     with INBOX_LOCK:
         order = sorted(RUNQ + INBOX["queue"], key=lambda x: x.get("seq", 0))
-        i = next((k for k, t in enumerate(order) if t.get("seq") == seq), None)
-        if i is None:
+        t = next((x for x in order if x.get("seq") == seq), None)
+        if t is None:
             raise ValueError("It is not waiting any more: it has started or finished")
-        if body.get("to") is not None:
-            j = int(body.get("to"))
-        else:
-            j = i + (1 if int(body.get("dir") or 0) > 0 else -1)
-        j = max(0, min(len(order) - 1, j))
-        order.insert(j, order.pop(i))
-        for t in order:
-            t["seq"] = next(QSEQ)
+        lane = lane_of(t)
+        slots = [k for k, x in enumerate(order) if lane_of(x) == lane]    # where this lane's items sit in the line
+        sub = [order[k] for k in slots]
+        i = next(k for k, x in enumerate(sub) if x is t)
+        try:
+            j = int(body.get("to")) if body.get("to") is not None else i + (1 if int(body.get("dir") or 0) > 0 else -1)
+        except (TypeError, ValueError):
+            raise ValueError("Bad request")
+        j = max(0, min(len(sub) - 1, j))
+        sub.insert(j, sub.pop(i))
+        for k, x in zip(slots, sub):
+            order[k] = x
+        for x in order:
+            x["seq"] = next(QSEQ)
         RUNQ.sort(key=lambda x: x["seq"]); INBOX["queue"].sort(key=lambda x: x.get("seq", 0))
         _qsave()
-        return {"seq": order[j]["seq"], "at": j}
+        return {"seq": sub[j]["seq"], "at": j}
 
 
-def _claim(task, chained):
-    """With both locks held and the slot taken: get a waiting task ready to start. Returns its thread, or None
-    when it can no longer run (an Add's reason goes to the Inbox, a Run's to the log)."""
+def _claim(task, chained, job=JOB):
+    """With both locks held and the lane's slot taken: get a waiting task ready to start. Returns its thread, or None
+    when it can no longer run (an Add's reason goes to the Inbox, a Run's to the log). Adds are always in the video
+    lane (JOB)."""
     if task.get("kind") == "add":
         try:
             item = _load_item(task["id"])
@@ -3091,69 +3205,79 @@ def _claim(task, chained):
                                                       task["label"], chained), daemon=True)
     target = task["target"]
     if target and not (OUT / target / "note.md").exists():
-        JOB["log"].append(f"-- left out {task['label']}: that video is no longer in your library")
+        job["log"].append(f"-- left out {task['label']}: that video is no longer in your library")
         return None
-    JOB["busy"] = {target} if (target and task["redo"]) else set()
+    job["busy"] = {target} if (target and task["redo"]) else set()
     return threading.Thread(target=run_job, args=(task["urls"], task["max_shots"], task["redo"], task["flags"],
-                                                  target if task["redo"] else None, None, task["label"], chained),
+                                                  target if task["redo"] else None, None, task["label"], chained, job),
                             daemon=True)
 
 
-def start_next(after_run=False):
-    """Give the run slot to what has waited longest. after_run: called by the run that just ended, which still
-    holds the slot: it passes straight on, or goes free when nothing waits."""
+def start_next(after_run=None):
+    """Give each free lane's slot to what has waited longest in that lane. after_run: the lane ("video" or "tr")
+    whose run just ended and still holds its slot: it passes straight on, or goes free when nothing of that lane
+    waits. (True is taken as the video lane.)"""
+    if after_run is True:
+        after_run = "video"
+    for lane in LANES:
+        _start_lane(lane, lane == after_run)
+
+
+def _start_lane(lane, after_run):
+    job = JOBS[lane]
     hold = after_run
     while True:
         with INBOX_LOCK:
             with JOB_LOCK:
-                if JOB["running"] and not hold:
+                if job["running"] and not hold:
                     return                          # the run going now starts the next one when it ends
-                task = _take_next()
-                JOB["running"] = task is not None
-                JOB["task"] = task
+                task = _take_next(lane)
+                job["running"] = task is not None
+                job["task"] = task
                 _qsave()
                 if task is None:
                     return
                 hold = True                         # from here on this call holds the slot
                 try:
-                    th = _claim(task, after_run)
+                    th = _claim(task, after_run, job)
                 except Exception as e:              # never leave the slot taken by a task that can't start
-                    JOB["log"].append(f"-- could not start {task.get('label') or 'the next run'}: {e}")
+                    job["log"].append(f"-- could not start {task.get('label') or 'the next run'}: {e}")
                     th = None
         if th:
             try:
                 th.start()
             except Exception as e:                  # no thread: free the slot again rather than block every run
                 with INBOX_LOCK:
-                    INBOX["adding"] = None
+                    if lane == "video":
+                        INBOX["adding"] = None
                     with JOB_LOCK:
-                        JOB.update(running=False, busy=set(), share=None)
-                        JOB["log"].append(f"-- could not start {task.get('label') or 'the next run'}: {e}")
+                        job.update(running=False, busy=set(), share=None)
+                        job["log"].append(f"-- could not start {task.get('label') or 'the next run'}: {e}")
             return
 
 
-def end_run():
-    """The run that holds the slot is over: start the next one waiting, or free the slot."""
-    JOB.update(finished=time.time(), progress=None, busy=set(), share=None)   # running stays true while passing on
+def end_run(job=JOB):
+    """The run that holds its lane's slot is over: start the next one of that lane, or free the slot."""
+    job.update(finished=time.time(), progress=None, busy=set(), share=None)   # running stays true while passing on
     try:
-        start_next(after_run=True)
+        start_next(after_run=job["lane"])
     except Exception as e:
         print(f"  run queue: {e}")
-        JOB["running"] = False
+        job["running"] = False
 
 
-def new_log(chained, label):
+def new_log(chained, label, job=JOB):
     """A run starts: a new log, or after a run in line the earlier lines stay, with a header for this one."""
-    if chained and JOB["log"]:
-        JOB["log"] = JOB["log"][-LOG_KEEP:] + ["", f"== next in line: {label}"]
+    if chained and job["log"]:
+        job["log"] = job["log"][-LOG_KEEP:] + ["", f"== next in line: {label}"]
     else:
-        JOB["log"] = []
-    JOB["mark"], JOB["done"] = len(JOB["log"]), 0
+        job["log"] = []
+    job["mark"], job["done"] = len(job["log"]), 0
 
 
-def run_lines():
+def run_lines(job=JOB):
     """This run's own lines of the log (the log can hold earlier runs' lines too)."""
-    return JOB["log"][JOB["mark"]:]
+    return job["log"][job["mark"]:]
 
 
 def queue_list():
@@ -3161,10 +3285,10 @@ def queue_list():
     with INBOX_LOCK:
         L = [{"seq": t["seq"], "kind": "run", "label": t["label"], "platform": t["platform"], "target": t["target"],
               "redo": t["redo"], "transcripts": bool(t.get("transcripts")), "held": bool(t.get("held")),
-              "interrupted": bool(t.get("interrupted"))} for t in RUNQ]
+              "interrupted": bool(t.get("interrupted")), "lane": lane_of(t)} for t in RUNQ]
         L += [{"seq": t.get("seq", 0), "kind": "add", "label": t.get("label") or "From the inbox",
                "platform": t.get("platform") or "", "target": "", "redo": False, "share": t["id"],
-               "held": bool(t.get("held")), "interrupted": bool(t.get("interrupted"))}
+               "held": bool(t.get("held")), "interrupted": bool(t.get("interrupted")), "lane": "video"}
               for t in INBOX["queue"]]
     return sorted(L, key=lambda x: x["seq"])
 
@@ -3188,7 +3312,10 @@ def queue_remove(body):
 def lined_up():
     """Links that are running now or waiting in line."""
     with INBOX_LOCK:
-        s = set(JOB["urls"]) if JOB["running"] else set()
+        s = set()
+        for job in (JOB, TRJOB):                # a link is not lined up twice, not even once in each lane
+            if job["running"]:
+                s.update(job["urls"])
         for t in RUNQ:
             s.update(t["urls"])
         for t in INBOX["queue"]:
@@ -3209,7 +3336,9 @@ def queue_run(task):
     with INBOX_LOCK:
         if not any(t is task for t in RUNQ):
             return 0
-        return sum(1 for q in queue_list() if q["seq"] < task["seq"] and not q["held"]) + bool(JOB["running"])
+        lane = lane_of(task)                    # only its own lane is ahead of it
+        return (sum(1 for q in queue_list() if q["seq"] < task["seq"] and not q["held"] and q["lane"] == lane)
+                + bool(JOBS[lane]["running"]))
 
 
 def run_fill(task, chained=False):
@@ -3217,7 +3346,7 @@ def run_fill(task, chained=False):
     new_log(chained, task.get("label") or "a share")
     JOB["log"].append(f"-- filling in {task['item'].get('from_name') or 'the'}'s share again (the video is already here)")
     JOB.update(started=time.time(), finished=None, urls=[task["item"]["url"]], progress=None, busy={task["fill"]},
-               share=task["id"])
+               share=task["id"], total=None, transcripts=False, label=task.get("label") or "a share")
     try:
         _finish_add(task, 0, [{"url": task["item"]["url"], "folder": task["fill"]}])
         JOB["log"].append("-- finished")
@@ -3421,31 +3550,35 @@ def shots_setting(v):
         return "auto"
 
 
-def run_job(urls, max_shots="auto", redo=False, flags=(), target=None, share=None, label="", chained=False):
-    # JOB["running"] was already claimed under JOB_LOCK (by start_next, for a Run or an inbox Add)
-    new_log(chained, label or short_url(urls[0] if urls else ""))
-    JOB.update(started=time.time(), finished=None, urls=urls, progress=None, busy={target} if target else set(),
+def run_job(urls, max_shots="auto", redo=False, flags=(), target=None, share=None, label="", chained=False, job=JOB):
+    # job["running"] was already claimed under JOB_LOCK (by start_next, for a Run or an inbox Add); job is the lane's
+    new_log(chained, label or short_url(urls[0] if urls else ""), job)
+    job.update(started=time.time(), finished=None, urls=urls, progress=None, busy={target} if target else set(),
                share=share["id"] if share else None, total=None, transcripts="--transcripts" in flags, vault_warned=False,
-               paused=False, stopping=False, pid=None)
+               paused=False, stopping=False, pid=None, label=label or short_url(urls[0] if urls else ""))
+    try:                                        # one run per lane: this lane's turn flag can only be a leftover
+        (OUT / TR_DIR).mkdir(parents=True, exist_ok=True)
+        (OUT / TR_DIR / (TR_TRBUSY if "--transcripts" in flags else TR_YIELD)).unlink(missing_ok=True)
+    except OSError:
+        pass
     if "--transcripts" in flags:                # a Pause or Stop left over from an earlier run must not hold this one
         try:
-            (OUT / TR_DIR).mkdir(parents=True, exist_ok=True)
             (OUT / TR_DIR / TR_CONTROL).unlink(missing_ok=True)
         except OSError:
             pass
     if share:
-        JOB["log"].append(f"-- adding {share['item'].get('from_name') or 'a'}'s share from the inbox")
+        job["log"].append(f"-- adding {share['item'].get('from_name') or 'a'}'s share from the inbox")
     done = []                                   # @@DONE lines from reels2notes: which folder each link went to
     try:
-        _run_job(urls, max_shots, redo, flags, target, share, done)
+        _run_job(urls, max_shots, redo, flags, target, share, done, job)
     finally:
         with INBOX_LOCK:
             if share:
                 INBOX["adding"] = None
-        end_run()                               # the next one in line starts now
+        end_run(job)                            # the next one of this lane starts now
 
 
-def _transcript_done(d, channels):
+def _transcript_done(d, channels, job=TRJOB):
     """A transcript-only video is done: create its Obsidian note; remember its channel for the channel note."""
     try:
         parts = d["folder"].replace("\\", "/").split("/")
@@ -3455,22 +3588,22 @@ def _transcript_done(d, channels):
         from_channel = d.get("from") == "channel"
         note = transcript_note(folder, from_channel)
         if note.get("path"):
-            JOB["log"].append(f"  Obsidian note: {note['path']}")
+            job["log"].append(f"  Obsidian note: {note['path']}")
         try:
             if _auto_category(folder):                  # the channel's home category, if it has one
-                JOB["log"].append(f"  category: {_hub(folder).get('category')} (the channel's)")
+                job["log"].append(f"  category: {_hub(folder).get('category')} (the channel's)")
         except Exception as e:
-            JOB["log"].append(f"  category not set: {e}")
+            job["log"].append(f"  category not set: {e}")
         if from_channel:
             channels.add(parts[1])
-        elif note.get("error") and not JOB.get("vault_warned"):
-            JOB["log"].append(f"  Obsidian: {note['error']} (no notes this run)")
-            JOB["vault_warned"] = True
+        elif note.get("error") and not job.get("vault_warned"):
+            job["log"].append(f"  Obsidian: {note['error']} (no notes this run)")
+            job["vault_warned"] = True
     except Exception as e:
-        JOB["log"].append(f"  Obsidian: {e}")
+        job["log"].append(f"  Obsidian: {e}")
 
 
-def _run_job(urls, max_shots, redo, flags, target, share, done):
+def _run_job(urls, max_shots, redo, flags, target, share, done, job=JOB):
     env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
     cmd = [sys.executable, "-u", str(SCRIPT), "--out", str(OUT), "--max-shots", str(max_shots)]
     if CONFIG.get("person"):
@@ -3485,24 +3618,24 @@ def _run_job(urls, max_shots, redo, flags, target, share, done):
     cookies = HERE / "cookies.txt"          # optional: login cookies next to the app (git-ignored)
     if cookies.exists():
         cmd += ["--cookies", str(cookies)]
-        JOB["log"].append("-- using cookies.txt for sites that need login")
+        job["log"].append("-- using cookies.txt for sites that need login")
     cmd += urls
     channels = set()                        # transcripts run: channels whose own note is written at the end
     try:
         proc = subprocess.Popen(cmd, cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, encoding="utf-8", errors="replace", env=env)
-        JOB["pid"] = proc.pid
+        job["pid"] = proc.pid
         for line in proc.stdout:
             line = line.rstrip()
             if line.startswith("@@PROGRESS "):
                 try:
-                    JOB["progress"] = {**json.loads(line[11:]), "at": time.time()}
+                    job["progress"] = {**json.loads(line[11:]), "at": time.time()}
                 except ValueError:
                     pass
                 continue
             if line.startswith("@@TOTAL "):        # transcripts run: how many videos it will do
                 try:
-                    JOB["total"] = int(json.loads(line[8:]).get("n"))
+                    job["total"] = int(json.loads(line[8:]).get("n"))
                 except (ValueError, TypeError, AttributeError):
                     pass
                 continue
@@ -3514,18 +3647,19 @@ def _run_job(urls, max_shots, redo, flags, target, share, done):
                 if isinstance(d, dict):
                     done.append(d)
                     if share and not d.get("skipped") and isinstance(d.get("folder"), str):
-                        JOB["busy"].add(d["folder"])   # no edits from the page until the share is filled in
+                        job["busy"].add(d["folder"])   # no edits from the page until the share is filled in
                     if d.get("transcripts") and not d.get("skipped") and isinstance(d.get("folder"), str):
-                        _transcript_done(d, channels)  # its Obsidian note, now
+                        _transcript_done(d, channels, job)  # its Obsidian note, now
                 continue
             if line.startswith("@@CHANNEL "):
                 continue                               # channel notes are written below, once per channel
             if line and "warnings.warn" not in line:
-                JOB["log"].append(line)
+                job["log"].append(line)
                 if DONE_LINE.match(line) or "already done" in line:
-                    JOB["done"] += 1
+                    job["done"] += 1
         proc.wait()
-        JOB.update(paused=False, stopping=False)
+        job.update(paused=False, stopping=False)
+        _drop_lane_flag(proc.pid, TR_TRBUSY if "--transcripts" in flags else TR_YIELD)   # left by a run that broke off
         if "--transcripts" in flags:
             try:
                 (OUT / TR_DIR / TR_CONTROL).unlink(missing_ok=True)
@@ -3535,9 +3669,9 @@ def _run_job(urls, max_shots, redo, flags, target, share, done):
             try:
                 rel = channel_note(key)
                 if rel:
-                    JOB["log"].append(f"-- channel note: {rel}")
+                    job["log"].append(f"-- channel note: {rel}")
             except Exception as e:
-                JOB["log"].append(f"-- channel note of {key}: {e}")
+                job["log"].append(f"-- channel note of {key}: {e}")
         if share:
             _finish_add(share, proc.returncode, done)
         if redo and target and proc.returncode == 0:   # snapshots were replaced: old favorites no longer apply
@@ -3546,15 +3680,30 @@ def _run_job(urls, max_shots, redo, flags, target, share, done):
                 st = read_state(folder)
                 if not st.get("_bad") and st["favorites"]:
                     st["favorites"] = []; write_state(folder, st); write_note_favorites(folder, [])
-                    JOB["log"].append("-- favorites cleared (the snapshots were replaced)")
+                    job["log"].append("-- favorites cleared (the snapshots were replaced)")
         elif redo and target:
-            JOB["log"].append("-- the run failed, so this video's favorites were kept")
-        JOB["log"].append(f"-- finished (exit code {proc.returncode})")
+            job["log"].append("-- the run failed, so this video's favorites were kept")
+        job["log"].append(f"-- finished (exit code {proc.returncode})")
     except Exception as e:
-        JOB["log"].append(f"-- could not start: {e}")
+        job["log"].append(f"-- could not start: {e}")
         if share:
             with INBOX_LOCK:
                 INBOX["errors"][share["id"]] = f"Could not start: {e}"
+
+
+def lane_status(job):
+    """One lane for /api/status: whether it runs, its log, progress (ETA aged by the time since the last update),
+    counts, its label, and Pause / Stop (transcripts lane)."""
+    prog = job["progress"]
+    if prog:
+        prog = {**prog, "eta": None if prog.get("eta") is None else max(0, prog["eta"] - (time.time() - prog["at"])),
+                "elapsed": prog.get("elapsed", 0) + (time.time() - prog["at"])}
+    return {"running": job["running"], "log": job["log"][-300:], "urls": job["urls"], "finished": job["finished"],
+            "progress": prog, "share": job["share"], "done": job["done"], "label": job.get("label") or "",
+            "total": job.get("total") if job.get("total") is not None else len(job["urls"]),
+            "transcripts": bool(job.get("transcripts")),
+            "paused": bool(job.get("paused")) and job["running"], "stopping": bool(job.get("stopping")) and job["running"],
+            "total_elapsed": time.time() - job["started"] if job["started"] else 0}
 
 
 # ---------------------------------------------------------------- HTTP
@@ -3623,6 +3772,7 @@ class Handler(BaseHTTPRequestHandler):
             seq = CHANGED["seq"]                     # read before listing: later fill-ins count as changed
             self.send_json({"reels": list_reels() if CONFIG.get("name") else [], "categories": read_cats(),
                             "channel_cats": channel_cats(), "tags": read_tags(), "homes": read_homes(),
+                            "homes_job": dict(HOMES),
                             "boot": BOOT, "changed_seq": seq,
                             "me": {"name": CONFIG.get("name", ""), "person": CONFIG.get("person", ""),
                                    "can_delete": can_delete(),
@@ -3633,19 +3783,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(inbox_status())
         elif path == "/api/transcripts":
             self.send_json(list_transcripts() if CONFIG.get("name") else {"channels": [], "items": []})
-        elif path == "/api/status":
-            prog = JOB["progress"]
-            if prog:   # age the ETA by the time since the last update
-                prog = {**prog, "eta": None if prog.get("eta") is None else max(0, prog["eta"] - (time.time() - prog["at"])),
-                        "elapsed": prog["elapsed"] + (time.time() - prog["at"])}
-            self.send_json({"running": JOB["running"], "log": JOB["log"][-300:], "urls": JOB["urls"],
-                            "finished": JOB["finished"], "progress": prog, "share": JOB["share"],
-                            "done": JOB["done"], "busy": sorted(JOB["busy"]) if JOB["running"] else [],
-                            "total": JOB.get("total") if JOB.get("total") is not None else len(JOB["urls"]),
-                            "transcripts": bool(JOB.get("transcripts")),
-                            "paused": bool(JOB.get("paused")) and JOB["running"], "stopping": bool(JOB.get("stopping")) and JOB["running"],
-                            "queue": queue_list(), "changed": CHANGED["list"], "boot": BOOT,
-                            "total_elapsed": time.time() - JOB["started"] if JOB["started"] else 0})
+        elif path == "/api/status":                          # both lanes; busy (reels being changed) is the video lane's
+            self.send_json({"running": any_running(), "lanes": {lane: lane_status(JOBS[lane]) for lane in LANES},
+                            "busy": sorted(JOB["busy"]) if JOB["running"] else [],
+                            "transcripts": bool(TRJOB["running"]),
+                            "queue": queue_list(), "changed": CHANGED["list"], "boot": BOOT, "homes_job": dict(HOMES)})
         elif path.startswith("/media/"):
             self.serve_file(path[len("/media/"):])
         else:
@@ -3698,9 +3840,20 @@ class Handler(BaseHTTPRequestHandler):
                                          else "These links are already running or waiting in line")
                     label = (f"{len(urls)} links: " if len(urls) > 1 else "") + short_url(urls[0])   # count first: it stays visible
                     mode = body.get("existing")              # what to do with links that are already done
-                    listing = next((u for u in urls if tr_listing(u)), None)
-                    if listing and not body.get("transcripts"):
-                        raise ValueError(f"{short_url(listing)} is a channel, profile or playlist link: press Transcripts for it (Run takes single videos)")
+                    listings = [u for u in urls if tr_listing(u)]
+                    if listings and not body.get("transcripts"):   # the page lists them and asks which videos
+                        return self.send_json({"listings": listings, "singles": [u for u in urls if u not in listings]})
+                    batch = str(body.get("batch") or "").strip()[:100]
+                    if batch and not body.get("transcripts"):      # chosen from a channel: in groups, already-done skipped
+                        n, ahead = len(urls), None
+                        for i in range(0, n, BATCH):
+                            part = urls[i:i + BATCH]
+                            a = queue_run({"kind": "run", "urls": part, "max_shots": max_shots, "redo": False, "flags": [],
+                                           "target": "", "label": f"{batch}: {i + 1}-{i + len(part)} of {n}",
+                                           "platform": platform_of(part[0]), "transcripts": False})
+                            ahead = a if ahead is None else ahead
+                        return self.send_json({"ok": True, "count": n, "queued": ahead, "skipped": skipped,
+                                               "groups": (n + BATCH - 1) // BATCH})
                     if body.get("transcripts"):              # transcripts only: videos, channels, playlists
                         flags.append("--transcripts")
                         label = "Transcripts: " + (f"{len(urls)} links" if len(urls) > 1 else tr_label(urls[0]))
@@ -3717,6 +3870,8 @@ class Handler(BaseHTTPRequestHandler):
                                    "target": target, "label": label, "platform": platform_of(urls[0]),
                                    "transcripts": "--transcripts" in flags})
                 self.send_json({"ok": True, "count": len(urls), "queued": ahead, "skipped": skipped})
+            elif path == "/api/listing":
+                self.send_json({"ok": True, **list_channel(body.get("url"))})
             elif path == "/api/queue/remove":
                 self.send_json({"ok": True, **queue_remove(body)})
             elif path == "/api/config":
@@ -3888,6 +4043,9 @@ header .spacer{flex:1}
 .btn:hover{border-color:var(--accent)}
 .btn.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:600}
 .btn.small{padding:3px 9px;font-size:12px}
+#run,#trbtn{min-width:104px;text-align:center}
+.btn.primary.trbtn{background:#8fd6a3;border-color:#8fd6a3;color:#0b2414}
+.btn.primary:hover{filter:brightness(1.08)}
 .btn:disabled{opacity:.5;cursor:default}
 .ico{background:none;border:0;color:var(--muted);cursor:pointer;padding:2px 5px;border-radius:5px;font-size:13px;line-height:1}
 .ico:hover{color:var(--text);background:var(--panel2)}
@@ -3942,16 +4100,23 @@ body.resizing-y,body.resizing-y *{cursor:row-resize!important;user-select:none}
 .runbox .row{display:flex;gap:8px;align-items:center}
 .status{font-size:12px;color:var(--muted)}
 .status.on{color:var(--warn)}
-#prog{display:flex;flex-direction:column;gap:4px}
+.prog{display:flex;flex-direction:column;gap:4px}
+.prog:not([hidden])+.prog:not([hidden]){border-top:1px dashed var(--line);padding-top:6px}
 .pline{display:flex;justify-content:space-between;gap:8px;font-size:12px}
 .pline.sub{color:var(--muted);font-size:11px}
-#peta{color:var(--accent);font-variant-numeric:tabular-nums;white-space:nowrap}
+.pline.phead{font-size:11px;color:var(--muted);min-width:0;justify-content:flex-start;align-items:baseline}
+.pline.phead .plane{flex:none;font-size:10.5px;text-transform:uppercase;letter-spacing:.5px}
+.pline.phead .plabel{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.pline.phead .pcount{flex:none;white-space:nowrap;font-variant-numeric:tabular-nums}
+.peta{color:var(--accent);font-variant-numeric:tabular-nums;white-space:nowrap}
 .pbar{height:6px;background:var(--panel2);border-radius:4px;overflow:hidden}
-#pfill{height:100%;width:0;background:var(--accent);transition:width .6s}
-#pfill[data-stage="download"]{background:#6aa8ff}
-#pfill[data-stage="ocr"]{background:var(--star)}
+.pfill{height:100%;width:0;background:var(--accent);transition:width .6s}
+.pfill[data-stage="download"]{background:#6aa8ff}
+.pfill[data-stage="ocr"]{background:var(--star)}
+.pfill[data-stage="waiting"],.pfill[data-stage="paused"]{background:var(--muted)}
 #queue{display:flex;flex-direction:column;gap:3px;border-top:1px dashed var(--line);padding-top:6px}
 #queue .qhead{font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+#qlist li.qsub{cursor:default;font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-top:2px}
 #qlist{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:1px;max-height:150px;overflow-y:auto;contain:inline-size}
 /* contain: long links shorten with ... instead of widening the list (one column below 900 px) */
 #qlist li{display:flex;align-items:center;gap:6px;min-width:0;font-size:12px;line-height:1.5}
@@ -3967,6 +4132,7 @@ body.resizing-y,body.resizing-y *{cursor:row-resize!important;user-select:none}
 #qlist .qhold{font-size:9px;letter-spacing:-1px;min-width:18px}
 .runbox .row{flex-wrap:wrap}
 .modebar{display:flex;gap:4px;padding:10px 12px 0;align-items:center}
+.pbtn.foldall{font-size:19px;line-height:1;padding-bottom:2px}
 .item.tr .tcat{color:var(--accent)}
 .group a.ico{text-decoration:none;line-height:1}
 .mode{flex:1;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:5px 8px;cursor:pointer;color:var(--muted);font-size:12px;font-weight:600;letter-spacing:.4px;text-transform:uppercase;display:flex;justify-content:center;align-items:center;gap:6px}
@@ -4160,6 +4326,12 @@ video.seekflash{animation:seekflash 1s}
 .btn.danger.solid{background:#c94a47;color:#fff;border-color:#c94a47;font-weight:600}
 #confirm{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:50;padding:16px}
 #confirm.show{display:flex}
+#listdlg{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:50;padding:16px}
+#listdlg.show{display:flex}
+.lopts{display:flex;flex-direction:column;gap:8px;margin:0 0 16px;font-size:13px}
+.lopts label{display:flex;align-items:center;gap:8px;cursor:pointer}
+.lopts label:has(input:disabled){opacity:.5}
+.lopts input[type=number]{width:64px;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:2px 6px}
 #setup{position:fixed;inset:0;background:rgba(6,8,10,.92);display:none;align-items:center;justify-content:center;z-index:60;padding:16px}
 #setup.show{display:flex}
 .setbox{width:min(560px,100%);display:flex;flex-direction:column;gap:12px}
@@ -4224,6 +4396,10 @@ video.seekflash{animation:seekflash 1s}
 #log pre{margin:0;padding:10px 12px;overflow:auto;font:12px/1.45 ui-monospace,Consolas,monospace;white-space:pre-wrap;flex:1}
 #log .head{display:flex;align-items:center;padding:6px 10px;border-bottom:1px solid var(--line);gap:8px}
 #log .head span{flex:1;font-size:12px;color:var(--muted)}
+#log .logtabs{display:flex;gap:4px}
+#log .logtabs[hidden]{display:none}
+#log .ltab{background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:1px 8px;font-size:11px;color:var(--muted);cursor:pointer}
+#log .ltab.on{color:var(--text);border-color:var(--accent)}
 #lightbox{position:fixed;inset:0;background:rgba(6,8,10,.97);display:none;align-items:center;justify-content:center;z-index:30}
 #lightbox.show{display:flex}
 #lightbox img{max-width:92vw;max-height:84vh;border-radius:8px}
@@ -4319,7 +4495,7 @@ kbd{background:var(--panel2);border:1px solid var(--line);border-bottom-width:2p
 .lbbar #lbstar{position:static;flex:none}
 @media (max-width:600px){ .lbbar button{font-size:12px;padding:0 10px;height:34px} .lbbar #lbstar{width:34px;height:34px;line-height:34px;font-size:18px} }
 .cardhead{flex-wrap:wrap}
-.cardhead .hint{min-width:0}
+.cardhead .hint{min-width:0;order:9;flex:1 1 260px}   /* a narrow column: the hint goes on its own line under the buttons */
 @media (max-width:1200px){ .cardhead .hint{display:none} }
 body:has(#bulkbar.show) #log{bottom:84px}
 #main.busy #notes,#main.busy .favtext,#main.busy .favs,#main.busy .shots,#main.busy .capbar,#main.busy #favs + *,#main.busy .rowbtns{opacity:.45;pointer-events:none}
@@ -4401,7 +4577,7 @@ body:has(#bulkbar.show) #log{bottom:84px}
       <textarea id="urls" placeholder="Paste Instagram, TikTok, YouTube or X links, one per line. Transcripts also takes YouTube channel and playlist links."></textarea>
       <div class="row">
         <button class="btn primary" id="run">Run</button>
-        <button class="btn" id="trbtn" title="Only the transcript of each video, as a note in Obsidian: no video, no snapshots. YouTube channel and playlist links do every video in them. Captions from YouTube (the creator's, else automatic); Whisper where there are none.">Transcripts</button>
+        <button class="btn primary trbtn" id="trbtn" title="Only the transcript of each video, as a note in Obsidian: no video, no snapshots. YouTube channel and playlist links do every video in them. Captions from YouTube (the creator's, else automatic); Whisper where there are none.">Transcripts</button>
         <select id="maxshots" title="Auto: works out how many snapshots from the video's length and how fast it is edited. Or pick a maximum, or Every ... s to set the seconds between snapshots yourself.">
           <option value="auto" selected>Auto shots</option>
           <option value="60">Max 60</option><option value="120">Max 120</option>
@@ -4411,10 +4587,17 @@ body:has(#bulkbar.show) #log{bottom:84px}
           title="Seconds between snapshots: exactly one every this many seconds, no extra ones at scene cuts (at most 1000 per video)"> 
         <span class="status" id="status">Idle</span>
       </div>
-      <div id="prog" hidden>
-        <div class="pline"><span id="pstage"></span><span id="peta"></span></div>
-        <div class="pbar"><div id="pfill"></div></div>
-        <div class="pline sub"><span id="pvid"></span><span id="pel"></span></div>
+      <div id="prog" class="prog" data-lane="video" hidden>
+        <div class="pline phead" hidden><span class="plane"></span><span class="plabel"></span><span class="pcount"></span></div>
+        <div class="pline"><span class="pstage"></span><span class="peta"></span></div>
+        <div class="pbar"><div class="pfill"></div></div>
+        <div class="pline sub"><span class="pvid"></span><span class="pel"></span></div>
+      </div>
+      <div id="trprog" class="prog" data-lane="tr" hidden>
+        <div class="pline phead" hidden><span class="plane"></span><span class="plabel"></span><span class="pcount"></span></div>
+        <div class="pline"><span class="pstage"></span><span class="peta"></span></div>
+        <div class="pbar"><div class="pfill"></div></div>
+        <div class="pline sub"><span class="pvid"></span><span class="pel"></span></div>
         <div class="pbtns" id="pbtns" hidden>
           <button class="btn small" id="ppause" title="Finish the current video, then wait; Resume goes on">Pause</button>
           <button class="btn small" id="pstop" title="Finish the current video, then stop; Resume on the channel goes on later">Stop</button>
@@ -4428,6 +4611,7 @@ body:has(#bulkbar.show) #log{bottom:84px}
     <div class="modebar" role="tablist">
       <button class="mode on" data-mode="reels" role="tab" aria-selected="true" title="Your videos">Videos</button>
       <button class="mode" data-mode="transcripts" role="tab" aria-selected="false" title="Transcript-only videos, by channel">Transcripts<span class="cn" id="trcount" hidden></span></button>
+      <button class="pbtn foldall" id="foldall" title="Collapse all groups" aria-label="Collapse all groups">&#8863;</button>
       <button class="pbtn" id="lsFold" title="Fold the list">&#8249;</button>
     </div>
     </div>
@@ -4522,9 +4706,15 @@ body:has(#bulkbar.show) #log{bottom:84px}
   <label class="cchk"><input type="checkbox" id="cobs"> Also delete their Obsidian notes and images</label>
   <div class="cbtns"><button class="btn" id="cno">Cancel</button><button class="btn danger solid" id="cyes">Delete</button></div>
 </div></div>
+<div id="listdlg" class="cdlg"><div class="cbox card">
+  <h3 id="ltitle"></h3>
+  <p id="lmsg"></p>
+  <div id="lopts" class="lopts"></div>
+  <div class="cbtns"><button class="btn" id="lno">Cancel</button><button class="btn primary" id="lyes">Download</button></div>
+</div></div>
 <div id="dragghost"></div>
 <div id="log" class="card">
-  <div class="head"><span id="logtitle">Run log</span><button class="btn small" id="closelog">Close</button></div>
+  <div class="head"><span id="logtitle">Run log</span><div class="logtabs" id="logtabs" hidden><button class="ltab" data-loglane="video" title="The log of video runs (Run, Re-process, New version, Inbox Add)">Videos</button><button class="ltab" data-loglane="tr" title="The log of transcripts runs">Transcripts</button></div><button class="btn small" id="closelog">Close</button></div>
   <pre id="logtext"></pre>
 </div>
 <div id="lightbox">
@@ -4561,6 +4751,8 @@ body:has(#bulkbar.show) #log{bottom:84px}
 const $ = s => document.querySelector(s);
 let reels = [], cats = [], filtered = [], current = null, tab = "transcript";
 let lb = {list: [], i: 0}, wasRunning = false, dragFav = null;
+const LANES = ["video", "tr"], LANE_NAME = {video: "Videos", tr: "Transcripts"};   // the two run lanes (2026-11-09)
+let lastStatus = null, logLane = "", trWas = false;      // the last /api/status; the log's lane ("" = follow what runs)
 let collapsed = new Set(), vault = {ok: false, path: ""}, view = "detail", favFull = false;
 let panes = {fp: true, ls: true};            // filters pane and list pane open (localStorage rh-panes)
 try { panes = {...panes, ...JSON.parse(localStorage.getItem("rh-panes") || "{}")}; } catch (e) {}
@@ -4676,6 +4868,7 @@ async function loadReels(keepId, changedIds){
     return r;
   });
   cats = j.categories; chanCats = new Set(j.channel_cats || []); homes = j.homes || homes; tags = j.tags || tags; vault = j.vault || vault; me = j.me || me;
+  trackHomes(j.homes_job);
   if (changedSeq === null) { changedSeq = j.changed_seq || 0; bootId = j.boot; }
   else if (j.boot && j.boot !== bootId) { bootId = j.boot; changedSeq = 0; }
   applyMe();
@@ -4924,6 +5117,35 @@ async function setChannelHome(key, name, cat){
   const n = j.moved ? ` (${j.moved} video${j.moved === 1 ? "" : "s"} moved)` : "";
   toast(cat ? `${name} is now in ${cat}${n}` : `${name} has no category now${n}`);
 }
+/* Collapse all / Expand all (2026-11-09, Simeon): one button in the mode bar for the list that is showing.
+   Collapse all folds every group and every channel group inside them; Expand all opens everything. */
+function listKeys(){                      // the collapse keys of the groups the list shows now: top level, and the channel groups inside
+  const top = [], subs = [];
+  if (mode === "transcripts") {
+    trGroups().forEach(g => { top.push(g.key);
+      if (g.kind === "cat") subGroups(tr.items.filter(g.test), g.cat, it => it.ch, it => chanName(it.ch)).subs.forEach(x => subs.push(subKey(g.cat, x.key))); });
+  } else {
+    groupsFor().forEach(g => { top.push(g.label);
+      if (g.kind === "cat") subGroups(reels.filter(g.test), g.cat, r => r.ch, r => r.chname).subs.forEach(x => subs.push(subKey(g.cat, x.key))); });
+  }
+  return {top, subs};
+}
+const foldSet = () => mode === "transcripts" ? trCollapsed : collapsed;
+function allFolded(){ const {top} = listKeys(); return top.length > 0 && top.every(k => foldSet().has(k)); }
+function saveCollapsed(){ try { localStorage.setItem("rh-collapsed", JSON.stringify([...collapsed])); localStorage.setItem("rh-trcollapsed", JSON.stringify([...trCollapsed])); } catch (e) {} }
+function updateFoldBtn(){
+  const b = $("#foldall"); if (!b) return;
+  const all = allFolded();
+  b.innerHTML = all ? "&#8862;" : "&#8863;";
+  b.title = all ? "Expand all groups" : "Collapse all groups (each category and the channels inside)";
+  b.setAttribute("aria-label", all ? "Expand all groups" : "Collapse all groups");
+}
+function foldAll(){
+  const set = foldSet(), {top, subs} = listKeys();
+  if (allFolded()) { [...top, ...subs, CH_KEY].forEach(k => set.delete(k)); }   // this grouping open again (another grouping's folds stay)
+  else { top.forEach(k => set.add(k)); subs.forEach(k => set.add(k)); }
+  saveCollapsed(); renderList();
+}
 function reelItem(r, sub){
   return `
       <div class="item ${sub ? "sub" : ""} ${current && current.id===r.id?"active":""} ${selected.has(r.id)?"sel":""}" data-id="${esc(r.id)}" draggable="true">
@@ -4967,6 +5189,7 @@ function renderList(){
   });
   const html = assemble(parts, collapsed);
   $("#list").innerHTML = html || `<div class="empty">No matches</div>`;
+  updateFoldBtn();
   if (view === "gallery") renderGallery();
 }
 
@@ -5120,7 +5343,7 @@ async function reprocess(r){
   if (j.queued) waitingIds.add(r.id);
   showBusy();
   toast(j.queued ? `Re-process queued: ${queuedText(j.queued)}` : "Re-processing... favorites are cleared only if it succeeds");
-  $("#log").classList.add("show"); ensurePoll();
+  openLog("video"); ensurePoll();
 }
 async function newVersion(r){
   const n = shotsValue(), nTxt = shotsText(n);
@@ -5128,9 +5351,9 @@ async function newVersion(r){
   let j;
   try { j = await api("/api/run", {target: r.id, action: "new", max_shots: n}); } catch (e) { return alert(e.message); }
   if (j.queued) toast(`New version queued: ${queuedText(j.queued)}`);
-  $("#log").classList.add("show"); ensurePoll();
+  openLog("video"); ensurePoll();
 }
-const queuedText = n => n === 1 ? "it starts when the current run finishes" : `${n} ahead of it, it starts by itself`;
+const queuedText = n => n === 1 ? "it starts when the current run of its kind finishes" : `${n} ahead of it, it starts by itself`;
 function chooseExisting(list, total, share){      // share: an inbox item (Add of a video you already have)
   return new Promise(res => {
     const box = $("#choice");
@@ -5773,6 +5996,7 @@ document.addEventListener("click", async e => {
   if (c("#fpFold")) { panes.fp = false; return applyPanes(); }
   if (c("#lsOpen") || c("#lsRail")) { panes.ls = true; return applyPanes(); }
   if (c("#lsFold")) { panes.ls = false; return applyPanes(); }
+  if (c("#foldall")) return foldAll();
   if ((el = c("[data-pmhome]"))) { const m = $("#pmenu"); return setChannelHome(m.dataset.key, m.dataset.name, el.dataset.pmhome); }
   if (c("[data-pmnew]")) { const m = $("#pmenu"), key = m.dataset.key, name = m.dataset.name; closeMenu();
     const n = prompt(`New category for ${name}`); if (!n || !n.trim()) return;
@@ -5814,6 +6038,7 @@ document.addEventListener("click", async e => {
   if ((el = c("[data-share]"))) return current && shareReels([current.id], el.dataset.share);
   if ((el = c("[data-bulkshare]"))) return shareReels([...selected], el.dataset.bulkshare);
   if ((el = c("[data-qrm]"))) return removeQueued(el);
+  if (t.dataset && t.dataset.loglane) { logLane = t.dataset.loglane; return renderLog(); }
   if ((el = c("[data-qhold]"))) { const held = el.dataset.held !== "1";
     try { await api("/api/queue/hold", {seq: +el.dataset.qhold, held}); } catch (err) { toast(err.message); }
     toast(held ? "Set for later: it waits in line until you press \u25B6" : "It runs when its turn comes"); lastQueueHtml = null; return ensurePoll(); }
@@ -5897,7 +6122,7 @@ document.addEventListener("click", async e => {
     case "printbtn": renderPaper(); return $("#printsheet").classList.add("show");
     case "pclose": return $("#printsheet").classList.remove("show");
     case "pprint": return window.print();
-    case "showlog": return $("#log").classList.add("show");
+    case "showlog": return openLog();
     case "viewbtn": if (mode === "transcripts") setMode("reels"); return setView(view === "gallery" ? "detail" : "gallery");
     case "expandbtn": return toggleFull();
     case "closelog": return $("#log").classList.remove("show");
@@ -5915,6 +6140,13 @@ document.addEventListener("click", async e => {
         const body = {urls: $("#urls").value, max_shots: shotsValue()};
         let j;
         try { j = await api("/api/run", body); } catch (err) { return alert(err.message); }
+        if (j.listings) {                    // channel, playlist or profile links: list them and ask which videos
+          $("#urls").value = "";
+          for (const u of j.listings) await runListing(u, body.max_shots);
+          if (!j.singles.length) return;
+          body.urls = j.singles.join("\n");
+          try { j = await api("/api/run", body); } catch (err) { return alert(err.message); }
+        }
         if (j.existing) {
           const pick = await chooseExisting(j.existing, j.total);
           if (!pick) return;
@@ -5925,7 +6157,7 @@ document.addEventListener("click", async e => {
         const left = j.skipped ? ` (${j.skipped} link${j.skipped > 1 ? "s were" : " was"} already running or waiting, left out)` : "";
         $("#urls").value = "";
         if (j.queued) toast(`Queued: ${queuedText(j.queued)}${left}`);           // waits in line: see Waiting
-        else { if (left) toast("Running" + left); $("#log").classList.add("show"); }
+        else { if (left) toast("Running" + left); openLog("video"); }
         ensurePoll();
       } finally { runBusy = false; $("#run").disabled = false; }   // Run is off only while a press is being sent
       return;
@@ -5985,10 +6217,10 @@ addEventListener("resize", closeMenu);
 document.addEventListener("scroll", e => { if ($("#pmenu") && Date.now() - menuAt > 300 && !(e.target.closest && e.target.closest("#pmenu"))) closeMenu(); }, true);
 
 /* drag: favorites reorder + reels onto categories (+ a whole channel onto a category, 2026-11-09) */
-let dragQ = null;                          // the Waiting list item being dragged (its seq)
+let dragQ = null, dragQLane = "";          // the Waiting list item being dragged (its seq, its lane)
 document.addEventListener("dragstart", e => {
-  const ql = e.target.closest && e.target.closest("#qlist li");
-  if (ql) { dragQ = +ql.dataset.qseq; ql.classList.add("dragging"); e.dataTransfer.setData("text/plain", "queue"); e.dataTransfer.effectAllowed = "move"; return; }
+  const ql = e.target.closest && e.target.closest("#qlist li[data-qseq]");
+  if (ql) { dragQ = +ql.dataset.qseq; dragQLane = ql.dataset.qlane; ql.classList.add("dragging"); e.dataTransfer.setData("text/plain", "queue"); e.dataTransfer.effectAllowed = "move"; return; }
   const chh = e.target.closest && e.target.closest("[data-chkey][draggable]");
   if (chh) { e.dataTransfer.setData("text/plain", "chan:" + JSON.stringify({key: chh.dataset.chkey, name: chh.dataset.chname || chh.dataset.chkey}));
     e.dataTransfer.effectAllowed = "move"; chh.classList.add("dragging"); return; }
@@ -6011,7 +6243,7 @@ document.addEventListener("dragstart", e => {
 });
 document.addEventListener("dragend", () => { dragFav = null; dragQ = null; document.querySelectorAll(".dragging,.over,.drop").forEach(x => x.classList.remove("dragging","over","drop")); });
 document.addEventListener("dragover", e => {
-  if (dragQ !== null) { const li = e.target.closest && e.target.closest("#qlist li");
+  if (dragQ !== null) { const li = e.target.closest && e.target.closest(`#qlist li[data-qlane="${dragQLane}"]`);
     if (li) { e.preventDefault(); document.querySelectorAll("#qlist li.over").forEach(x => x !== li && x.classList.remove("over")); li.classList.add("over"); }
     return; }
   const fav = e.target.closest && e.target.closest(".fav");
@@ -6029,8 +6261,8 @@ function groupFor(el){ // the category header that a list element sits under
 }
 document.addEventListener("drop", e => {
   if (dragQ !== null) {                                       // the Waiting list: drop onto another item = its place
-    const li = e.target.closest && e.target.closest("#qlist li"), seq = dragQ; dragQ = null;
-    if (li) { e.preventDefault(); const to = [...$("#qlist").children].indexOf(li);
+    const li = e.target.closest && e.target.closest(`#qlist li[data-qlane="${dragQLane}"]`), seq = dragQ; dragQ = null;
+    if (li) { e.preventDefault(); const to = [...$("#qlist").querySelectorAll(`li[data-qlane="${dragQLane}"]`)].indexOf(li);
       if (+li.dataset.qseq !== seq) api("/api/queue/move", {seq, to}).catch(err => toast(err.message)).finally(() => { lastQueueHtml = null; ensurePoll(); }); }
     return;
   }
@@ -6066,6 +6298,7 @@ document.addEventListener("drop", e => {
 
 document.addEventListener("keydown", e => {
   if (e.key === "Escape" && $("#pmenu")) { e.preventDefault(); return closeMenu(); }
+  if (e.key === "Escape" && $("#listdlg").classList.contains("show")) { e.preventDefault(); return $("#lno").click(); }
   if (ed) return edKey(e);
   if (openDrop && e.key === "Escape") { e.preventDefault(); openDrop = ""; return renderList(); }
   if ($("#setup").classList.contains("show")) {
@@ -6261,19 +6494,30 @@ async function testCloud(){
 /* ---------- progress / ETA ---------- */
 const hms = sec => { sec = Math.max(0, Math.round(sec)); const h = Math.floor(sec/3600), m = Math.floor(sec%3600/60), x = sec%60;
   return h ? `${h}:${String(m).padStart(2,"0")}:${String(x).padStart(2,"0")}` : `${m}:${String(x).padStart(2,"0")}`; };
-function showProgress(s){
-  const p = s.progress, box = $("#prog");
-  $("#pbtns").hidden = !(s.running && s.transcripts);
-  $("#ppause").textContent = s.paused ? "Resume" : "Pause";
-  $("#ppause").disabled = !!s.stopping; $("#pstop").disabled = !!s.stopping;
-  if (!s.running || !p) { box.hidden = !s.running; if (s.running) { $("#pstage").textContent = "Starting..."; $("#peta").textContent = ""; $("#pfill").style.width = "0%"; $("#pvid").textContent = ""; $("#pel").textContent = ""; } return; }
-  box.hidden = false;
-  $("#pstage").textContent = `${p.label} ${p.stage_pct ? Math.round(p.stage_pct) + "%" : ""}`;
-  $("#peta").textContent = p.stage === "paused" ? "paused" : s.stopping ? "stopping after this video" : p.eta == null ? "estimating..." : (p.eta_partial ? `download ~${hms(p.eta)} left` : `~${hms(p.eta)} left`);
-  $("#pfill").style.width = `${Math.min(100, p.stage_pct || 0)}%`;
-  $("#pfill").dataset.stage = p.stage;
-  $("#pvid").textContent = p.n > 1 ? `Video ${p.i} of ${p.n}` : "This video";
-  $("#pel").textContent = `${hms(p.elapsed)} elapsed`;
+function showProgress(s){            // one box per lane (2026-11-09): Videos and Transcripts run side by side
+  const L = s.lanes || {}, both = !!(L.video && L.video.running && L.tr && L.tr.running);
+  const t = L.tr || {};
+  $("#pbtns").hidden = !(t.running && t.transcripts);
+  $("#ppause").textContent = t.paused ? "Resume" : "Pause";
+  $("#ppause").disabled = !!t.stopping; $("#pstop").disabled = !!t.stopping;
+  showLane($("#prog"), L.video || {}, both); showLane($("#trprog"), t, both);
+}
+function showLane(box, s, both){
+  const p = s.progress, q = sel => box.querySelector(sel);
+  box.hidden = !s.running;
+  if (!s.running) return;
+  q(".phead").hidden = !both;                         // which box is which, when both run
+  q(".plane").textContent = LANE_NAME[box.dataset.lane];
+  q(".plabel").textContent = String(s.label || "").replace(/^Transcripts( again)?: /, "");
+  q(".plabel").title = s.label || "";
+  q(".pcount").textContent = `${s.done || 0} / ${s.total != null ? s.total : (s.urls || []).length} done`;
+  if (!p) { q(".pstage").textContent = "Starting..."; q(".peta").textContent = ""; q(".pfill").style.width = "0%"; q(".pvid").textContent = ""; q(".pel").textContent = ""; return; }
+  q(".pstage").textContent = `${p.label} ${p.stage_pct && p.stage !== "waiting" && p.stage !== "paused" ? Math.round(p.stage_pct) + "%" : ""}`;
+  q(".peta").textContent = p.stage === "paused" ? "paused" : p.stage === "waiting" ? "waiting" : s.stopping ? "stopping after this video" : p.eta == null ? "estimating..." : (p.eta_partial ? `download ~${hms(p.eta)} left` : `~${hms(p.eta)} left`);
+  q(".pfill").style.width = `${Math.min(100, p.stage_pct || 0)}%`;
+  q(".pfill").dataset.stage = p.stage;
+  q(".pvid").textContent = p.n > 1 ? `Video ${p.i} of ${p.n}` : "This video";
+  q(".pel").textContent = `${hms(p.elapsed)} elapsed`;
 }
 
 /* ---------- transcripts: the catalogue of transcript-only videos (by channel) ---------- */
@@ -6386,6 +6630,7 @@ function renderTrList(){
   });
   const html = assemble(parts, trCollapsed);
   $("#list").innerHTML = html || `<div class="empty">${tr.items.length ? "No matches" : "No transcripts yet.<br><br>Paste a YouTube channel link, a playlist link or video links above and press <b>Transcripts</b>."}</div>`;
+  updateFoldBtn();
 }
 const trCatSelect = it => `<select id="trcat">${["", ...cats].map(c => `<option value="${esc(c)}" ${trCatOf(it)===c?"selected":""}>${c?esc(c):"Unassigned"}</option>`).join("")}</select>`;
 async function trSetCategory(it, cat){
@@ -6498,7 +6743,7 @@ async function runTranscripts(){
     const left = j.skipped ? ` (${j.skipped} link${j.skipped > 1 ? "s were" : " was"} already running or waiting, left out)` : "";
     $("#urls").value = "";
     if (j.queued) toast(`Queued: ${queuedText(j.queued)}${left}`);
-    else { toast("Getting transcripts - see the Log" + left); $("#log").classList.add("show"); }
+    else { toast("Getting transcripts - see the Log" + left); openLog("tr"); }
     ensurePoll();
     if (mode !== "transcripts") setMode("transcripts");
   } finally { runBusy = false; $("#trbtn").disabled = false; }
@@ -6507,7 +6752,42 @@ async function trGet(it){
   let j;
   try { j = await api("/api/run", {urls: it.url, max_shots: shotsValue(), existing: "skip"}); } catch (err) { return alert(err.message); }
   if (j.queued) toast(`Queued: ${queuedText(j.queued)}`);
-  else { toast("Downloading the video - it shows under Videos when it is done"); $("#log").classList.add("show"); }
+  else { toast("Downloading the video - it shows under Videos when it is done"); openLog("video"); }
+  ensurePoll();
+}
+/* Run on a channel, playlist or profile link (2026-11-09): the server lists it, you choose which videos, and they
+   wait in line in groups of 10 (each group can be set for Later or taken out like any Run). */
+async function runListing(url, maxShots){
+  toast("Listing " + url.replace(/^https?:\/\/(www\.)?/, "") + " ...");
+  let L;
+  try { L = await api("/api/listing", {url}); } catch (err) { return alert(err.message); }
+  const notFull = L.videos.filter(v => v.state !== "full"), none = L.videos.filter(v => !v.state);
+  const full = L.count - notFull.length, tr = L.videos.filter(v => v.state === "tr").length;
+  if (!notFull.length) return toast(`${L.title}: all ${L.count} videos are already downloaded`);
+  const first = L.playlist ? "first" : "newest";
+  const ans = await new Promise(res => {
+    const d = $("#listdlg");
+    $("#ltitle").textContent = `Download from ${L.title}`;
+    $("#lmsg").textContent = `${L.count} video${L.count === 1 ? "" : "s"}${L.playlist ? " in this playlist" : " on this channel"}: ${full} already downloaded, ${tr} with a transcript only, ${none.length} not here yet.\n\nEach one is downloaded and processed in full (transcript, snapshots, on-screen text, note), one after another, in groups of 10 in the waiting line.`;
+    $("#lopts").innerHTML = `
+      <label><input type="radio" name="lpick" value="all" checked> All not downloaded yet (${notFull.length})</label>
+      <label><input type="radio" name="lpick" value="none" ${none.length ? "" : "disabled"}> Only those without a transcript either (${none.length})</label>
+      <label><input type="radio" name="lpick" value="first"> The ${first} <input type="number" id="lnum" min="1" max="${notFull.length}" value="${Math.min(10, notFull.length)}"> not downloaded yet</label>`;
+    d.classList.add("show");
+    setTimeout(() => $("#lno").focus(), 0);
+    const done = v => { d.classList.remove("show"); $("#lyes").onclick = $("#lno").onclick = null; res(v); };
+    $("#lnum").onfocus = () => { d.querySelector('input[value="first"]').checked = true; };
+    $("#lyes").onclick = () => done({pick: d.querySelector('input[name="lpick"]:checked').value, n: Math.max(1, parseInt($("#lnum").value, 10) || 1)});
+    $("#lno").onclick = () => done(null);
+  });
+  if (!ans) return;
+  const chosen = ans.pick === "none" ? none : ans.pick === "first" ? notFull.slice(0, ans.n) : notFull;
+  if (!chosen.length) return toast("Nothing to download");
+  let j;
+  try { j = await api("/api/run", {urls: chosen.map(v => v.url).join("\n"), max_shots: maxShots, batch: L.title, existing: "skip"}); }
+  catch (err) { return alert(err.message); }
+  toast(`${j.count} video${j.count === 1 ? "" : "s"} from ${L.title} in line (${j.groups} group${j.groups === 1 ? "" : "s"})` + (j.skipped ? `, ${j.skipped} already in line` : ""));
+  if (!j.queued) openLog("video");
   ensurePoll();
 }
 function askConfirm(title, msg, obsLabel, yes){
@@ -6559,6 +6839,26 @@ function takeChanged(list, boot){          // reels an inbox Add filled in since
   changedSeq = L.reduce((m, c) => Math.max(m, c.seq || 0), changedSeq);
   return ids;
 }
+/* the one-time change of channel categories into channel groups (2026-11-09) runs in the background on the server:
+   show how far it is in the status line and reload the library when it is done */
+let homesWatch = false, homesJob = null;
+function homesText(h){ homesJob = h; const st = $("#status"); if (!st.classList.contains("on")) st.textContent = `Channel groups: ${h.done || 0} / ${h.total || "..."}`; }
+function trackHomes(h){
+  if (!h || h.state !== "running" || homesWatch) return;
+  homesWatch = true; homesText(h);
+  const tick = async () => {
+    let s; try { s = await api("/api/status"); } catch (e) { setTimeout(tick, 3000); return; }
+    const job = s.homes_job || {};
+    if (job.state === "running") { homesText(job); setTimeout(tick, 2000); return; }
+    homesWatch = false; homesJob = null;
+    if (!$("#status").classList.contains("on")) $("#status").textContent = "Idle";
+    if (job.state === "done") toast("Channels are now groups inside your categories");
+    else if (job.state === "error") toast(`Channel groups: stopped (${job.error || "error"}); it goes on at the next start`);
+    try { await loadReels(current && current.id, new Set(reels.map(r => r.id))); } catch (e) {}
+    loadTr().catch(() => {});
+  };
+  setTimeout(tick, 2000);
+}
 function ensurePoll(){ if (!polling) poll(); }
 async function poll(){
   polling = true;
@@ -6566,18 +6866,20 @@ async function poll(){
   let s;
   try { s = await api("/api/status"); }
   catch (e) { setTimeout(poll, 3000); return; }          // server hiccup: keep trying
-  const q = s.queue || [];
-  $("#logtext").textContent = s.log.join("\n") || "(waiting for output)";
-  $("#logtext").scrollTop = 1e9;
-  $("#status").textContent = s.running ? `Running · ${s.done || 0} / ${s.total != null ? s.total : s.urls.length} done` : (s.finished ? "Finished" : "Idle");
+  const q = s.queue || [], L = s.lanes, runs = LANES.filter(k => L[k].running);
+  lastStatus = s; renderLog();
+  const one = runs.length === 1 ? L[runs[0]] : null;
+  $("#status").textContent = runs.length > 1 ? "Running · 2 at once"
+    : one ? `Running · ${one.done || 0} / ${one.total != null ? one.total : one.urls.length} done`
+    : homesWatch && homesJob ? `Channel groups: ${homesJob.done || 0} / ${homesJob.total || "..."}` : (L.video.finished || L.tr.finished ? "Finished" : "Idle");
   showProgress(s); showQueue(q);
   $("#status").classList.toggle("on", s.running);
-  $("#logtitle").textContent = s.running ? "Run log · working (first run downloads models)" : "Run log";
   const fresh = takeChanged(s.changed, s.boot);
   const ended = syncBusy(s, q, ep);                       // a re-process that finished, even with more in line
+  const trEnded = trWas && !s.transcripts; trWas = !!s.transcripts;
   if (s.running || q.some(x => !x.held)) {             // only items set for Later: nothing to watch
     wasRunning = true; refreshQuiet().catch(() => {});
-    if (s.transcripts && ++trTick % 5 === 0) loadTr().catch(() => {});   // the catalogue fills up as it runs
+    if ((s.transcripts && ++trTick % 5 === 0) || trEnded) loadTr().catch(() => {});   // the catalogue fills up as it runs
     if (fresh.size || ended.length) reloadChanged(new Set([...fresh, ...ended]));
     setTimeout(poll, 1000); return;
   }
@@ -6592,6 +6894,22 @@ async function poll(){
     loadTr().catch(() => {});                              // a transcripts run adds videos; a full Run marks one
   }
 }
+/* the Run log: one per lane; tabs when both lanes have lines. logLane "" = follow what runs */
+function renderLog(){
+  const s = lastStatus; if (!s || !s.lanes) return;
+  const L = s.lanes, has = k => L[k].running || L[k].log.length;
+  let lane = logLane && has(logLane) ? logLane
+    : L.video.running !== L.tr.running ? (L.video.running ? "video" : "tr")
+    : !L.video.running && (L.tr.finished || 0) > (L.video.finished || 0) ? "tr" : "video";
+  const tabs = has("video") && has("tr");
+  $("#logtabs").hidden = !tabs;
+  document.querySelectorAll("#logtabs .ltab").forEach(b => b.classList.toggle("on", b.dataset.loglane === lane));
+  const pre = $("#logtext"), text = L[lane].log.join("\n") || "(waiting for output)";
+  if (pre.dataset.lane !== lane || pre.textContent !== text) { pre.textContent = text; pre.scrollTop = 1e9; pre.dataset.lane = lane; }
+  $("#logtitle").textContent = (tabs ? "Run log" : `Run log${L.tr.log.length && lane === "tr" ? " · transcripts" : ""}`)
+    + (L[lane].running ? " · working (first run downloads models)" : "");
+}
+function openLog(lane){ if (lane) logLane = lane; renderLog(); $("#log").classList.add("show"); }
 async function reloadChanged(ids){       // reels a run changed: take the server's copy (others keep your edits)
   const redone = [...ids].filter(id => lastRunTargets.has(id));
   redone.forEach(id => lastRunTargets.delete(id));
@@ -6614,14 +6932,16 @@ function showQueue(q){                    // the Waiting list under the progress
   $("#queue").hidden = !q.length;
   const later = q.filter(x => x.held).length;
   $("#qhead").textContent = q.length ? `Waiting · ${q.length}${later ? ` (${later} for later)` : ""}` : "";
-  const html = q.map((x, i) => `<li class="${x.held ? "held" : ""}" draggable="true" data-qseq="${x.seq}" title="Drag to move it up or down the line"><span class="qn">${i + 1}.</span>${x.platform ? pbadge({platform: x.platform}) : ""}`
+  const lanes = LANES.map(k => q.filter(x => (x.lane || "video") === k)), split = lanes.every(a => a.length);
+  const html = lanes.map((part, li) => (split ? `<li class="qsub">${LANE_NAME[LANES[li]]}</li>` : "") + part.map((x, i, q) =>
+    `<li class="${x.held ? "held" : ""}" draggable="true" data-qseq="${x.seq}" data-qlane="${x.lane || "video"}" title="Drag to move it up or down the line"><span class="qn">${i + 1}.</span>${x.platform ? pbadge({platform: x.platform}) : ""}`
     + `<span class="ql" title="${esc(x.label)}">${esc(x.label)}</span>`
     + (x.held ? `<span class="qlater" title="${x.interrupted ? "It was running when the app closed. Press &#9654; to run it again (what is done is skipped for transcripts)" : "Set for later: it stays in line and waits until you press &#9654;"}">${x.interrupted ? "stopped" : "later"}</span>` : "")
     + `<button class="ico" data-qmove="-1" data-qs="${x.seq}" title="Move up" ${i === 0 ? "disabled" : ""}>&#8593;</button>`
     + `<button class="ico" data-qmove="1" data-qs="${x.seq}" title="Move down" ${i === q.length - 1 ? "disabled" : ""}>&#8595;</button>`
     + `<button class="ico qhold" data-qhold="${x.seq}" data-held="${x.held ? 1 : 0}" title="${x.held ? "Run it when its turn comes" : "Later: keep it in line but don't run it (stays so when you close the app)"}">${x.held ? "&#9654;" : "&#10074;&#10074;"}</button>`
     + `<button class="ico" data-qrm="${x.seq}" data-qkind="${esc(x.kind)}" data-qtarget="${esc(x.redo ? x.target : "")}" aria-label="Take it out of the line" `
-    + `title="${x.kind === "add" ? "Take it out of the line (the share stays in your Inbox)" : "Take it out of the line"}">&times;</button></li>`).join("");
+    + `title="${x.kind === "add" ? "Take it out of the line (the share stays in your Inbox)" : "Take it out of the line"}">&times;</button></li>`).join("")).join("");
   if (html !== lastQueueHtml) { $("#qlist").innerHTML = html; lastQueueHtml = html; }   // unchanged: leave hover and focus alone
 }
 async function removeQueued(el){
@@ -6629,6 +6949,7 @@ async function removeQueued(el){
   let j;
   try { j = await api("/api/queue/remove", {seq: +el.dataset.qrm}); }
   catch (e) { toast(e.message); return ensurePoll(); }
+  const row = el.closest("li"); if (row) row.remove();
   if (target) { busyEpoch++; busyIds.delete(target); waitingIds.delete(target); lastRunTargets.delete(target); showBusy(); }
   const back = (j.urls || []).filter(u => !$("#urls").value.includes(u));
   if (back.length) $("#urls").value = [$("#urls").value.trim(), ...back].filter(Boolean).join("\n");
@@ -6748,6 +7069,7 @@ def main():
         n = queue_restore()
         if n:
             print(f"Waiting line: {n} item(s) from last time (the one that was running is set for Later)")
+        start_homes()                               # one time: channel categories -> channel groups (background)
     if cloud_settings():
         print(f"Sharing: inbox at {CONFIG['cloud']['url']} (checked every {PICKUP_EVERY} s while this runs)")
     threading.Thread(target=inbox_worker, daemon=True).start()
