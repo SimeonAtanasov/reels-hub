@@ -503,6 +503,7 @@ def write_state(folder, state):
 def list_reels():
     if not OUT.exists():
         return []
+    ensure_homes()
     items = []
     for f in OUT.iterdir():
         if not f.is_dir() or f.name.startswith(("_", ".")):
@@ -518,6 +519,10 @@ def list_reels():
             r["obsidian"] = ensure_vault_note(f, r)
         except Exception as e:
             r["obsidian"] = {"error": f"Obsidian: {e}"}
+        try:
+            r["ch"], r["chname"] = reel_channel(f)      # the channel group it shows in, inside its category
+        except Exception:
+            r["ch"], r["chname"] = "", ""
         items.append(r)
     return sorted(items, key=lambda r: (r["date"], r["id"]), reverse=True)
 
@@ -633,7 +638,8 @@ def _ensure_vault_note(folder, r):
             return {"pending": True}       # a video being added from the inbox: its note waits for the share's notes
         rel = _adopt_transcript_note(folder, r)      # the same video as a transcript-only note: keep that note
     if not rel:
-        dname = note_home(r["platform"], state["category"] if state["category"] in read_cats() else "")
+        cat = state["category"] if state["category"] in read_cats() else ""
+        dname = note_home(r["platform"], cat, _note_chan(folder, cat))
         base = NOTE_PREFIX.get(r["platform"], "") + clean_name(r["label"], r["id"]) + (f" (v{r['version']})" if r["version"] > 1 else "")
         name, k = base, 2
         while (VAULT / dname / f"{name}.md").exists():
@@ -939,7 +945,7 @@ def tr_item(folder, key):
         it["full_flag"] = st.get("full") or ""
         it["category"] = str(st.get("category") or "")[:100]
         it["tags"] = _clean_tags(st.get("tags"))
-        it["cat_set"] = "category" in st or st.get("from") == "link"    # a channel's video with no category yet: see _auto_category
+        it["cat_set"] = "category" in st             # no category yet: its channel's home, if any (_auto_category)
         TR_CACHE[str(folder)] = (mt, dict(it))
     rel = it.pop("note_path")
     it["note"] = {"name": Path(rel).stem, "path": rel, "uri": obsidian_uri(rel)} if rel and (VAULT / rel).is_file() else None
@@ -954,18 +960,21 @@ def _tr_folders(cdir):
 
 def list_transcripts():
     """The catalogue: channels (folders in _transcripts) and their transcript-only videos."""
+    ensure_homes()
     root = OUT / TR_DIR
     chans, items = [], []
+    homes = read_homes()
     for cdir in (sorted(root.iterdir()) if root.is_dir() else []):
         if not cdir.is_dir() or cdir.name.startswith((".", "_")):
             continue
         meta = _channel_meta(cdir)
+        home = home_of(cdir.name, homes)
         n = 0
         for f in _tr_folders(cdir):
             it = tr_item(f, cdir.name)
-            if it and not it["cat_set"] and meta.get("run"):     # a channel run's video: the channel is its category
+            if it and not it["cat_set"] and home:                # no category yet: the channel's home
                 try:
-                    _auto_category(f)
+                    _auto_category(f, homes)
                     it = tr_item(f, cdir.name) or it
                 except Exception as e:
                     print(f"  {f.name}: category not set ({e})")
@@ -973,14 +982,14 @@ def list_transcripts():
                 items.append(it); n += 1
         rel = meta.get("note_path") or ""
         note = {"name": Path(rel).stem, "path": rel, "uri": obsidian_uri(rel)} if rel and (VAULT / rel).is_file() else None
-        chans.append({"key": cdir.name, "name": meta.get("name") or cdir.name, "handle": meta.get("handle", ""),
+        chans.append({"key": cdir.name, "name": meta.get("name") or cdir.name, "handle": meta.get("handle", ""), "home": home,
                       "url": meta.get("url", ""), "platform": meta.get("platform", ""), "count": n, "note": note,
                       "run": tr_run_state(meta.get("run")),
                       "wrong_lang": sum(1 for it in items if it["ch"] == cdir.name and _pref_lang() and "caption" in (it["source"] or "")
                                         and not it["full"] and not _lang_ok(it["lang"], _pref_lang()))})
     _add_reels(chans, items)
     items.sort(key=lambda x: (x["date"], x["id"]), reverse=True)
-    return {"channels": chans, "items": items, "channel_cats": channel_cats(), "tags": read_tags()}
+    return {"channels": chans, "items": items, "channel_cats": channel_cats(), "tags": read_tags(), "homes": homes}
 
 
 def _video_id(folder_name):
@@ -1023,14 +1032,15 @@ def _add_reels(chans, items):
             known[key] = {"key": key, "name": r2n.tr_name(info, url) if has_ch else "Unknown channel",
                           "handle": ("@" + r2n._handle(info, url).lstrip("@")) if has_ch else "",
                           "url": r2n._channel_url(url, info) if has_ch else "", "platform": rk.get("platform") or "",
-                          "count": 0, "note": None, "run": None, "wrong_lang": 0, "videos_only": True}
+                          "count": 0, "note": None, "run": None, "wrong_lang": 0, "videos_only": True,
+                          "home": home_of(key) if has_ch else ""}
             chans.append(known[key])
         known[key]["count"] += 1
         rk.update(ch=key, reel=f.name, full=f.name, category=st["category"], tags=st["tags"], source="video")
         items.append(rk)
 
 
-def _tr_set_category(folder, cat, prev=None):
+def _tr_set_category(folder, cat, prev=None, refresh=True):
     """A video's category (transcript folder or reel): hub.json, and in its note the #Category tag on the **Tags**
     line (the tag the app set before is taken out) plus the **Category** line where the note has one; then the note
     moves to <platform>/<category>/ (move_note)."""
@@ -1058,35 +1068,25 @@ def _tr_set_category(folder, cat, prev=None):
         atomic_write(folder / "hub.json", json.dumps(st, indent=1, ensure_ascii=False))
         TR_CACHE.pop(str(folder), None)
         try:
-            move_note(folder, cat, extra=[old_cat])
+            move_note(folder, cat, extra=[old_cat], refresh=refresh)
         except Exception as e:
             print(f"  {folder.name}: note not moved ({e})")
     return cat
 
 
-def _auto_category(folder):
-    """A transcript from a channel run starts in a category named after the channel (made if missing), so it never
-    sits in Unassigned; a category you set yourself, Unassigned included, is left alone (the key is then present)."""
+def _auto_category(folder, homes=None):
+    """A new transcript starts in its channel's home category (2026-11-09: you give a channel its category, see
+    set_channel_home); a channel without one leaves it in Unassigned, where it shows under its channel. A category
+    you set yourself, Unassigned included, is left alone (the key is then present). Single links too."""
     st = _hub(folder)
-    if "category" in st or st.get("from") == "link":
+    if "category" in st:
         return None
     meta = _channel_meta(folder.parent)
     kept = (meta.get("keep_cats") or {}).get(folder.name.split("_", 1)[-1])
-    if kept is not None:                                   # the category it had before a redo
-        if kept and kept not in read_cats():
-            with DATA_LOCK:
-                write_cats(read_cats() + [kept])
+    if kept is not None and (not kept or kept in read_cats()):     # the category it had before a redo
         return _tr_set_category(folder, kept)
-    name = str(meta.get("name") or folder.parent.name).strip()[:100]
-    if not name or name.lower() == "unassigned":
-        return None
-    with DATA_LOCK:
-        cats = read_cats()
-        if name not in cats:
-            cats.append(name)
-            write_cats(cats)
-    mark_channel(name)
-    return _tr_set_category(folder, name)
+    home = home_of(folder.parent.name, homes)
+    return _tr_set_category(folder, home) if home else None
 
 
 # ---------------------------------------------------------------- note folders by category (2026-11-07)
@@ -1111,15 +1111,22 @@ def _note_platform(folder):
 CH_DIR = "Channels"          # channel categories: <platform>/Channels/<channel>/, as the app's Channels group
 
 
-def note_home(platform, cat):
+def note_home(platform, cat, chan=""):
+    """The note's folder: <platform>/<category>/, <platform>/<category>/<channel>/ for a channel at home in that
+    category (2026-11-09), <platform>/Channels/<channel>/ for a channel run's unassigned transcripts, <platform>/."""
     base = vault_dir(platform)
     sub = clean_name(cat, "") if cat else ""
+    ch = clean_name(chan, "") if chan else ""
+    if ch:
+        return f"{base}/{sub or CH_DIR}/{ch}"
     if sub and cat in channel_cats():
         return f"{base}/{CH_DIR}/{sub}"
     return f"{base}/{sub}" if sub else base
 
 
-def _app_dirs(platform, extra=()):
+def _app_dirs(platform, extra=(), chans=()):
+    """The folders the app made or makes for notes: a note in one of them may be moved; anywhere else it is yours.
+    chans: the video's own channel name (for <platform>/<category>/<channel>/)."""
     base = vault_dir(platform)
     names = list(read_cats()) + [c for c in extra if c]
     root = OUT / TR_DIR
@@ -1128,7 +1135,9 @@ def _app_dirs(platform, extra=()):
             if cdir.is_dir() and not cdir.name.startswith((".", "_")):
                 names.append(str(_channel_meta(cdir).get("name") or cdir.name))
     subs = [clean_name(n, "") for n in names if clean_name(n, "")]
-    return {base} | {f"{base}/{x}" for x in subs} | {f"{base}/{CH_DIR}/{x}" for x in subs}
+    ch = [clean_name(c, "") for c in chans if c and clean_name(c, "")]
+    return ({base} | {f"{base}/{x}" for x in subs} | {f"{base}/{CH_DIR}/{x}" for x in subs + ch}
+            | {f"{base}/{s}/{c}" for s in subs for c in ch})
 
 
 def _move_file(src, dst):
@@ -1149,11 +1158,14 @@ def _plan_move(folder, cat, extra=()):
     rel = st.get("note_path") or ""
     if not rel or not (VAULT / rel).is_file():
         return None
+    if _in_tr(folder) and (OUT / folder.name / "note.md").is_file():
+        return None                                # the same video is here in full: the note moves with the video
     plat = _note_platform(folder)
     cur = rel.rsplit("/", 1)[0] if "/" in rel else ""
-    if cur.casefold() not in {d.casefold() for d in _app_dirs(plat, extra)}:   # Windows: case does not matter
+    own = _folder_channel(folder)[1]
+    if cur.casefold() not in {d.casefold() for d in _app_dirs(plat, extra, [own])}:   # Windows: case does not matter
         return None
-    dest_dir = note_home(plat, cat)
+    dest_dir = note_home(plat, cat, _note_chan(folder, cat))
     if cur == dest_dir:
         return None
     new = f"{dest_dir}/{rel.rsplit('/', 1)[-1]}"
@@ -1169,8 +1181,9 @@ def _plan_move(folder, cat, extra=()):
     return (rel, new)
 
 
-def move_note(folder, cat, extra=()):
-    """Move this video's note to its category folder. Returns the new path or None."""
+def move_note(folder, cat, extra=(), refresh=True):
+    """Move this video's note to its category folder. Returns the new path or None. refresh=False: the caller
+    rewrites the channel notes once at the end (a whole channel moving)."""
     with DATA_LOCK:
         plan = _plan_move(folder, cat, extra)
         if not plan or plan[0] == "clash":
@@ -1196,7 +1209,7 @@ def move_note(folder, cat, extra=()):
                         TR_CACHE.pop(str(rec), None)
                     if rec == folder or h.get("note_path") == new:
                         keys.add(cdir.name)
-        for k in keys:                            # the channel note links by path
+        for k in (keys if refresh else ()):       # the channel note links by path
             if _channel_meta(OUT / TR_DIR / k).get("note_path"):
                 try:
                     channel_note(k)
@@ -1207,7 +1220,8 @@ def move_note(folder, cat, extra=()):
 
 def sort_notes(dry=False):
     """Settings > Move notes to category folders: every video's note that is still in the app's folders goes to
-    <platform>/<category>/ (Unassigned: <platform>/). dry: count and examples only."""
+    <platform>/<category>/ (Unassigned: <platform>/), <platform>/<category>/<channel>/ for a channel at home in that
+    category, and each channel note goes with its channel. dry: count and examples only."""
     if line_busy():
         raise ValueError("Wait for the current run (and the ones waiting) to finish")
     if not vault_ok():
@@ -1227,7 +1241,8 @@ def sort_notes(dry=False):
         plan = _plan_move(f, cat)
         if plan is None:
             rel = st.get("note_path") or ""
-            if rel and vault_ok() and (VAULT / rel).is_file() and (rel.rsplit("/", 1)[0] if "/" in rel else "").casefold() not in {d.casefold() for d in _app_dirs(_note_platform(f))}:
+            if rel and vault_ok() and (VAULT / rel).is_file() and (rel.rsplit("/", 1)[0] if "/" in rel else "").casefold() \
+                    not in {d.casefold() for d in _app_dirs(_note_platform(f), (), [_folder_channel(f)[1]])}:
                 mine += 1
             continue
         (clashes if plan[0] == "clash" else moves).append((f, cat, plan))
@@ -1237,19 +1252,9 @@ def sort_notes(dry=False):
             if not cdir.is_dir() or cdir.name.startswith((".", "_")):
                 continue
             meta = _channel_meta(cdir)
-            rel = meta.get("note_path") or ""
-            if not rel or not (VAULT / rel).is_file():
-                continue
-            plat = meta.get("platform") or "YouTube"
-            cname = clean_name(meta.get("name") or cdir.name, cdir.name)
-            cur, dest = rel.rsplit("/", 1)[0], f"{vault_dir(plat)}/{CH_DIR}/{cname}"
-            if cur.casefold() == dest.casefold() or cur.casefold() != f"{vault_dir(plat)}/{cname}".casefold():
-                continue
-            new = f"{dest}/{rel.rsplit('/', 1)[-1]}"
-            if (VAULT / new).exists():
-                clashes.append(None); continue
-            if f"<!-- reels-hub:channel={cdir.name} -->" in read_text(VAULT / rel):
-                chmoves.append((cdir, meta, rel, new))
+            plan = _channel_note_plan(cdir, meta)       # <platform>/<home>/<channel>/ or <platform>/Channels/<channel>/
+            if plan:
+                chmoves.append((cdir, meta) + plan)
     if dry:
         return {"count": len(moves) + len(chmoves), "clashes": len(clashes), "yours": mine,
                 "examples": [f"{p[0]}  ->  {p[1].rsplit('/', 1)[0]}/" for _, _, p in moves[:8]]
@@ -1272,40 +1277,6 @@ def sort_notes(dry=False):
         except Exception as e:
             print(f"  {f.name}: note not moved ({e})")
     return {"count": done, "clashes": len(clashes), "yours": mine}
-
-
-def sort_by_channel(dry=False):
-    """Unassigned videos -> a category named after their channel or creator (made if missing). Videos with a
-    category are left alone. dry: only count."""
-    if line_busy():
-        raise ValueError("Wait for the current run (and the ones waiting) to finish")
-    import reels2notes as r2n
-    plan = []
-    for f in sorted(OUT.iterdir()):
-        if not f.is_dir() or f.name.startswith(("_", ".")) or not (f / "note.md").is_file():
-            continue
-        st = read_state(f)
-        if st.get("_bad") or (st["category"] and st["category"] in read_cats()):
-            continue
-        info = _info(f)
-        known = info and any(info.get(k) for k in ("channel", "uploader", "uploader_id"))   # never a title as a name
-        name = re.sub(r"\s+", " ", r2n.tr_name(info, info.get("webpage_url") or "")).strip()[:100] if known else ""
-        if name and name.lower() not in ("unassigned", "channel") and not name.isdigit():
-            plan.append((f, name))
-    if dry:
-        return {"count": len(plan), "categories": sorted(set(n for _, n in plan))}
-    with DATA_LOCK:
-        cats = read_cats()
-        cats += [n for n in dict.fromkeys(n for _, n in plan) if n not in cats]
-        write_cats(cats, channel_cats() + [n for _, n in plan])
-    done = 0
-    for f, name in plan:
-        try:
-            _tr_set_category(f, name)                       # hub.json + the note's tag and Category line
-            done += 1
-        except Exception as e:
-            print(f"  {f.name}: not sorted ({e})")
-    return {"count": done, "categories": sorted(set(n for _, n in plan))}
 
 
 def tr_set_category(key, rid, cat):
@@ -1572,7 +1543,9 @@ def template_note_text(folder, r):
 
 def transcript_note(folder, from_channel):
     """Create the Obsidian note of a transcript-only video once: your template, the transcript between the text
-    markers. From a channel link the note goes to YouTube/<channel>/, from a single link to YouTube/ as usual."""
+    markers. It goes straight to the folder its category will give it (_auto_category runs right after): the
+    channel's home <platform>/<category>/<channel>/, else <platform>/Channels/<channel>/ from a channel link,
+    <platform>/ from a single link."""
     if not vault_ok():
         return {"error": f"Vault not found: {VAULT}"}
     with DATA_LOCK:
@@ -1584,10 +1557,13 @@ def transcript_note(folder, from_channel):
         if rel and (VAULT / rel).is_file():
             return {"name": Path(rel).stem, "path": rel, "uri": obsidian_uri(rel)}
         label = tr_source_label(r["tsource"]) + " · video not downloaded"
-        dname = vault_dir(r["platform"])
-        if from_channel:
-            cm = _channel_meta(folder.parent)
-            dname = f"{dname}/{CH_DIR}/{clean_name(cm.get('name') or folder.parent.name, folder.parent.name)}"
+        cm, key, cats = _channel_meta(folder.parent), folder.parent.name, read_cats()
+        kept = (cm.get("keep_cats") or {}).get(folder.name.split("_", 1)[-1])
+        cat = str(st.get("category") or "") if "category" in st else \
+            (kept if kept is not None and (not kept or kept in cats) else home_of(key))
+        cat = cat if cat in cats else ""
+        chan = (cm.get("name") or key) if (cat and home_of(key) == cat) or (not cat and from_channel) else ""
+        dname = note_home(r["platform"], cat, chan)
         base = NOTE_PREFIX.get(r["platform"], "") + clean_name(r["label"], r["id"])
         name, k = base, 2
         while (VAULT / dname / f"{name}.md").exists():
@@ -1603,8 +1579,9 @@ def transcript_note(folder, from_channel):
 
 
 def channel_note(key):
-    """The channel's own note, YouTube/<channel>/'<channel> (channel).md: the list of its videos' notes. Only the
-    block between the videos markers is ever rewritten; the rest of the note is yours."""
+    """The channel's own note, '<channel> (channel).md in the channel's folder (YouTube/<home category>/<channel>/
+    or YouTube/Channels/<channel>/): the list of its videos' notes. Only the block between the videos markers is
+    ever rewritten; the rest of the note is yours."""
     if not vault_ok():
         return None
     cdir = tr_cdir(key)
@@ -1634,7 +1611,7 @@ def channel_note(key):
                 text = text.rstrip() + f"\n\n## Videos (Reels Hub)\n{VIDS_START}\n{block}\n{VIDS_END}\n"
         else:
             plat = meta.get("platform") or "YouTube"
-            dname = f"{vault_dir(plat)}/{CH_DIR}/{cname}"
+            dname = note_home(plat, home_of(key), meta.get("name") or key)     # next to its videos' notes
             rel = f"{dname}/{NOTE_PREFIX.get(plat, '')}{cname} (channel).md"
             if (VAULT / rel).is_file() and mark not in read_text(VAULT / rel):
                 rel = f"{dname}/{NOTE_PREFIX.get(plat, '')}{cname} (channel, Reels Hub).md"
@@ -1947,23 +1924,17 @@ def write_cats(cats, channels=None):
     raw = _cats_raw()
     ch = raw.get("channels") if channels is None else channels
     ch = [c for c in dict.fromkeys(ch or []) if c in cats]
-    d = {"categories": cats, "channels": ch, "tags": read_tags()}
-    if raw.get("channels_checked"):
-        d["channels_checked"] = True
-    atomic_write(cats_file(), json.dumps(d, indent=1, ensure_ascii=False))
-
-
-def mark_channel(name):
-    with DATA_LOCK:
-        cats = read_cats()
-        ch = channel_cats()
-        if name in cats and name not in ch:
-            write_cats(cats, ch + [name])
+    raw.update(categories=cats, channels=ch, tags=read_tags())      # other keys (homes, homes_v1, ...) are kept
+    if isinstance(raw.get("homes"), dict):                         # a channel's home that is gone: no home
+        raw["homes"] = {k: v for k, v in raw["homes"].items() if v in cats}
+    atomic_write(cats_file(), json.dumps(raw, indent=1, ensure_ascii=False))
 
 
 def channel_cats():
-    """Categories made from a channel or creator name (shown under one Channels group). Categories made before
-    2026-11-07 are worked out once: a category whose videos or transcripts all come from a channel of that name."""
+    """Categories made from a channel or creator name (2026-11-07 to 2026-11-09; shown under one Channels group).
+    Since 2026-11-09 nothing makes them any more and ensure_homes() turns the old ones into channel groups, so this
+    is empty after that. Categories made before 2026-11-07 are worked out once: a category whose videos or
+    transcripts all come from a channel of that name."""
     raw = _cats_raw()
     cats = read_cats()
     ch = [c for c in raw.get("channels") or [] if c in cats]
@@ -1997,6 +1968,261 @@ def channel_cats():
     except Exception as e:
         print(f"  channel categories not worked out: {e}")
     return ch
+
+
+# ---------------------------------------------------------------- channel homes (2026-11-09)
+# Simeon: "master has to be my Categories ... and automatically create channel sub-category in that Category".
+# Your categories are the top level; a channel (or creator) is a group inside a category. A channel can be given a
+# home category (the folder button on the channel, or drag the channel onto a category): _categories.json "homes"
+# {channel key: category}, the key as in _transcripts (reels2notes.tr_key). Its videos in Unassigned or in its old
+# home move there, notes included, and its new videos start there (transcripts: _auto_category; full videos:
+# reels2notes --channel-category). Before this, each channel was a category of its own (the "channels" list);
+# ensure_homes() turns those into channel groups once (homes_v1).
+
+REEL_CH = {}                                # reel folder -> (video.info.json mtime, channel key, channel name)
+
+
+def reel_channel(folder):
+    """(key, name) of a downloaded video's channel or creator, the same key as its _transcripts folder would have;
+    ("", "") when yt-dlp named none. Cached by video.info.json's time (those files can be large)."""
+    p = folder / "video.info.json"
+    try:
+        mt = p.stat().st_mtime
+    except OSError:
+        return ("", "")
+    hit = REEL_CH.get(str(folder))
+    if hit and hit[0] == mt:
+        return hit[1], hit[2]
+    import reels2notes as r2n
+    info = _info(folder)
+    key = name = ""
+    if info and any(info.get(k) for k in ("channel", "uploader", "uploader_id")):   # never a title as a name
+        url = info.get("webpage_url") or info.get("original_url") or ""
+        key = r2n.tr_key(info, url)
+        name = re.sub(r"\s+", " ", r2n.tr_name(info, url)).strip()[:100]
+    REEL_CH[str(folder)] = (mt, key, name)
+    return key, name
+
+
+def read_homes():
+    """{channel key: category}, only categories that exist."""
+    h = _cats_raw().get("homes")
+    cats = set(read_cats())
+    return {str(k): v for k, v in h.items() if isinstance(v, str) and v in cats} if isinstance(h, dict) else {}
+
+
+def home_of(key, homes=None):
+    """The home category of a channel key ("" = none). Keys match in any case (Windows folders)."""
+    if not key:
+        return ""
+    h = read_homes() if homes is None else homes
+    if key in h:
+        return h[key]
+    kf = key.casefold()
+    return next((v for k, v in h.items() if k.casefold() == kf), "")
+
+
+def _write_homes(homes):
+    raw = _cats_raw()
+    raw.setdefault("categories", read_cats())
+    raw["homes"] = homes
+    atomic_write(cats_file(), json.dumps(raw, indent=1, ensure_ascii=False))
+
+
+def _in_tr(folder):
+    return folder.parent.parent.name == TR_DIR and folder.parent.parent.parent == OUT
+
+
+def _folder_channel(folder):
+    """(key, name, from_channel) of any video folder: a transcript's channel folder, or a reel's channel."""
+    if _in_tr(folder):
+        key = folder.parent.name
+        name = str(_channel_meta(folder.parent).get("name") or key).strip()
+        return key, name, _hub(folder).get("from") == "channel"
+    key, name = reel_channel(folder)
+    root = OUT / TR_DIR                             # a video fetched first as a channel run's transcript stays with it
+    from_channel = root.is_dir() and any((c / folder.name / "hub.json").is_file() and _hub(c / folder.name).get("from") == "channel"
+                                         for c in root.iterdir() if c.is_dir() and not c.name.startswith((".", "_")))
+    return key, name, from_channel
+
+
+def _note_chan(folder, cat, homes=None):
+    """The channel folder a video's note goes in, inside its category folder, or "": a video whose channel has this
+    category as its home; and a channel run's transcript while it is unassigned (<platform>/Channels/<channel>/)."""
+    key, name, from_channel = _folder_channel(folder)
+    if not name:
+        return ""
+    if cat:
+        return name if key and home_of(key, homes) == cat else ""
+    return name if from_channel else ""
+
+
+def _channel_folders(key):
+    """The reel folders and transcript folders of a channel (key in any case)."""
+    kf = key.casefold()
+    reels = [f for f in sorted(OUT.iterdir()) if f.is_dir() and not f.name.startswith(("_", ".")) and (f / "note.md").is_file()
+             and reel_channel(f)[0].casefold() == kf]
+    trs = []
+    root = OUT / TR_DIR
+    if root.is_dir():
+        for cdir in sorted(root.iterdir()):
+            if cdir.is_dir() and not cdir.name.startswith((".", "_")) and cdir.name.casefold() == kf:
+                trs += _tr_folders(cdir)
+    return reels, trs
+
+
+def _channel_note_plan(cdir, meta, homes=None, extra=()):
+    """(old rel, new rel) to move a channel's own note next to its videos' notes, or None. Only from the app's own
+    folders (<platform>/<channel>, <platform>/Channels/<channel>, <platform>/<a category>/<channel>), only with the
+    channel marker, never over another file."""
+    rel = meta.get("note_path") or ""
+    if not rel or not vault_ok() or not (VAULT / rel).is_file():
+        return None
+    plat = meta.get("platform") or "YouTube"
+    base, cname = vault_dir(plat), clean_name(meta.get("name") or cdir.name, cdir.name)
+    cur = rel.rsplit("/", 1)[0] if "/" in rel else ""
+    ours = {f"{base}/{cname}", f"{base}/{CH_DIR}/{cname}"} | \
+        {f"{base}/{clean_name(c, '')}/{cname}" for c in list(read_cats()) + list(extra) if c and clean_name(c, "")}
+    if cur.casefold() not in {d.casefold() for d in ours}:
+        return None
+    dest = note_home(plat, home_of(cdir.name, homes), meta.get("name") or cdir.name)
+    if cur.casefold() == dest.casefold():
+        return None
+    new = f"{dest}/{rel.rsplit('/', 1)[-1]}"
+    if (VAULT / new).exists() or f"<!-- reels-hub:channel={cdir.name} -->" not in read_text(VAULT / rel):
+        return None
+    return (rel, new)
+
+
+def _move_channel_note(cdir, homes=None, extra=()):
+    """Move the channel note with its channel (see _channel_note_plan), then rewrite its list (links by path).
+    extra: a category name that is gone (renamed or deleted), so its folder still counts as the app's."""
+    meta = _channel_meta(cdir)
+    plan = _channel_note_plan(cdir, meta, homes, extra)
+    if plan:
+        with DATA_LOCK:
+            (VAULT / plan[1]).parent.mkdir(parents=True, exist_ok=True)
+            _move_file(VAULT / plan[0], VAULT / plan[1])
+            meta["note_path"] = plan[1]
+            _save_channel_meta(cdir, meta)
+    if meta.get("note_path"):
+        channel_note(cdir.name)
+
+
+def set_channel_home(key, cat):
+    """Give a channel (or creator) a home category: its videos that are in Unassigned or in its old home move there
+    (their notes too, into <platform>/<category>/<channel>/), and its new videos start there. cat "" = no home: its
+    videos in the old home go back to Unassigned. Videos you put in another category stay where they are."""
+    key = str(key or "").strip()[:80]
+    cat = str(cat or "").strip()[:100]
+    if not key or key.startswith(("_", ".")) or "/" in key or "\\" in key:
+        raise ValueError("This channel is not known")
+    if cat and cat not in read_cats():
+        raise ValueError("No such category")
+    with DATA_LOCK:
+        homes = read_homes()
+        old_key = next((k for k in homes if k.casefold() == key.casefold()), None)
+        old = homes.pop(old_key) if old_key else ""
+        if cat:
+            homes[old_key or key] = cat
+        _write_homes(homes)
+    reels, trs = _channel_folders(key)
+    cats, moved = set(read_cats()), 0
+    # the videos first: a transcript of the same video shares the video's note, which moves with the video
+    for f in reels + trs:
+        joined = _in_tr(f) and (OUT / f.name / "note.md").is_file()
+        if not _in_tr(f) and JOB["running"] and f.name in JOB.get("busy", ()):
+            continue                                    # being re-processed: left as it is
+        cur = str(_hub(f).get("category") or "")
+        cur = cur if cur in cats else ""
+        try:
+            if cur == cat:                              # already there: only its note joins the channel's folder
+                move_note(f, cat, refresh=False)
+            elif not cur or cur == old:
+                _tr_set_category(f, cat, refresh=False)
+                moved += 0 if joined else 1
+        except Exception as e:
+            print(f"  {f.name}: category not changed ({e})")
+    root = OUT / TR_DIR
+    for cdir in ([d for d in root.iterdir() if d.is_dir() and d.name.casefold() == key.casefold()] if root.is_dir() else []):
+        try:
+            _move_channel_note(cdir, read_homes())
+        except Exception as e:
+            print(f"  channel note {cdir.name} not moved ({e})")
+    return {"homes": read_homes(), "moved": moved, "category": cat, "old": old}
+
+
+def ensure_homes():
+    """Once (homes_v1, 2026-11-09): the channel categories made since 2026-11-07 become channel groups. A category
+    named after its channel: its videos go to Unassigned, where they show under their channel, and the category goes.
+    A channel category you renamed, or one that holds videos of other channels too, stays as your own category; the
+    channel it was named after (or its only channel) gets it as its home."""
+    if not OUT.is_dir() or not cats_file().exists() or _cats_raw().get("homes_v1"):
+        return None
+    if line_busy():
+        return None                                 # a run may be writing categories: next time
+    chs = channel_cats()
+    norm = lambda s: re.sub(r"\s+", " ", str(s or "")).strip().casefold()
+    items = []                                      # (folder, category, channel key, channel name)
+    if chs:
+        for f in sorted(OUT.iterdir()):
+            if f.is_dir() and not f.name.startswith(("_", ".")) and (f / "note.md").is_file():
+                c = read_state(f)["category"]
+                if c in chs:
+                    items.append((f, c) + reel_channel(f))
+        root = OUT / TR_DIR
+        if root.is_dir():
+            for cdir in sorted(root.iterdir()):
+                if cdir.is_dir() and not cdir.name.startswith((".", "_")):
+                    cname = str(_channel_meta(cdir).get("name") or cdir.name)
+                    for tf in _tr_folders(cdir):
+                        c = str(_hub(tf).get("category") or "")
+                        if c in chs:
+                            items.append((tf, c, cdir.name, cname))
+    gone, homes, done, stay = [], read_homes(), 0, []
+    for c in chs:
+        its = [x for x in items if x[1] == c]
+        names = {norm(x[3]) for x in its}
+        if not its or names == {norm(c)}:           # named after its channel: the channel group takes its place
+            for f, _, _, _ in sorted(its, key=lambda x: _in_tr(x[0])):     # videos before transcripts
+                try:
+                    _tr_set_category(f, "", refresh=False)
+                    done += 1
+                except Exception as e:
+                    print(f"  {f.name}: not moved to Unassigned ({e})")
+            gone.append(c)
+        else:                                       # yours now; the channel it is about gets it as its home
+            keys = {x[2] for x in its if x[2]}
+            for k in keys:
+                if any(norm(x[3]) == norm(c) for x in its if x[2] == k) or len(keys) == 1:
+                    homes.setdefault(k, c)
+                    stay.extend((f, c) for f, _, k2, _ in its if k2 == k)
+    with DATA_LOCK:
+        cats = [c for c in read_cats() if c not in gone]
+        _write_homes({**read_homes(), **{k: v for k, v in homes.items() if v in cats}})
+        write_cats(cats, [])
+        raw = _cats_raw(); raw["homes_v1"] = True
+        atomic_write(cats_file(), json.dumps(raw, indent=1, ensure_ascii=False))
+    for f, c in sorted(stay, key=lambda x: _in_tr(x[0])):     # a channel at home in a kept category: its notes
+        try:                                                    # into <platform>/<category>/<channel>/
+            move_note(f, c, refresh=False)
+        except Exception as e:
+            print(f"  {f.name}: note not moved ({e})")
+    if chs:
+        _move_channel_notes(gone)
+        print(f"Channels are now groups inside your categories: {len(gone)} channel categor{'y' if len(gone) == 1 else 'ies'} "
+              f"removed, {done} video{'' if done == 1 else 's'} to Unassigned (shown there under their channel)")
+    return {"removed": gone, "videos": done}
+
+
+def _move_channel_notes(extra=()):
+    root = OUT / TR_DIR
+    for cdir in (sorted(root.iterdir()) if root.is_dir() else []):
+        if cdir.is_dir() and not cdir.name.startswith((".", "_")) and _channel_meta(cdir).get("note_path"):
+            try:
+                _move_channel_note(cdir, None, extra)
+            except Exception as e:
+                print(f"  channel note {cdir.name} not moved ({e})")
 
 
 def recategorize(old, new):
@@ -2203,13 +2429,19 @@ def change_cats(body):
             if new in cats and new != name:
                 raise ValueError("That category already exists")
             cats[cats.index(name)] = new
-            recategorize(name, new)
+            raw = _cats_raw()                         # channels at home in it keep it under the new name
+            if isinstance(raw.get("homes"), dict):
+                _write_homes({k: (new if v == name else v) for k, v in raw["homes"].items()})
             write_cats(cats, [new if c == name else c for c in channel_cats()])
+            recategorize(name, new)                   # after the list: the notes' folders follow the new name
+            _move_channel_notes([name])               # a channel at home in it: its own note too
             return cats
         elif action == "delete":
             if name in cats:
                 cats.remove(name)
+            write_cats(cats)                          # first, so its channels lose it as their home
             recategorize(name, "")
+            _move_channel_notes([name])
         elif action == "move":
             d = int(body.get("dir", 0))
             if name in cats:
@@ -3224,12 +3456,13 @@ def _transcript_done(d, channels):
         note = transcript_note(folder, from_channel)
         if note.get("path"):
             JOB["log"].append(f"  Obsidian note: {note['path']}")
+        try:
+            if _auto_category(folder):                  # the channel's home category, if it has one
+                JOB["log"].append(f"  category: {_hub(folder).get('category')} (the channel's)")
+        except Exception as e:
+            JOB["log"].append(f"  category not set: {e}")
         if from_channel:
             channels.add(parts[1])
-            try:
-                _auto_category(folder)
-            except Exception as e:
-                JOB["log"].append(f"  category not set: {e}")
         elif note.get("error") and not JOB.get("vault_warned"):
             JOB["log"].append(f"  Obsidian: {note['error']} (no notes this run)")
             JOB["vault_warned"] = True
@@ -3389,7 +3622,7 @@ class Handler(BaseHTTPRequestHandler):
             cl = CONFIG.get("cloud") or {}
             seq = CHANGED["seq"]                     # read before listing: later fill-ins count as changed
             self.send_json({"reels": list_reels() if CONFIG.get("name") else [], "categories": read_cats(),
-                            "channel_cats": channel_cats(), "tags": read_tags(),
+                            "channel_cats": channel_cats(), "tags": read_tags(), "homes": read_homes(),
                             "boot": BOOT, "changed_seq": seq,
                             "me": {"name": CONFIG.get("name", ""), "person": CONFIG.get("person", ""),
                                    "can_delete": can_delete(),
@@ -3509,8 +3742,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, **tr_wrong_lang(body.get("channel"))})
             elif path == "/api/transcripts/redo":
                 self.send_json({"ok": True, **tr_redo_lang(body)})
-            elif path == "/api/sortchannels":
-                self.send_json({"ok": True, **sort_by_channel(bool(body.get("dry")))})
+            elif path == "/api/channels/home":
+                self.send_json({"ok": True, **set_channel_home(body.get("key"), body.get("category"))})
             elif path == "/api/queue/hold":
                 self.send_json({"ok": True, **queue_hold(body)})
             elif path == "/api/queue/move":
@@ -3540,7 +3773,8 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Nothing to delete")
                 self.send_json({"ok": True, **delete_reels(ids, bool(body.get("obsidian")))})
             elif path == "/api/categories":
-                self.send_json({"ok": True, "categories": change_cats(body), "channel_cats": channel_cats(), "tags": read_tags()})
+                self.send_json({"ok": True, "categories": change_cats(body), "channel_cats": channel_cats(), "tags": read_tags(),
+                                "homes": read_homes()})
             elif path == "/api/share":
                 self.send_json({"ok": True, **share_reels(body.get("ids"), str(body.get("to") or ""))})
             elif path == "/api/inbox/check":
@@ -3797,6 +4031,27 @@ body.resizing-y,body.resizing-y *{cursor:row-resize!important;user-select:none}
 .group .ico{opacity:0}
 .group:hover .ico{opacity:1}
 .gempty{font-size:12px;color:var(--muted);padding:2px 10px 6px 22px}
+/* channels inside a category (2026-11-09) */
+.group.sub{padding:6px 6px 2px 18px;margin-top:0;cursor:grab}
+.group.sub .gname{text-transform:none;letter-spacing:0;font-size:12.5px;color:var(--text)}
+.group.sub .sname{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.group.sub.dragging,.gsubh.dragging{opacity:.5}
+.group .ico.homed{opacity:.55}
+.group:hover .ico.homed{opacity:1}
+.item.sub{margin-left:16px;border-left:1px solid var(--line);border-radius:0 8px 8px 0}
+.item.tr.sub{padding-left:14px}
+.gstat.ghome b{color:var(--accent);font-weight:500}
+.gsubh{display:flex;align-items:center;gap:6px;font-size:12.5px;font-weight:600;color:var(--text);margin:12px 0 8px;cursor:grab}
+.gsubh .ico{opacity:0}.gsubh:hover .ico,.gsubh .ico.homed{opacity:1}
+.gsubgrid{margin-left:6px;padding-left:12px;border-left:1px solid var(--line)}
+.pmenu{position:fixed;z-index:300;min-width:210px;max-width:300px;max-height:60vh;overflow:auto;background:var(--panel);border:1px solid var(--line);border-radius:10px;box-shadow:0 10px 28px rgba(0,0,0,.5);padding:6px}
+.pmenu .pmh{font-size:12px;color:var(--muted);padding:4px 8px 6px;overflow-wrap:anywhere}
+.pmenu .pmh b{color:var(--text);font-weight:600}
+.pmenu button{display:block;width:100%;text-align:left;background:none;border:0;color:var(--text);padding:6px 8px;border-radius:6px;font:inherit;font-size:13px;cursor:pointer}
+.pmenu button:hover,.pmenu button:focus{background:var(--panel2);outline:none}
+.pmenu button.on{color:var(--accent)}
+.pmenu button.on::after{content:" \2713"}
+.pmenu .pmnote{font-size:11px;color:var(--muted);padding:6px 8px 2px;border-top:1px solid var(--line);margin-top:4px}
 .item{display:flex;gap:10px;padding:7px 8px;border-radius:8px;cursor:pointer;align-items:center}
 .item:hover{background:var(--panel2)}
 .item.active{background:#1f2c2b;outline:1px solid #2f5551}
@@ -4314,7 +4569,8 @@ function applyPanes(){
   L.classList.toggle("fp-closed", !panes.fp); L.classList.toggle("ls-closed", !panes.ls);
   try { localStorage.setItem("rh-panes", JSON.stringify(panes)); } catch (e) {}
 }
-let chanCats = new Set();                   // categories that are channels (under one "Channels" group)
+let chanCats = new Set();                   // categories that are channels (under one "Channels" group; none since 2026-11-09)
+let homes = {};                             // channel key -> its home category (set_channel_home)
 let tags = [];                              // the tag list (a video: one category, any number of tags)
 const CH_KEY = "\u2063channels";            // the Channels group's key in the collapsed sets
 function orderCats(list){ return [...list.filter(c => !chanCats.has(c)), ...list.filter(c => chanCats.has(c))]; }
@@ -4332,10 +4588,11 @@ function assemble(parts, closedSet){        // the Channels group around the cha
 }
 let mode = "reels";                        // "reels" (the gallery) or "transcripts" (the catalogue of transcript-only videos)
 let tr = {channels: [], items: [], current: null, shown: ""}, trCollapsed = new Set(), trTick = 0;
-let trGroupBy = "channel", tfChan = new Set(), tfCat = new Set(), tfPlat = new Set(), tfTag = new Set();   // the catalogue's own grouping and filters
+let trGroupBy = "category", tfChan = new Set(), tfCat = new Set(), tfPlat = new Set(), tfTag = new Set();   // the catalogue's own grouping and filters
 try { trCollapsed = new Set(JSON.parse(localStorage.getItem("rh-trcollapsed") || "[]")); } catch (e) {}
 try { trGroupBy = localStorage.getItem("rh-trgroupby") || trGroupBy; const f = JSON.parse(localStorage.getItem("rh-trfilters") || "{}"); tfCat = new Set(f.c || []); tfPlat = new Set(f.p || []); tfTag = new Set(f.t || []); } catch (e) {}
-const GROUP_OPTS = {reels: [["category", "Category"], ["source", "Source"], ["none", "None"]], transcripts: [["channel", "Channel"], ["category", "Category"], ["none", "None"]]};
+const GROUP_OPTS = {reels: [["category", "Category"], ["source", "Source"], ["none", "None"]], transcripts: [["category", "Category"], ["channel", "Channel"], ["none", "None"]]};
+try { if (!localStorage.getItem("rh-trgroup2")) { trGroupBy = "category"; localStorage.setItem("rh-trgroupby", "category"); localStorage.setItem("rh-trgroup2", "1"); } } catch (e) {}   // 2026-11-09: categories on top, once
 function setGroupOptions(m){            // the Group menu offers Channel in Transcripts and Source in Videos
   const sel = $("#groupby");
   sel.innerHTML = GROUP_OPTS[m].map(([v, l]) => `<option value="${v}">${l}</option>`).join("");
@@ -4418,7 +4675,7 @@ async function loadReels(keepId, changedIds){
     if (o && !(changedIds && changedIds.has(r.id))) { r.state = o.state; if (o.notesDraft !== undefined) r.notesDraft = o.notesDraft; }
     return r;
   });
-  cats = j.categories; chanCats = new Set(j.channel_cats || []); tags = j.tags || tags; vault = j.vault || vault; me = j.me || me;
+  cats = j.categories; chanCats = new Set(j.channel_cats || []); homes = j.homes || homes; tags = j.tags || tags; vault = j.vault || vault; me = j.me || me;
   if (changedSeq === null) { changedSeq = j.changed_seq || 0; bootId = j.boot; }
   else if (j.boot && j.boot !== bootId) { bootId = j.boot; changedSeq = 0; }
   applyMe();
@@ -4610,6 +4867,71 @@ function groupsFor(){
   return [...orderCats(cats).map(c => ({key: c, label: c, cat: c, kind: "cat", chan: chanCats.has(c), test: r => catOf(r) === c})),
           {key: "", label: "Unassigned", cat: "", kind: "cat", unas: true, test: r => catOf(r) === ""}];
 }
+/* Channels inside a category (2026-11-09, Simeon: "master has to be my Categories ... channel sub-category in that
+   Category"): in a category (and in Unassigned) the videos of one channel form a group of their own when there are
+   2 or more of them, or when that category is the channel's home; the others stay loose under the category.
+   A channel group can be dragged onto a category, or its folder button picks one: set_channel_home on the server. */
+function homeOf(key){
+  if (!key) return "";
+  let v = Object.prototype.hasOwnProperty.call(homes, key) ? homes[key] : undefined;
+  if (v === undefined) { const kf = key.toLowerCase(); for (const k in homes) if (k.toLowerCase() === kf) { v = homes[k]; break; } }
+  return v && cats.includes(v) ? v : "";
+}
+const subKey = (cat, key) => "sub:" + cat + "\u0001" + key.toLowerCase();
+function subGroups(items, cat, keyOf, nameOf){
+  const by = new Map();
+  items.forEach(x => { const k = keyOf(x); if (!k || k.startsWith("_")) return; const kl = k.toLowerCase();
+    if (!by.has(kl)) by.set(kl, {key: k, items: []}); by.get(kl).items.push(x); });
+  const subs = [], inSub = new Set();
+  for (const sg of by.values()) if (sg.items.length >= 2 || (cat && homeOf(sg.key) === cat)) {
+    sg.name = nameOf(sg.items[0]) || sg.key; subs.push(sg); sg.items.forEach(x => inSub.add(x)); }
+  subs.sort((a, b) => a.name.localeCompare(b.name, undefined, {sensitivity: "base"}));
+  return {subs, loose: items.filter(x => !inSub.has(x))};
+}
+function subHead(cat, sg, plat, closedSet){
+  const closed = closedSet.has(subKey(cat, sg.key)), home = homeOf(sg.key);
+  return `<div class="group sub ${closed ? "closed" : ""}" data-cat="${esc(cat)}" data-sub="${esc(subKey(cat, sg.key))}" data-chkey="${esc(sg.key)}" data-chname="${esc(sg.name)}" draggable="true" title="Drag onto a category to put the whole channel there">
+    <span class="gname" data-subtoggle><span class="caret">&#9662;</span>${plat ? pbadge({platform: plat}) + " " : ""}<span class="sname">${esc(sg.name)}</span></span>
+    <span class="gcount">${sg.items.length}</span>
+    <button class="ico ${home ? "homed" : ""}" data-chhome="${esc(sg.key)}" data-chname="${esc(sg.name)}" title="${home ? `This channel's category is ${esc(home)}. ` : ""}Put this channel in a category: its videos move there and its new videos start there">&#128193;</button></div>`;
+}
+let menuAt = 0;
+function closeMenu(){ const m = $("#pmenu"); if (m) m.remove(); }
+function chanMenu(btn){                     // the folder button on a channel: pick its category
+  closeMenu();
+  const key = btn.dataset.chhome, name = btn.dataset.chname || key, cur = homeOf(key);
+  const m = document.createElement("div");
+  m.id = "pmenu"; m.className = "pmenu"; m.dataset.key = key; m.dataset.name = name;
+  m.innerHTML = `<div class="pmh">Put <b>${esc(name)}</b> in</div>`
+    + [...orderCats(cats).filter(c => !chanCats.has(c)), ""].map(c => `<button data-pmhome="${esc(c)}" class="${c === cur ? "on" : ""}">${c ? esc(c) : "No category (Unassigned)"}</button>`).join("")
+    + `<button data-pmnew>+ New category...</button>`
+    + `<div class="pmnote">Its videos in Unassigned${cur ? ` or ${esc(cur)}` : ""} move there, notes too, and its new videos start there.</div>`;
+  document.body.appendChild(m); menuAt = Date.now();
+  const r = btn.getBoundingClientRect(), w = m.offsetWidth, h = m.offsetHeight;
+  m.style.left = Math.max(8, Math.min(r.left, innerWidth - w - 8)) + "px";
+  m.style.top = (r.bottom + 4 + h <= innerHeight - 8 ? r.bottom + 4 : Math.max(8, r.top - h - 4)) + "px";
+  const first = m.querySelector("button.on") || m.querySelector("button"); first && first.focus();
+}
+async function setChannelHome(key, name, cat){
+  closeMenu();
+  let j;
+  try { j = await api("/api/channels/home", {key, category: cat}); } catch (err) { return alert(err.message); }
+  homes = j.homes || homes;
+  const kl = key.toLowerCase(), mine = new Set(reels.filter(r => (r.ch || "").toLowerCase() === kl).map(r => r.id));
+  if (mine.size) await loadReels(current && current.id, mine).catch(() => {});      // their categories changed
+  await loadTr().catch(() => {});
+  renderList();
+  const n = j.moved ? ` (${j.moved} video${j.moved === 1 ? "" : "s"} moved)` : "";
+  toast(cat ? `${name} is now in ${cat}${n}` : `${name} has no category now${n}`);
+}
+function reelItem(r, sub){
+  return `
+      <div class="item ${sub ? "sub" : ""} ${current && current.id===r.id?"active":""} ${selected.has(r.id)?"sel":""}" data-id="${esc(r.id)}" draggable="true">
+        ${r.shots[0] ? `<img loading="lazy" src="${shotUrl(r, r.shots[0])}" alt="">` : `<img alt="">`}
+        <div><div class="t">${esc(r.label)}</div>
+        <div class="s">${pbadge(r)}${vtag(r)} ${esc(r.author)} · ${esc(r.date)}${r.state.favorites.length?` · <span class="fc">&#9733; ${r.state.favorites.length}</span>`:""}${fromBadge(r)}${tagsOf(r).length ? ` · <span class="ttg">${tagsOf(r).map(t => "#" + esc(t)).join(" ")}</span>` : ""}</div></div>
+      </div>`;
+}
 function renderList(){
   if (mode === "transcripts") return renderTrList();      // the list shows the catalogue; reels keep their state
   const q = $("#search").value.trim().toLowerCase();
@@ -4620,11 +4942,14 @@ function renderList(){
   groups.forEach((g, gi) => {
     if (g.kind === "cat" && !catShown(g.cat)) return;
     const items = sortReels(reels.filter(r => g.test(r) && matches(r, q)));
-    filtered.push(...items);
-    if (!collapsed.has(g.label) && !(g.chan && collapsed.has(CH_KEY))) shown.push(...items);
+    const closed = collapsed.has(g.label), hidden = closed || (g.chan && collapsed.has(CH_KEY));
+    // in a category: the channel groups first, then the loose videos (the same order for the arrows and the gallery)
+    const sg = g.kind === "cat" ? subGroups(items, g.cat, r => r.ch, r => r.chname) : {subs: [], loose: items};
+    sg.subs.forEach(x => { filtered.push(...x.items); if (!hidden && !collapsed.has(subKey(g.cat, x.key))) shown.push(...x.items); });
+    filtered.push(...sg.loose);
+    if (!hidden) shown.push(...sg.loose);
     if (g.kind === "cat" && !items.length && (q || fPlat.size || fTag.size)) return;     // filtering: empty categories are left out
     if (g.kind === "source" && !items.length) return;
-    const closed = collapsed.has(g.label);
     const name = g.cat || "";
     let html = `<div class="group ${closed?"closed":""}" ${g.kind === "cat" ? `data-cat="${esc(g.cat)}"` : ""} data-label="${esc(g.label)}">
       <span class="gname" data-toggle><span class="caret">&#9662;</span>${g.kind === "source" ? pbadge({platform: g.label}) + " " : ""}${esc(g.label)}</span>
@@ -4633,14 +4958,11 @@ function renderList(){
                   <button class="ico" data-catmove="1" title="Move down" ${gi===cats.length-1?"disabled":""}>&#8595;</button>
                   <button class="ico" data-rename title="Rename">&#9998;</button>
                   <button class="ico" data-delcat title="Delete category">&#10005;</button>` : ""}
-      ${g.kind === "cat" && !g.cat && items.length ? `<button class="btn small" data-sortch title="Put each unassigned video in a category named after its channel or creator">Sort by channel</button>` : ""}
     </div>`;
-    if (!closed) html += items.length ? items.map(r => `
-      <div class="item ${current && current.id===r.id?"active":""} ${selected.has(r.id)?"sel":""}" data-id="${esc(r.id)}" draggable="true">
-        ${r.shots[0] ? `<img loading="lazy" src="${shotUrl(r, r.shots[0])}" alt="">` : `<img alt="">`}
-        <div><div class="t">${esc(r.label)}</div>
-        <div class="s">${pbadge(r)}${vtag(r)} ${esc(r.author)} · ${esc(r.date)}${r.state.favorites.length?` · <span class="fc">&#9733; ${r.state.favorites.length}</span>`:""}${fromBadge(r)}${tagsOf(r).length ? ` · <span class="ttg">${tagsOf(r).map(t => "#" + esc(t)).join(" ")}</span>` : ""}</div></div>
-      </div>`).join("") : `<div class="gempty">${name ? "Drag reels here or pick this category on a reel" : "Nothing here"}</div>`;
+    if (!closed) html += items.length
+      ? sg.subs.map(x => subHead(g.cat, x, x.items[0].platform, collapsed) + (collapsed.has(subKey(g.cat, x.key)) ? "" : x.items.map(r => reelItem(r, true)).join(""))).join("")
+        + sg.loose.map(r => reelItem(r)).join("")
+      : `<div class="gempty">${name ? "Drag reels here or pick this category on a reel" : "Nothing here"}</div>`;
     parts.push({html, chan: !!g.chan, unas: !!g.unas, n: items.length});
   });
   const html = assemble(parts, collapsed);
@@ -4896,8 +5218,7 @@ function renderGallery(){
     const items = sortReels(reels.filter(r => g.test(r) && matches(r, q)));
     if (!items.length && (g.kind !== "cat" || q || fPlat.size)) continue;
     if (g.chan && !chHead) { chHead = true; html += `<h2 class="gchan">Channels</h2>`; }
-    html += `<section class="gsec ${g.chan ? "gsub" : ""}" ${g.kind === "cat" ? `data-cat="${esc(g.cat)}"` : ""}><h3>${g.kind === "source" ? pbadge({platform: g.label}) + " " : ""}${esc(g.label)} <span class="gcount">${items.length}</span></h3>
-      <div class="ggrid">${items.length ? items.map(r => `
+    const card = r => `
         <div class="gcard ${current && current.id===r.id?"active":""} ${selected.has(r.id)?"sel":""}" data-open="${esc(r.id)}" tabindex="0" draggable="true">
           <span class="tick">&#10003;</span>
           <div class="gthumb">${cover(r) ? `<img loading="lazy" src="${shotUrl(r, cover(r))}" alt="">` : ""}
@@ -4905,7 +5226,15 @@ function renderGallery(){
             ${r.slides ? `<span class="gdur">${r.slides.length} slides</span>` : r.duration ? `<span class="gdur">${mmss(+r.duration)}</span>` : ""}</div>
           <div class="gtitle">${esc(r.label)}</div>
           <div class="s">${pbadge(r)}${vtag(r)} ${esc(r.author)} · ${esc(r.date)}${fromBadge(r)}</div>
-        </div>`).join("") : `<div class="gdrop">Drop reels here</div>`}</div></section>`;
+        </div>`;
+    const sg = g.kind === "cat" ? subGroups(items, g.cat, r => r.ch, r => r.chname) : {subs: [], loose: items};
+    const body = !items.length ? `<div class="ggrid"><div class="gdrop">Drop reels here</div></div>`
+      : sg.subs.map(x => `<div class="gsubh" data-chkey="${esc(x.key)}" data-chname="${esc(x.name)}" draggable="true" title="Drag onto a category to put the whole channel there">${pbadge(x.items[0])} ${esc(x.name)} <span class="gcount">${x.items.length}</span>
+            <button class="ico ${homeOf(x.key) ? "homed" : ""}" data-chhome="${esc(x.key)}" data-chname="${esc(x.name)}" title="Put this channel in a category: its videos move there and its new videos start there">&#128193;</button></div>
+          <div class="ggrid gsubgrid">${x.items.map(card).join("")}</div>`).join("")
+        + (sg.loose.length ? `<div class="ggrid">${sg.loose.map(card).join("")}</div>` : "");
+    html += `<section class="gsec ${g.chan ? "gsub" : ""}" ${g.kind === "cat" ? `data-cat="${esc(g.cat)}"` : ""}><h3>${g.kind === "source" ? pbadge({platform: g.label}) + " " : ""}${esc(g.label)} <span class="gcount">${items.length}</span></h3>
+      ${body}</section>`;
   }
   $("#main").innerHTML = `<div class="gallery"><div class="ghint">Click to open · <kbd>Ctrl</kbd>+click or <kbd>Shift</kbd>+click to select several · ${groupBy === "category" ? "drag onto a category to move" : "group by Category to move reels by dragging"}</div>${html || `<div class="empty">No reels match.</div>`}</div>`;
 }
@@ -4933,7 +5262,7 @@ function setCategory(r, cat){
 }
 
 async function catAction(body){
-  try { const r = await api("/api/categories", body); cats = r.categories; chanCats = new Set(r.channel_cats || []); tags = r.tags || tags; }
+  try { const r = await api("/api/categories", body); cats = r.categories; chanCats = new Set(r.channel_cats || []); homes = r.homes || homes; tags = r.tags || tags; }
   catch (e) { return alert(e.message); }
   if (body.action === "rename") reels.forEach(r => { if (r.state.category === body.name) r.state.category = body.new; });
   if (body.action === "rename" && fCat.delete(body.name)) { fCat.add(body.new); saveFilters(); }
@@ -5431,6 +5760,7 @@ function splitKey(e, h){             // a handle reached with Tab: arrow keys re
 document.addEventListener("click", async e => {
   const t = e.target, c = sel => t.closest(sel);
   let el;
+  if ($("#pmenu") && !c("#pmenu") && !c("[data-chhome]")) closeMenu();     // the channel's category menu: a click elsewhere closes it
   if ((el = c("[data-seek]"))) { e.preventDefault(); e.stopPropagation(); return seekTo(+el.dataset.seek); }
   if ((el = c("[data-fdtoggle]"))) { openDrop = openDrop === el.dataset.fdtoggle ? "" : el.dataset.fdtoggle; renderList();
     const qi = openDrop && document.querySelector(`[data-fdq="${openDrop}"]`); if (qi) qi.focus(); return; }
@@ -5443,6 +5773,14 @@ document.addEventListener("click", async e => {
   if (c("#fpFold")) { panes.fp = false; return applyPanes(); }
   if (c("#lsOpen") || c("#lsRail")) { panes.ls = true; return applyPanes(); }
   if (c("#lsFold")) { panes.ls = false; return applyPanes(); }
+  if ((el = c("[data-pmhome]"))) { const m = $("#pmenu"); return setChannelHome(m.dataset.key, m.dataset.name, el.dataset.pmhome); }
+  if (c("[data-pmnew]")) { const m = $("#pmenu"), key = m.dataset.key, name = m.dataset.name; closeMenu();
+    const n = prompt(`New category for ${name}`); if (!n || !n.trim()) return;
+    await catAction({action: "add", name: n.trim()}); if (cats.includes(n.trim())) return setChannelHome(key, name, n.trim()); return; }
+  if ((el = c("[data-chhome]"))) { e.stopPropagation(); return $("#pmenu") && $("#pmenu").dataset.key === el.dataset.chhome ? closeMenu() : chanMenu(el); }
+  if ((el = c("[data-subtoggle]"))) { const k = el.closest(".group").dataset.sub, set = mode === "transcripts" ? trCollapsed : collapsed; set.has(k) ? set.delete(k) : set.add(k);
+    try { localStorage.setItem("rh-collapsed", JSON.stringify([...collapsed])); localStorage.setItem("rh-trcollapsed", JSON.stringify([...trCollapsed])); } catch (err) {}
+    return renderList(); }
   if (c("[data-chtoggle]")) { const set = mode === "transcripts" ? trCollapsed : collapsed; set.has(CH_KEY) ? set.delete(CH_KEY) : set.add(CH_KEY);
     try { localStorage.setItem("rh-collapsed", JSON.stringify([...collapsed])); localStorage.setItem("rh-trcollapsed", JSON.stringify([...trCollapsed])); } catch (err) {}
     return renderList(); }
@@ -5469,7 +5807,6 @@ document.addEventListener("click", async e => {
   if ((el = c("[data-trrm]"))) return trRemoveChannel(el.dataset.trrm);
   if ((el = c("[data-trresume]"))) return trResume(el.dataset.trresume);
   if ((el = c("[data-trredo]"))) return trRedo(el.dataset.trredo);
-  if (c("[data-sortch]")) return sortByChannel();
   if ((el = c("[data-ttab]"))) { document.querySelectorAll("[data-ttab]").forEach(x => x.classList.toggle("active", x === el));
     document.querySelectorAll("[data-tpane]").forEach(x => x.classList.toggle("active", x.dataset.tpane === el.dataset.ttab)); return; }
   if (c("#inboxbtn")) return openInbox();
@@ -5644,11 +5981,17 @@ document.addEventListener("change", async e => {
   if (["pcols","ptitle","pnums"].includes(e.target.id)) renderPaper();
 });
 
-/* drag: favorites reorder + reels onto categories */
+addEventListener("resize", closeMenu);
+document.addEventListener("scroll", e => { if ($("#pmenu") && Date.now() - menuAt > 300 && !(e.target.closest && e.target.closest("#pmenu"))) closeMenu(); }, true);
+
+/* drag: favorites reorder + reels onto categories (+ a whole channel onto a category, 2026-11-09) */
 let dragQ = null;                          // the Waiting list item being dragged (its seq)
 document.addEventListener("dragstart", e => {
   const ql = e.target.closest && e.target.closest("#qlist li");
   if (ql) { dragQ = +ql.dataset.qseq; ql.classList.add("dragging"); e.dataTransfer.setData("text/plain", "queue"); e.dataTransfer.effectAllowed = "move"; return; }
+  const chh = e.target.closest && e.target.closest("[data-chkey][draggable]");
+  if (chh) { e.dataTransfer.setData("text/plain", "chan:" + JSON.stringify({key: chh.dataset.chkey, name: chh.dataset.chname || chh.dataset.chkey}));
+    e.dataTransfer.effectAllowed = "move"; chh.classList.add("dragging"); return; }
   const h = e.target.closest && e.target.closest(".favimg");
   if (h) { dragFav = +h.closest(".fav").dataset.i; h.closest(".fav").classList.add("dragging"); e.dataTransfer.setData("text/plain", "fav"); e.dataTransfer.effectAllowed = "move"; return; }
   const it = e.target.closest && (e.target.closest(".item") || e.target.closest(".gcard"));
@@ -5708,6 +6051,11 @@ document.addEventListener("drop", e => {
     moveReels(ids, target.dataset.cat);
     if (ids.length > 1) clearSel();
   }
+  if (target && target.hasAttribute("data-cat") && data.startsWith("chan:")) {
+    e.preventDefault();
+    let d = null; try { d = JSON.parse(data.slice(5)); } catch (err) {}
+    if (d && d.key && homeOf(d.key) !== target.dataset.cat) setChannelHome(d.key, d.name, target.dataset.cat);
+  }
   if (target && target.hasAttribute("data-cat") && data.startsWith("tr:")) {
     e.preventDefault();
     let tids = []; try { tids = JSON.parse(data.slice(3)); } catch (err) {}
@@ -5717,6 +6065,7 @@ document.addEventListener("drop", e => {
 });
 
 document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && $("#pmenu")) { e.preventDefault(); return closeMenu(); }
   if (ed) return edKey(e);
   if (openDrop && e.key === "Escape") { e.preventDefault(); openDrop = ""; return renderList(); }
   if ($("#setup").classList.contains("show")) {
@@ -5951,6 +6300,7 @@ function setMode(m){
 async function loadTr(){
   const j = await api("/api/transcripts");
   if (j.channel_cats) chanCats = new Set(j.channel_cats);
+  if (j.homes) homes = j.homes;
   if (j.tags) tags = j.tags;
   tr.channels = j.channels || []; tr.items = (j.items || []).map(it => ({...it, label: it.title, version: 1}));
   const n = tr.items.length; $("#trcount").textContent = n; $("#trcount").hidden = !n;
@@ -6014,17 +6364,24 @@ function renderTrList(){
       <span class="gcount">${ch && items.length !== ch.count ? `${items.length} / ${ch.count}` : items.length}</span>
       ${ch && ch.note ? `<a class="ico" href="${esc(ch.note.uri)}" title="Open the channel note in Obsidian (${esc(ch.note.path)})">&#128196;</a>` : ""}
       ${ch && ch.url ? `<a class="ico" href="${esc(ch.url)}" target="_blank" rel="noopener" title="Open the channel on ${esc(ch.platform || "YouTube")}">&#8599;</a>` : ""}
+      ${ch && ch.key !== "_unknown" ? `<button class="ico ${homeOf(ch.key) ? "homed" : ""}" data-chhome="${esc(ch.key)}" data-chname="${esc(ch.name)}" title="${homeOf(ch.key) ? `In ${esc(homeOf(ch.key))}. ` : ""}Put this channel in a category: its videos move there and its new videos start there">&#128193;</button>` : ""}
       ${ch && !ch.videos_only ? `<button class="ico" data-trrm="${esc(ch.key)}" title="Remove this channel's transcripts (downloaded videos stay)">&#10005;</button>` : ""}
       ${g.kind === "cat" && g.cat ? `<button class="ico" data-catmove="-1" title="Move up" ${gi===0?"disabled":""}>&#8593;</button>
                   <button class="ico" data-catmove="1" title="Move down" ${gi===cats.length-1?"disabled":""}>&#8595;</button>
                   <button class="ico" data-rename title="Rename">&#9998;</button>
                   <button class="ico" data-delcat title="Delete category">&#10005;</button>` : ""}
-    </div>${ch ? runLine(ch) : ""}`;
-    if (!closed) html += items.length ? items.map(it => `
-      <div class="item tr ${tr.current && tr.current.ch === it.ch && tr.current.id === it.id ? "active" : ""}" data-tid="${esc(it.ch)}/${esc(it.id)}" draggable="true">
+    </div>${ch && homeOf(ch.key) ? `<div class="gstat ghome">Category: <b>${esc(homeOf(ch.key))}</b></div>` : ""}${ch ? runLine(ch) : ""}`;
+    const trItem = (it, sub) => `
+      <div class="item tr ${sub ? "sub" : ""} ${tr.current && tr.current.ch === it.ch && tr.current.id === it.id ? "active" : ""}" data-tid="${esc(it.ch)}/${esc(it.id)}" draggable="true">
         <div><div class="t">${esc(it.title)}</div>
-        <div class="s">${g.kind !== "channel" ? esc(chanName(it.ch)) + " · " : ""}${esc(it.date)}${it.duration ? ` · ${mmss(+it.duration)}` : ""} · ${srcBadge(it)}${g.kind !== "cat" && trCatOf(it) ? ` · <span class="tcat">${esc(trCatOf(it))}</span>` : ""}${it.full ? ` · <span class="fc" title="This video is in Videos, in full">&#9654; video</span>` : ""}${it.note || !vault.ok ? "" : ` · <span title="No Obsidian note yet">no note</span>`}${tagsOf(it).length ? ` · <span class="ttg">${tagsOf(it).map(t => "#" + esc(t)).join(" ")}</span>` : ""}</div></div>
-      </div>`).join("") : `<div class="gempty">${g.kind === "cat" && g.cat ? "Drag transcripts here or pick this category on a transcript" : "Nothing here"}</div>`;
+        <div class="s">${g.kind !== "channel" && !sub ? esc(chanName(it.ch)) + " · " : ""}${esc(it.date)}${it.duration ? ` · ${mmss(+it.duration)}` : ""} · ${srcBadge(it)}${g.kind !== "cat" && trCatOf(it) ? ` · <span class="tcat">${esc(trCatOf(it))}</span>` : ""}${it.full ? ` · <span class="fc" title="This video is in Videos, in full">&#9654; video</span>` : ""}${it.note || !vault.ok ? "" : ` · <span title="No Obsidian note yet">no note</span>`}${tagsOf(it).length ? ` · <span class="ttg">${tagsOf(it).map(t => "#" + esc(t)).join(" ")}</span>` : ""}</div></div>
+      </div>`;
+    const sg = g.kind === "cat" ? subGroups(items, g.cat, it => it.ch, it => chanName(it.ch)) : {subs: [], loose: items};
+    const chPlat = key => { const c = tr.channels.find(x => x.key === key); return c ? c.platform : ""; };
+    if (!closed) html += items.length
+      ? sg.subs.map(x => subHead(g.cat, x, chPlat(x.key), trCollapsed) + (trCollapsed.has(subKey(g.cat, x.key)) ? "" : x.items.map(it => trItem(it, true)).join(""))).join("")
+        + sg.loose.map(it => trItem(it)).join("")
+      : `<div class="gempty">${g.kind === "cat" && g.cat ? "Drag transcripts here or pick this category on a transcript" : "Nothing here"}</div>`;
     parts.push({html, chan: !!g.chan || g.kind === "channel", unas: !!g.unas, n: items.length});
   });
   const html = assemble(parts, trCollapsed);
@@ -6041,18 +6398,6 @@ async function trSetCategory(it, cat){
 function runLine(ch){                       // under a channel: how far its last transcripts run got, and Resume
   const wl = ch.wrong_lang ? `<div class="gstat"><span class="warn">${ch.wrong_lang} from captions in another language</span> <button class="btn small" data-trredo="${esc(ch.key)}" title="List them, then redo them with the language set in Settings">Redo</button></div>` : "";
   return wl + runLine0(ch);
-}
-async function sortByChannel(){
-  let j;
-  try { j = await api("/api/sortchannels", {dry: true}); } catch (err) { return alert(err.message); }
-  if (!j.count) return toast("No unassigned video has a known channel");
-  const names = j.categories.slice(0, 10).join(", ") + (j.categories.length > 10 ? ` and ${j.categories.length - 10} more` : "");
-  const ans = await askConfirm(`Sort ${j.count} unassigned video${j.count > 1 ? "s" : ""} by channel?`,
-    `Each goes into a category named after its channel or creator: ${names}. Missing categories are made. Videos that already have a category are not touched.`, null, "Sort");
-  if (!ans.ok) return;
-  try { j = await api("/api/sortchannels", {}); } catch (err) { return alert(err.message); }
-  await loadReels(current && current.id, new Set(reels.map(r => r.id)));
-  toast(`Sorted ${j.count} video${j.count === 1 ? "" : "s"}`);
 }
 async function trRedo(key){
   let j;

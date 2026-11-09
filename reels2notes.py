@@ -943,29 +943,24 @@ def new_version(out, workdir, video, info):
 
 
 def channel_category(out, workdir, info, url):
-    """A new video starts in a category named after its channel or creator (made if missing), written before the
-    note so the app and the vault note see it at once. Only for videos without hub.json (new downloads)."""
-    name = re.sub(r"\s+", " ", tr_name(info, url)).strip()[:100]
-    if not name or name.lower() in ("unassigned", "channel") or name.isdigit():
-        return
+    """A new video starts in its channel's home category when you gave the channel one in Reels Hub
+    (_categories.json "homes" {channel key: category}, the key as tr_key); otherwise in Unassigned, where the app
+    shows it under its channel. Written before the note so the app and the vault note see it at once. Only for
+    videos without hub.json (new downloads). Since 2026-11-09 no category is made per channel any more."""
     f = out / "_categories.json"
     try:
-        cats = json.loads(f.read_text(encoding="utf-8")).get("categories", []) if f.exists() else []
+        raw = json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
     except (OSError, ValueError):
         return                                               # unreadable: leave it to the app
-    raw = json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
-    ch = list(raw.get("channels") or [])
-    if name not in cats or name not in ch:
-        if name not in cats:
-            cats.append(name)
-        if name not in ch:
-            ch.append(name)                                  # shown under the Channels group
-        raw.update(categories=cats, channels=ch)
-        tmp = f.with_name("._categories.json.tmp")
-        tmp.write_text(json.dumps(raw, indent=1, ensure_ascii=False), encoding="utf-8")
-        replace_retry(tmp, f)
-    (workdir / "hub.json").write_text(json.dumps({"category": name, "favorites": []}, indent=1, ensure_ascii=False), encoding="utf-8")
-    print(f"  category: {name}")
+    homes, cats = raw.get("homes"), raw.get("categories") or []
+    if not isinstance(homes, dict) or not homes:
+        return
+    key = tr_key(info, url).casefold()
+    cat = next((v for k, v in homes.items() if str(k).casefold() == key), "")
+    if not cat or cat not in cats:
+        return
+    (workdir / "hub.json").write_text(json.dumps({"category": cat, "favorites": []}, indent=1, ensure_ascii=False), encoding="utf-8")
+    print(f"  category: {cat} (the channel's)")
 
 
 def fmt_dur(sec):
@@ -1726,7 +1721,7 @@ def main():
     ap.add_argument("--new-version", action="store_true", help="process already-done videos again as a new copy (_v2, _v3)")
     ap.add_argument("--target", help="reel folder name to use (with --redo or --new-version)")
     ap.add_argument("--out", default=str(Path.home() / "Downloads" / "reels"))
-    ap.add_argument("--channel-category", action="store_true", help="put a new video in a category named after its channel")
+    ap.add_argument("--channel-category", action="store_true", help="put a new video in its channel's home category, if the app gave the channel one")
     ap.add_argument("--prefer-lang", default="", help="transcripts: take captions in this language first (e.g. en)")
     ap.add_argument("--transcripts", action="store_true",
                     help="transcripts only (no video, no snapshots): links can be videos, YouTube channels or playlists")
