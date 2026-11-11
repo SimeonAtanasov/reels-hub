@@ -507,14 +507,14 @@ def read_state(folder):
            "shared_by": s["shared_by"] if isinstance(s.get("shared_by"), dict) else None,
            "shared": [x for x in s["shared"] if isinstance(x, dict)][-10:] if isinstance(s.get("shared"), list) else [],
            "tags": _clean_tags(s.get("tags")), "tag_tokens": [str(t) for t in s.get("tag_tokens") or [] if isinstance(t, str)],
-           "cat_tag": str(s.get("cat_tag") or "")}
+           "cat_tag": str(s.get("cat_tag") or ""), "creator_tag": str(s.get("creator_tag") or "")}
     if bad:
         out["_bad"] = True
     return out
 
 
 def write_state(folder, state):
-    state = {k: v for k, v in state.items() if not k.startswith("_") and not (k in ("shared_by", "shared", "tags", "tag_tokens", "cat_tag") and not v)}
+    state = {k: v for k, v in state.items() if not k.startswith("_") and not (k in ("shared_by", "shared", "tags", "tag_tokens", "cat_tag", "creator_tag") and not v)}
     atomic_write(folder / "hub.json", json.dumps(state, indent=1, ensure_ascii=False))
 
 
@@ -522,7 +522,7 @@ def list_reels():
     if not OUT.exists():
         return []
     start_homes()
-    items = []
+    items, t0 = [], time.time()
     for f in OUT.iterdir():
         if not f.is_dir() or f.name.startswith(("_", ".")):
             continue
@@ -542,6 +542,9 @@ def list_reels():
         except Exception:
             r["ch"], r["chname"] = "", ""
         items.append(r)
+    if time.time() - t0 > 10:
+        miss = sum(1 for r in items if isinstance(r.get("obsidian"), dict) and r["obsidian"].get("missing"))
+        print(f"  library listed in {time.time() - t0:.0f}s: {len(items)} videos, {miss} notes not found in the vault")
     return sorted(items, key=lambda r: (r["date"], r["id"]), reverse=True)
 
 
@@ -575,6 +578,9 @@ AI_SECTIONS = ["Obsidian Tags", "Summary", "Memorable Things / Main Takeaways", 
                "Reflective Questions", "Actionable Insights", "Compare and Contrast"]
 AI_TODO = "<!-- reels-hub:ai-todo - ask Claude to fill this in, or use \"Copy AI prompt\" in Reels Hub -->"
 MISS = {}                                   # reel id -> time of the last failed vault search
+VIDX = {"at": 0.0, "map": {}, "n": 0}       # reel id -> note paths, from one walk over the vault (_vault_index)
+VIDX_LOCK = threading.Lock()
+VIDX_AGE = 120                              # seconds an index is reused: one vault walk per listing, not one per note
 
 
 def vault_ok():
@@ -610,23 +616,50 @@ def find_vault_note(folder, r, state):
         return None                                         # never created: nothing to look for
     if time.time() - MISS.get(r["id"], 0) < 1800:        # a full vault scan is costly on OneDrive
         return None
-    hits = []
-    for p in VAULT.rglob("*.md"):                           # it was moved or renamed in Obsidian
-        if any(part.startswith(".") for part in p.relative_to(VAULT).parts):
-            continue
-        try:
-            with open(p, encoding="utf-8", errors="ignore") as fh:
-                head = fh.read(4000)
-        except OSError:
-            continue
-        if has_marker(head, r["id"]):
-            hits.append(p.relative_to(VAULT).as_posix())
+    hits = [h for h in _vault_index().get(r["id"], []) if (VAULT / h).is_file()]   # it was moved or renamed in Obsidian
     if len(hits) == 1:
         return hits[0]
     if len(hits) > 1:
         print(f"  {len(hits)} notes carry the id {r['id']} (a copy?) - not guessing: {hits}")
     MISS[r["id"]] = time.time()
     return None
+
+
+def _vault_index(max_age=VIDX_AGE):
+    """Reel id -> note paths (vault-relative), read from the head of every note (2026-11-11). Before, each note not at
+    its saved path walked the whole vault on its own, under DATA_LOCK: with many such notes on OneDrive a library
+    listing took about 6 minutes and every other request waited. Now one walk serves them all for VIDX_AGE seconds,
+    and ensure_vault_note starts it before taking DATA_LOCK."""
+    with VIDX_LOCK:
+        if time.time() - VIDX["at"] < max_age:
+            return VIDX["map"]
+        t0, idx, n = time.time(), {}, 0
+        for p in VAULT.rglob("*.md"):
+            rel = p.relative_to(VAULT)
+            if any(part.startswith(".") for part in rel.parts):
+                continue
+            try:
+                with open(p, encoding="utf-8", errors="ignore") as fh:
+                    head = fh.read(4000)
+            except OSError:
+                continue
+            n += 1
+            ids = set(re.findall(r"<!-- reels-hub:id=(\S+?) -->", head)) | set(re.findall(r"^reel_id:\s*(\S+)\s*$", head, re.M))
+            for i in ids:
+                idx.setdefault(i, []).append(rel.as_posix())
+        VIDX.update(at=time.time(), map=idx, n=n)
+        print(f"  looked for moved notes: {n} notes in the vault read in {time.time() - t0:.1f}s")
+        return idx
+
+
+def _needs_search(r, state):
+    """The note is not where hub.json says and was not looked for in the last 30 minutes."""
+    rel = state.get("note_path") or ""
+    if rel and (VAULT / rel).is_file():
+        return False
+    if not (rel or state.get("note_name")):
+        return False
+    return time.time() - MISS.get(r["id"], 0) >= 1800
 
 
 def has_marker(text, rid):
@@ -638,6 +671,11 @@ def ensure_vault_note(folder, r):
     """Create the reel's note once, in your note format; afterwards only the Favorites part is ever updated."""
     if not vault_ok():
         return {"error": f"Vault not found: {VAULT}"}
+    try:
+        if _needs_search(r, read_state(folder)):
+            _vault_index()                          # the slow part, before DATA_LOCK, so other requests go on
+    except Exception as e:
+        print(f"  vault search: {e}")
     with DATA_LOCK:
         return _ensure_vault_note(folder, r)
 
@@ -665,6 +703,7 @@ def _ensure_vault_note(folder, r):
         rel = f"{dname}/{name}.md"
         (VAULT / dname).mkdir(parents=True, exist_ok=True)
         atomic_write(VAULT / rel, vault_note_text(folder, r, state))
+        _new_note_creator(folder, rel)
     if rel != state.get("note_path"):
         st = read_state(folder); st["note_path"] = rel; st["note_name"] = Path(rel).stem; write_state(folder, st)
     return {"name": Path(rel).stem, "path": rel, "uri": obsidian_uri(rel), "sent": state["sent"]}
@@ -716,7 +755,7 @@ def vault_note_text(folder, r, state, tonly=None):
     plat = r["platform"]
     creator_url = info.get("uploader_url") or info.get("channel_url") or ""
     tag_cat = ("#" + re.sub(r"[^0-9A-Za-z]+", "", state["category"].title())) if state["category"] else ""
-    tag_cat = " ".join(dict.fromkeys([t for t in [tag_cat] + [_tag_token(x) for x in state.get("tags") or []] if t]))
+    tag_cat = " ".join(dict.fromkeys([t for t in [tag_cat] + [_tag_tok(x) for x in state.get("tags") or []] if t]))
     lines = [time.strftime("%Y-%m-%d"), time.strftime("%H:%M"),
              f"**Title:** {r['title'] or r['label']}",
              f"**Source**: {r['url']}",
@@ -1323,30 +1362,40 @@ def tr_set_category(key, rid, cat):
 # ---------------------------------------------------------------- tags (2026-11-07)
 # A video has one main category and any number of tags (Simeon: "training" as the category, "kettlebell" as a tag).
 # The tag list is in _categories.json "tags"; a video's tags in its hub.json "tags" (reels and transcript folders
-# alike). Each tag also goes on the note's **Tags** line as #Tag; the tokens the app wrote are kept in "tag_tokens"
+# alike). Each tag also goes on the note's **Tags** line as #tag (lower case, nested with "/": _tag_tok); the tokens the app wrote are kept in "tag_tokens"
 # so a removed tag takes out only its own token (never the platform's or the category's, never one you typed).
 
-def _clean_tags(v):
+def _clean_tags(v, limit=30):
     out, seen = [], set()
     for t in v if isinstance(v, list) else []:
-        t = re.sub(r"\s+", " ", str(t).replace("#", "")).strip()[:60]
+        t = re.sub(r"\s+", " ", str(t).replace("#", "")).strip().lower()[:60]
         if t and t.lower() not in seen and t.lower() != "unassigned":
             seen.add(t.lower()); out.append(t)
-    return out[:30]
+    return out[:limit] if limit else out          # 30 per video; the list of all tags has no limit (2026-11-11)
 
 
 def _tag_token(name):
     return ("#" + re.sub(r"[^0-9A-Za-z]+", "", str(name).title())) if re.sub(r"[^0-9A-Za-z]+", "", str(name)) else ""
 
 
+def _tag_tok(name):
+    """A tag's token on the note's Tags line (2026-11-11): lower case, spaces to hyphens, "/" kept, so "ai/claude code"
+    is #ai/claude-code, a nested tag in Obsidian (the tag pane folds it under #ai). Categories keep _tag_token."""
+    t = re.sub(r"\s+", "-", str(name).strip().lower())
+    t = re.sub(r"[^\w/-]+", "", t)
+    t = re.sub(r"-{2,}", "-", re.sub(r"/{2,}", "/", t)).strip("/-")
+    t = "/".join(x.strip("-") for x in t.split("/") if x.strip("-"))
+    return "#" + t if re.search(r"[^\d/_-]", t) else ""
+
+
 def read_tags():
-    return _clean_tags(_cats_raw().get("tags"))
+    return _clean_tags(_cats_raw().get("tags"), limit=None)
 
 
 def write_tags(tags):
     raw = _cats_raw()
     raw.setdefault("categories", read_cats())
-    raw["tags"] = _clean_tags(tags)
+    raw["tags"] = _clean_tags(tags, limit=None)
     atomic_write(cats_file(), json.dumps(raw, indent=1, ensure_ascii=False))
 
 
@@ -1357,7 +1406,7 @@ def _write_item_tags(folder, tags):
         raise ValueError(f"{folder.name}/hub.json can't be read - not changing it")
     tags = _clean_tags(tags)
     old = [t for t in st.get("tag_tokens") or [] if isinstance(t, str)]
-    want = [t for t in dict.fromkeys(_tag_token(x) for x in tags) if t]
+    want = [t for t in dict.fromkeys(_tag_tok(x) for x in tags) if t]
     keep = set(want) | {st.get("cat_tag") or "", _tag_token(st.get("category") or "")}
     rel = st.get("note_path") or ""
     if vault_ok() and rel and (VAULT / rel).is_file():
@@ -1409,6 +1458,121 @@ def _all_tagged():
                 for f in cdir.iterdir():
                     if f.is_dir() and (f / "hub.json").is_file():
                         yield f
+
+
+# ---------------------------------------------------------------- creator tag (2026-11-11)
+# Every note also gets #creator/<handle> on its **Tags** line (Simeon: notes are not in creator folders unless the
+# channel has a home, so a tag lists a creator's notes across categories; Obsidian folds them under #creator). Only
+# in the notes, not in the app's tag list (the Channel filter does that job). The handle is the channel key
+# (reel_channel / the _transcripts folder), "." and "_" as "-": angus.sewell -> #creator/angus-sewell. hub.json
+# "creator_tag" is the token the app wrote, so only that token is ever replaced; nothing else on the line changes.
+
+def _creator_key(folder):
+    if folder.parent.parent == OUT / TR_DIR:
+        return folder.parent.name
+    return reel_channel(folder)[0]
+
+
+def _creator_tok(key):
+    k = re.sub(r"[._\s]+", "-", str(key or "")).strip("-").lower()
+    if k in ("", "channel", "unknown"):
+        return ""
+    return _tag_tok("creator/" + k)
+
+
+def _set_creator_tag(folder, write=True):
+    """Put the creator token on the note's Tags line. Caller holds DATA_LOCK. Returns added | same | a reason it
+    was left alone (no creator, no note, not the app's note, no Tags line, unreadable hub.json)."""
+    hp = folder / "hub.json"
+    try:
+        st = json.loads(read_text(hp)) if hp.is_file() else {}
+        if not isinstance(st, dict):
+            return "unreadable hub.json"
+    except (ValueError, OSError):
+        return "unreadable hub.json"
+    want = _creator_tok(_creator_key(folder))
+    if not want:
+        return "no creator"
+    rel = st.get("note_path") or ""
+    if not (vault_ok() and rel and (VAULT / rel).is_file()):
+        return "no note"
+    text = read_text(VAULT / rel)
+    if not has_marker(text, folder.name):
+        return "not the app's note"
+    m = re.search(r"^\*\*Tags\*\*:(.*)$", text, re.M)
+    if not m:
+        return "no Tags line"
+    old = str(st.get("creator_tag") or "")
+    cur = m.group(1).split()
+    parts = [t for t in cur if not (old and t == old and t != want)]
+    line_changes = want not in parts or len(parts) != len(cur)
+    if not line_changes and old == want:
+        return "same"
+    if not write:
+        return "added" if line_changes else "same"
+    if want not in parts:
+        parts.append(want)
+    if line_changes:
+        atomic_write(VAULT / rel, text[:m.start()] + "**Tags**: " + " ".join(parts) + text[m.end():])
+    st["creator_tag"] = want
+    atomic_write(hp, json.dumps(st, indent=1, ensure_ascii=False))
+    TR_CACHE.pop(str(folder), None)
+    return "added" if line_changes else "same"
+
+
+def _new_note_creator(folder, rel):
+    try:
+        with DATA_LOCK:
+            _set_creator_tag(folder)
+    except Exception as e:
+        print(f"  {folder.name}: creator tag not added ({e})")
+
+
+CREATOR_JOB = {"state": "", "dry": False, "done": 0, "total": 0, "counts": {}, "examples": [], "at": 0}
+CREATOR_LOCK = threading.Lock()
+
+
+def creator_tags(body):
+    """POST /api/notes/creatortags {dry} starts the creator tag on every note of a video or transcript in the
+    background (about 7,000 notes: too long for one request); {status: true} answers how far it got. dry: counts and
+    examples only, nothing written. DATA_LOCK is taken per note, so the app and runs go on; a video being
+    re-processed is skipped (counted as busy) and picked up by the next pass."""
+    if body.get("status"):
+        return dict(CREATOR_JOB)
+    if not vault_ok():
+        raise ValueError("No Obsidian vault set (Settings)")
+    dry = bool(body.get("dry"))
+    with CREATOR_LOCK:
+        if CREATOR_JOB["state"] == "running":
+            raise ValueError("Already running")
+        CREATOR_JOB.update(state="running", dry=dry, done=0, total=0, counts={}, examples=[], at=time.time())
+
+    def work():
+        try:
+            folders = list(_all_tagged())
+            CREATOR_JOB["total"] = len(folders)
+            for f in folders:
+                try:
+                    if f.parent == OUT:
+                        busy_check(f.name)
+                    with DATA_LOCK:
+                        res = _set_creator_tag(f, write=not dry)
+                except ValueError:
+                    res = "busy"
+                except Exception as e:
+                    res = "error"
+                    print(f"  {f.name}: creator tag not added ({e})")
+                c = CREATOR_JOB["counts"]; c[res] = c.get(res, 0) + 1
+                if res == "added" and len(CREATOR_JOB["examples"]) < 8:
+                    CREATOR_JOB["examples"].append(_creator_tok(_creator_key(f)))
+                CREATOR_JOB["done"] += 1
+            CREATOR_JOB["state"] = "done"
+            print(f"  creator tags{' (count only)' if dry else ''}: {CREATOR_JOB['counts']}")
+        except Exception as e:
+            CREATOR_JOB["state"] = f"error: {e}"
+            print(f"  creator tags stopped: {e}")
+    threading.Thread(target=work, daemon=True).start()
+    return dict(CREATOR_JOB)
 
 
 def change_tags(body):
@@ -1621,6 +1785,7 @@ def transcript_note(folder, from_channel):
         atomic_write(VAULT / rel, text)
         st.update(note_path=rel, note_name=name, **{"from": "channel" if from_channel else "link"})
         atomic_write(folder / "hub.json", json.dumps(st, indent=1, ensure_ascii=False))
+        _new_note_creator(folder, rel)
         return {"name": name, "path": rel, "uri": obsidian_uri(rel)}
 
 
@@ -1710,7 +1875,7 @@ def _adopt_transcript_note(folder, r):
         if "category" in st or st.get("tags"):
             if "category" in st:
                 rh["category"] = str(st.get("category") or "")
-            for k in ("tags", "tag_tokens", "cat_tag"):
+            for k in ("tags", "tag_tokens", "cat_tag", "creator_tag"):
                 if st.get(k):
                     rh[k] = st[k]
             atomic_write(folder / "hub.json", json.dumps(rh, indent=1, ensure_ascii=False))
@@ -1917,7 +2082,8 @@ def save_state(reel_id, state):
         clean = {"category": str(state.get("category", ""))[:100], "favorites": favs,
                  "note_name": old["note_name"], "note_path": old["note_path"], "sent": old["sent"],
                  "shared_by": old["shared_by"], "shared": old["shared"],
-                 "tags": old["tags"], "tag_tokens": old["tag_tokens"], "cat_tag": old["cat_tag"]}
+                 "tags": old["tags"], "tag_tokens": old["tag_tokens"], "cat_tag": old["cat_tag"],
+                 "creator_tag": old["creator_tag"]}
         write_state(folder, clean)
         write_note_favorites(folder, favs)
         if clean["category"] != old["category"]:          # the note follows at once: tag, Category line, folder
@@ -3968,6 +4134,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, **queue_hold_all(body)})
             elif path == "/api/queue/move":
                 self.send_json({"ok": True, **queue_move(body)})
+            elif path == "/api/notes/creatortags":
+                self.send_json({"ok": True, **creator_tags(body)})
             elif path == "/api/notes/sortfolders":
                 self.send_json({"ok": True, **sort_notes(bool(body.get("dry")))})
             elif path == "/api/tags":
