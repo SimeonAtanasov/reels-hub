@@ -3154,6 +3154,24 @@ def queue_hold(body):
     return {"seq": seq, "held": held}
 
 
+def queue_hold_all(body):
+    """Pause all / Resume all (2026-11-11): every waiting item of both lanes, inbox Adds too, set for Later
+    (held) or released. What runs now is not stopped: it finishes, then nothing set for Later starts. Releasing also
+    clears STOPPED (interrupted); pausing keeps it, so a stopped item still says so."""
+    held = bool(body.get("held"))
+    with INBOX_LOCK:
+        n = 0
+        for t in RUNQ + INBOX["queue"]:
+            n += bool(t.get("held")) != held
+            t["held"] = held
+            if not held:
+                t.pop("interrupted", None)
+        _qsave()
+    if not held:
+        start_next()
+    return {"held": held, "count": n, "running": bool(any_running())}
+
+
 def queue_move(body):
     """Move a waiting item within its lane: {seq, to: position from 0 among that lane's items} or {seq, dir: -1 | 1}.
     The other lane's items keep their places; the whole line is renumbered."""
@@ -3490,6 +3508,50 @@ def _finish_add(task, code, done):
                       + (f" ({res['frames']} edited image{'s' if res['frames'] > 1 else ''} in use: the plain frame was kept)" if res["frames"] else ""))
 
 
+# Keep the PC awake while the line runs (2026-11-10). Windows may go to sleep after its idle time even while Whisper
+# and easyocr work, which pauses a long run (and a download cut by sleep fails). While a run goes or anything waits that
+# starts by itself (line_busy), Reels Hub asks Windows to stay awake: a "system required" request, so the screen can
+# still turn off. When the line is done, or only Later items wait, Windows may sleep again as usual. Closing the lid,
+# the Sleep button or a low battery still put it to sleep. Windows ties the request to the thread that made it, so one
+# long-lived thread (awake_worker) makes and clears it. Nothing happens off Windows.
+ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+AWAKE_EVERY = 10                          # seconds between checks
+AWAKE = {"on": False}
+
+
+def _set_awake(on):
+    """Ask Windows to stay awake (on) or let it sleep again (off); True when Windows took it."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        f = ctypes.windll.kernel32.SetThreadExecutionState
+        f.argtypes, f.restype = [ctypes.c_uint], ctypes.c_uint
+        return f(ES_CONTINUOUS | (ES_SYSTEM_REQUIRED if on else 0)) != 0
+    except Exception:
+        return False
+
+
+def awake_tick():
+    """One check: switch the request on or off when the line's state has changed."""
+    try:
+        busy = bool(line_busy())
+    except Exception:
+        return
+    if busy == AWAKE["on"]:
+        return
+    if _set_awake(busy) or not busy:
+        AWAKE["on"] = busy
+        print("Keeping this PC awake while the line runs (it may sleep again when the line is done)." if busy
+              else "The line is done: this PC may sleep again.", flush=True)
+
+
+def awake_worker():
+    while True:
+        awake_tick()
+        time.sleep(AWAKE_EVERY)
+
+
 def inbox_worker():
     """Background: pick up shares from Cloudflare now and then (or when asked), and start queued Adds."""
     last = 0.0
@@ -3778,7 +3840,7 @@ class Handler(BaseHTTPRequestHandler):
                                    "can_delete": can_delete(),
                                    "share": {"on": bool(cloud_settings()), "people": cl.get("people") or [],
                                              "as": cl.get("name", "")}},
-                            "vault": {"path": str(VAULT), "ok": vault_ok()}})
+                            "vault": {"path": str(VAULT), "ok": vault_ok()}, "trash": str(OUT / "_trash")})
         elif path == "/api/inbox":
             self.send_json(inbox_status())
         elif path == "/api/transcripts":
@@ -3787,7 +3849,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"running": any_running(), "lanes": {lane: lane_status(JOBS[lane]) for lane in LANES},
                             "busy": sorted(JOB["busy"]) if JOB["running"] else [],
                             "transcripts": bool(TRJOB["running"]),
-                            "queue": queue_list(), "changed": CHANGED["list"], "boot": BOOT, "homes_job": dict(HOMES)})
+                            "queue": queue_list(), "changed": CHANGED["list"], "boot": BOOT, "homes_job": dict(HOMES),
+                            "awake": AWAKE["on"]})
         elif path.startswith("/media/"):
             self.serve_file(path[len("/media/"):])
         else:
@@ -3901,6 +3964,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, **set_channel_home(body.get("key"), body.get("category"))})
             elif path == "/api/queue/hold":
                 self.send_json({"ok": True, **queue_hold(body)})
+            elif path == "/api/queue/holdall":
+                self.send_json({"ok": True, **queue_hold_all(body)})
             elif path == "/api/queue/move":
                 self.send_json({"ok": True, **queue_move(body)})
             elif path == "/api/notes/sortfolders":
@@ -4072,6 +4137,10 @@ header .spacer{flex:1}
 .fpane .sortbar select{flex:0 1 150px}
 .fpane #filters{border-bottom:0}
 .flist .fdlist{max-height:none}
+.fmore{display:flex;flex-wrap:wrap;gap:4px 14px;padding:2px 5px 0}
+.fmore:empty{display:none}
+.fmore .link{font-size:12px}
+.fmore .fhint{padding:0}
 .fdsep{font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;padding:8px 5px 3px;border-top:1px solid var(--line);margin-top:4px}
 .chgroup{margin-left:10px;border-left:1px solid var(--line);padding-left:4px}
 .cgroup .gname{color:var(--text)}
@@ -4116,6 +4185,10 @@ body.resizing-y,body.resizing-y *{cursor:row-resize!important;user-select:none}
 .pfill[data-stage="waiting"],.pfill[data-stage="paused"]{background:var(--muted)}
 #queue{display:flex;flex-direction:column;gap:3px;border-top:1px dashed var(--line);padding-top:6px}
 #queue .qhead{font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+#queue .qheadrow{display:flex;align-items:center;gap:6px;min-width:0}
+#queue .qheadrow .qhead{flex:1;min-width:0}
+#queue .qall{display:flex;gap:2px;flex:none}
+#queue .qallbtn{font-size:10.5px;padding:1px 5px;white-space:nowrap}
 #qlist li.qsub{cursor:default;font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-top:2px}
 #qlist{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:1px;max-height:150px;overflow-y:auto;contain:inline-size}
 /* contain: long links shorten with ... instead of widening the list (one column below 900 px) */
@@ -4196,6 +4269,8 @@ body.resizing-y,body.resizing-y *{cursor:row-resize!important;user-select:none}
 .gcount{font-size:11px;color:var(--muted);background:var(--panel2);border-radius:10px;padding:0 7px}
 .group .ico{opacity:0}
 .group:hover .ico{opacity:1}
+.group .ico.gfold{opacity:.6;font-size:15px;line-height:1;padding:0 4px}
+.group:hover .ico.gfold{opacity:1}
 .gempty{font-size:12px;color:var(--muted);padding:2px 10px 6px 22px}
 /* channels inside a category (2026-11-09) */
 .group.sub{padding:6px 6px 2px 18px;margin-top:0;cursor:grab}
@@ -4604,7 +4679,7 @@ body:has(#bulkbar.show) #log{bottom:84px}
         </div>
       </div>
       <div id="queue" hidden>
-        <div class="qhead" id="qhead"></div>
+        <div class="qheadrow"><div class="qhead" id="qhead"></div><span class="qall"><button class="ico qallbtn" id="qpauseall" data-qall="1" title="Pause all: set everything waiting for Later. What runs now still finishes; after that nothing starts until you resume (stays so when you close the app)">&#10074;&#10074; Pause all</button><button class="ico qallbtn" id="qresumeall" data-qall="0" title="Resume all: everything set for Later, STOPPED ones too, runs again when its turn comes">&#9654; Resume all</button></span></div>
         <ol id="qlist"></ol>
       </div>
     </div>
@@ -4753,7 +4828,7 @@ let reels = [], cats = [], filtered = [], current = null, tab = "transcript";
 let lb = {list: [], i: 0}, wasRunning = false, dragFav = null;
 const LANES = ["video", "tr"], LANE_NAME = {video: "Videos", tr: "Transcripts"};   // the two run lanes (2026-11-09)
 let lastStatus = null, logLane = "", trWas = false;      // the last /api/status; the log's lane ("" = follow what runs)
-let collapsed = new Set(), vault = {ok: false, path: ""}, view = "detail", favFull = false;
+let collapsed = new Set(), vault = {ok: false, path: ""}, trashDir = "", view = "detail", favFull = false;
 let panes = {fp: true, ls: true};            // filters pane and list pane open (localStorage rh-panes)
 try { panes = {...panes, ...JSON.parse(localStorage.getItem("rh-panes") || "{}")}; } catch (e) {}
 function applyPanes(){
@@ -4782,7 +4857,7 @@ let mode = "reels";                        // "reels" (the gallery) or "transcri
 let tr = {channels: [], items: [], current: null, shown: ""}, trCollapsed = new Set(), trTick = 0;
 let trGroupBy = "category", tfChan = new Set(), tfCat = new Set(), tfPlat = new Set(), tfTag = new Set();   // the catalogue's own grouping and filters
 try { trCollapsed = new Set(JSON.parse(localStorage.getItem("rh-trcollapsed") || "[]")); } catch (e) {}
-try { trGroupBy = localStorage.getItem("rh-trgroupby") || trGroupBy; const f = JSON.parse(localStorage.getItem("rh-trfilters") || "{}"); tfCat = new Set(f.c || []); tfPlat = new Set(f.p || []); tfTag = new Set(f.t || []); } catch (e) {}
+try { trGroupBy = localStorage.getItem("rh-trgroupby") || trGroupBy; const f = JSON.parse(localStorage.getItem("rh-trfilters") || "{}"); tfCat = new Set(f.c || []); tfPlat = new Set(f.p || []); tfTag = new Set(f.t || []); tfChan = new Set(f.h || []); } catch (e) {}
 const GROUP_OPTS = {reels: [["category", "Category"], ["source", "Source"], ["none", "None"]], transcripts: [["category", "Category"], ["channel", "Channel"], ["none", "None"]]};
 try { if (!localStorage.getItem("rh-trgroup2")) { trGroupBy = "category"; localStorage.setItem("rh-trgroupby", "category"); localStorage.setItem("rh-trgroup2", "1"); } } catch (e) {}   // 2026-11-09: categories on top, once
 function setGroupOptions(m){            // the Group menu offers Channel in Transcripts and Source in Videos
@@ -4867,7 +4942,7 @@ async function loadReels(keepId, changedIds){
     if (o && !(changedIds && changedIds.has(r.id))) { r.state = o.state; if (o.notesDraft !== undefined) r.notesDraft = o.notesDraft; }
     return r;
   });
-  cats = j.categories; chanCats = new Set(j.channel_cats || []); homes = j.homes || homes; tags = j.tags || tags; vault = j.vault || vault; me = j.me || me;
+  cats = j.categories; chanCats = new Set(j.channel_cats || []); homes = j.homes || homes; tags = j.tags || tags; vault = j.vault || vault; trashDir = j.trash || trashDir; me = j.me || me;
   trackHomes(j.homes_job);
   if (changedSeq === null) { changedSeq = j.changed_seq || 0; bootId = j.boot; }
   else if (j.boot && j.boot !== bootId) { bootId = j.boot; changedSeq = 0; }
@@ -4936,9 +5011,10 @@ window.addEventListener("pagehide", () => {    // tab closing: send pending save
 
 /* ---------- sidebar ---------- */
 /* filters: empty set = show all */
-let fPlat = new Set(), fCat = new Set(), fTag = new Set();
-try { const f = JSON.parse(localStorage.getItem("rh-filters") || "{}"); fPlat = new Set(f.p || []); fCat = new Set(f.c || []); fTag = new Set(f.t || []); } catch (e) {}
-function saveFilters(){ try { localStorage.setItem("rh-filters", JSON.stringify({p: [...fPlat], c: [...fCat], t: [...fTag]})); } catch (e) {} }
+let fPlat = new Set(), fCat = new Set(), fTag = new Set(), fChan = new Set();   // fChan: channel keys, lower case
+try { const f = JSON.parse(localStorage.getItem("rh-filters") || "{}"); fPlat = new Set(f.p || []); fCat = new Set(f.c || []); fTag = new Set(f.t || []); fChan = new Set(f.h || []); } catch (e) {}
+function saveFilters(){ try { localStorage.setItem("rh-filters", JSON.stringify({p: [...fPlat], c: [...fCat], t: [...fTag], h: [...fChan]})); } catch (e) {} }
+const chKey = x => String(x.ch || "").toLowerCase();          // a video's or transcript's channel, as the filters keep it
 const tagsOf = x => (x.state ? x.state.tags : x.tags) || [];
 const hasTag = (x, t) => tagsOf(x).some(y => y.toLowerCase() === t.toLowerCase());
 function tagList(kind, attr, sel, items, platOk){
@@ -4997,12 +5073,52 @@ async function tagAction(body){
 }
 const catShown = name => !fCat.size || fCat.has(name);
 let openDrop = "", dropQ = {};              // which filter drop-down is open, and its search text
+/* the filter lists (2026-11-09, Simeon: "like in amazon show first couple of and click view more and view all with
+   possible to search in it", "imagine I have 50 categories"): the first FLIMIT rows, then Show N more / Show all N /
+   Show less; a search box when the list is long (it searches every row, shown or not); a ticked row always shows. */
+const FLIMIT = 5, FSTEP = 10, FSEARCH = 8;
+let fmore = {};                                  // list kind -> rows shown (FLIMIT until Show more / Show all)
+const ffold = s => String(s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+const FPLURAL = {Category: "categories", Channel: "channels", Tags: "tags"};
 function flist(kind, label, attr, opts, sel){
-  // the pane has room: the whole list with ticks and counts, a find box when it is long
-  const q = (dropQ[kind] || "").toLowerCase();
-  return `<div class="fsec"><span class="fl">${label}${sel.size ? ` · <button class="link" data-fdclear="${kind}">show all</button>` : ""}</span>
-    <div class="fdpanel flist">${opts.length > 8 ? `<input class="fdq" data-fdq="${kind}" autocomplete="off" placeholder="Find ${label.toLowerCase()}" value="${esc(dropQ[kind] || "")}">` : ""}
-      <div class="fdlist">${opts.map((o, i) => (o.chan && !(opts[i - 1] || {}).chan ? `<div class="fdsep">Channels</div>` : "") + `<div class="fdopt" ${q && !o.label.toLowerCase().includes(q) ? "hidden" : ""} ${attr}="${esc(o.val)}"><input type="checkbox" ${sel.has(o.val) ? "checked" : ""} tabindex="-1"><span class="fdl">${o.html || esc(o.label)}</span><span class="cn">${o.n}</span>${o.tools || ""}</div>`).join("")}</div></div></div>`;
+  const q = dropQ[kind] || "", many = FPLURAL[label] || label.toLowerCase();
+  return `<div class="fsec" data-fkind="${kind}" data-fname="${esc(many)}"><span class="fl">${label}${sel.size ? ` · <button class="link" data-fdclear="${kind}" title="Untick all">clear</button>` : ""}</span>
+    <div class="fdpanel flist">${opts.length > FSEARCH ? `<input class="fdq" data-fdq="${kind}" autocomplete="off" spellcheck="false" placeholder="Search ${esc(many)} (${opts.length})" value="${esc(q)}">` : ""}
+      <div class="fdlist">${opts.map((o, i) => (o.chan && !(opts[i - 1] || {}).chan ? `<div class="fdsep">Channels</div>` : "") + `<div class="fdopt" data-fl="${esc(ffold(o.label))}" ${sel.has(o.val) ? "data-on" : ""} ${attr}="${esc(o.val)}"><input type="checkbox" ${sel.has(o.val) ? "checked" : ""} tabindex="-1"><span class="fdl" title="${esc(o.label)}">${o.html || esc(o.label)}</span><span class="cn">${o.n}</span>${o.tools || ""}</div>`).join("")}</div>
+      <div class="fmore"></div></div></div>`;
+}
+function fsync(sec){             // which rows of one list show, and its Show more / Show all / Show less links
+  const kind = sec.dataset.fkind, q = ffold((dropQ[kind] || "").trim()), rows = [...sec.querySelectorAll(".fdopt")];
+  const lim = rows.length <= FLIMIT + 2 ? rows.length : (fmore[kind] || FLIMIT);   // 6 or 7 rows: all of them
+  let shown = 0, hits = 0;
+  rows.forEach((r, i) => { const hit = !q || r.dataset.fl.includes(q), vis = q ? hit : (i < lim || r.hasAttribute("data-on"));
+    r.hidden = !vis; if (vis) shown++; if (q && hit) hits++; });
+  sec.querySelectorAll(".fdsep").forEach(sp => { let n = sp.nextElementSibling, any = false;
+    for (; n && !n.classList.contains("fdsep"); n = n.nextElementSibling) if (!n.hidden) any = true; sp.hidden = !any; });
+  const left = rows.length - shown, bar = sec.querySelector(".fmore");
+  bar.innerHTML = q ? (hits ? "" : `<span class="fhint">No ${esc(sec.dataset.fname)} match "${esc(dropQ[kind].trim())}"</span>`)
+    : left > 0 ? `<button class="link" data-fmore="${kind}">Show ${Math.min(FSTEP, left)} more</button><button class="link" data-fall="${kind}">Show all ${rows.length}</button>`
+    : lim > FLIMIT && rows.length > FLIMIT + 2 ? `<button class="link" data-fless="${kind}">Show less</button>` : "";
+}
+function setFilters(html){       // redraw the filters pane; the search box you are typing in keeps its focus and caret
+  const a = document.activeElement, k = a && a.classList && a.classList.contains("fdq") ? a.dataset.fdq : "";
+  const pos = k ? [a.selectionStart, a.selectionEnd] : null, box = $("#filters");
+  box.innerHTML = html;
+  box.querySelectorAll(".fsec[data-fkind]").forEach(fsync);
+  const i = k && box.querySelector(`[data-fdq="${k}"]`);
+  if (i) { i.focus(); try { i.setSelectionRange(pos[0], pos[1]); } catch (e) {} }
+}
+function chanOpts(items, keyOf, nameOf, ok, sel){
+  // the Channel list: every channel or creator with a count under the other filters, the site's badge, most videos first
+  const by = new Map();
+  items.forEach(x => { const kl = String(keyOf(x) || "").toLowerCase(); if (!kl) return;
+    let o = by.get(kl); if (!o) by.set(kl, o = {val: kl, label: nameOf(x) || keyOf(x), n: 0, plats: {}});
+    if (ok(x)) o.n++; o.plats[x.platform] = (o.plats[x.platform] || 0) + 1; });
+  [...sel].forEach(v => by.has(v) || !items.length || sel.delete(v));      // a channel that is gone: untick it
+  return [...by.values()].filter(o => o.n || sel.has(o.val)).map(o => {
+    const p = Object.keys(o.plats).sort((a, b) => o.plats[b] - o.plats[a])[0];
+    return {val: o.val, label: o.label, n: o.n, html: (p ? pbadge({platform: p}) + " " : "") + esc(o.label)};
+  }).sort((a, b) => b.n - a.n || a.label.localeCompare(b.label, undefined, {sensitivity: "base"}));
 }
 function fdrop(kind, label, attr, opts, sel){
   // a compact multi-select: "Category: All" / "Category: 2 selected", a search box and a scrolling list of ticks
@@ -5023,18 +5139,25 @@ function renderFilters(){
   const count = (pred) => reels.filter(pred).length;
   const chip = (attr, val, label, on, n, extra="") => `<button class="chip ${on?"on":""}" ${attr}="${esc(val)}" ${extra}>${label}<span class="cn">${n}</span></button>`;
   [...fTag].forEach(t => tags.includes(t) || fTag.delete(t));
-  const active = fPlat.size + fCat.size + fTag.size;
-  $("#filters").innerHTML = (plats.length > 1 || fPlat.size ? `<div class="frow"><span class="fl">Source</span>${plats.map(p =>
+  // each list counts what the other filters leave (Source, Category, Channel, Tags), like a shop's filters
+  const but = skip => r => (skip === "p" || !fPlat.size || fPlat.has(r.platform)) && (skip === "c" || !fCat.size || fCat.has(catOf(r)))
+    && (skip === "h" || !fChan.size || fChan.has(chKey(r))) && (skip === "t" || !fTag.size || [...fTag].some(t => hasTag(r, t)));
+  const narrowed = fPlat.size || fChan.size || fTag.size, okC = but("c");
+  const chans = chanOpts(reels, r => r.ch, r => r.chname, but("h"), fChan);
+  const active = fPlat.size + fCat.size + fTag.size + fChan.size;
+  setFilters((plats.length > 1 || fPlat.size ? `<div class="frow"><span class="fl">Source</span>${plats.map(p =>
       chip("data-fplat", p, pbadge({platform: p}) + " " + esc(p), fPlat.has(p), count(r => r.platform === p))).join("")}</div>` : "")
-    + flist("cat", "Category", "data-fcat", [...orderCats(cats).filter(c => !chanCats.has(c)), "", ...orderCats(cats).filter(c => chanCats.has(c))].map(c => ({val: c, label: c || "Unassigned", chan: chanCats.has(c), n: count(r => catOf(r) === c && (!fPlat.size || fPlat.has(r.platform)))}))
-        .filter(o => !fPlat.size || o.n || fCat.has(o.val)), fCat)
-    + tagList("tag", "data-ftag", fTag, reels, r => !fPlat.size || fPlat.has(r.platform))
-    + (active ? `<div class="frow"><button class="link" id="fclear">Clear filters (${active})</button></div>` : "");
+    + flist("cat", "Category", "data-fcat", ["", ...orderCats(cats).filter(c => !chanCats.has(c)), ...orderCats(cats).filter(c => chanCats.has(c))].map(c => ({val: c, label: c || "Unassigned", chan: chanCats.has(c), n: count(r => catOf(r) === c && okC(r))}))
+        .filter(o => !narrowed || o.n || fCat.has(o.val)), fCat)
+    + (chans.length ? flist("chan", "Channel", "data-fchan", chans, fChan) : "")
+    + tagList("tag", "data-ftag", fTag, reels, but("t"))
+    + (active ? `<div class="frow"><button class="link" id="fclear">Clear filters (${active})</button></div>` : ""));
 }
 
 function matches(r, q){
   if (fPlat.size && !fPlat.has(r.platform)) return false;
   if (fCat.size && !fCat.has(catOf(r))) return false;
+  if (fChan.size && !fChan.has(chKey(r))) return false;
   if (fTag.size && ![...fTag].some(t => hasTag(r, t))) return false;
   if (!q) return true;
   return [r.label, r.platform, r.caption, r.author, r.notes, fromName(r), ...tagsOf(r), ...r.transcript.map(x=>x.text), ...r.ocr.map(x=>x.text),
@@ -5146,6 +5269,23 @@ function foldAll(){
   else { top.forEach(k => set.add(k)); subs.forEach(k => set.add(k)); }
   saveCollapsed(); renderList();
 }
+/* Collapse / expand the channels of one category (2026-11-11, Simeon: "collapse all per category and expand all,
+   now I have to open the channels or collapse one by one"): a button on each category header with two or more
+   channel groups folds or opens just those channel groups; remembered like the other folds. */
+const catSubKeys = new Map();             // header id -> the collapse keys of its channel groups (set while drawing)
+function catFoldBtn(id, keys, set){
+  if (keys.length < 2) return "";
+  catSubKeys.set(id, keys);
+  const all = keys.every(k => set.has(k));
+  return `<button class="ico gfold" data-catfold="${esc(id)}" title="${all ? "Expand all channels in this category" : "Collapse all channels in this category"}" aria-label="${all ? "Expand all channels" : "Collapse all channels"}">${all ? "&#8862;" : "&#8863;"}</button>`;
+}
+function catFold(id){
+  const set = foldSet(), keys = catSubKeys.get(id) || [];
+  if (!keys.length) return;
+  const all = keys.every(k => set.has(k));
+  keys.forEach(k => all ? set.delete(k) : set.add(k));
+  saveCollapsed(); renderList();
+}
 function reelItem(r, sub){
   return `
       <div class="item ${sub ? "sub" : ""} ${current && current.id===r.id?"active":""} ${selected.has(r.id)?"sel":""}" data-id="${esc(r.id)}" draggable="true">
@@ -5156,6 +5296,7 @@ function reelItem(r, sub){
 }
 function renderList(){
   if (mode === "transcripts") return renderTrList();      // the list shows the catalogue; reels keep their state
+  catSubKeys.clear();
   const q = $("#search").value.trim().toLowerCase();
   const groups = groupsFor();
   filtered = []; shown = [];
@@ -5170,12 +5311,13 @@ function renderList(){
     sg.subs.forEach(x => { filtered.push(...x.items); if (!hidden && !collapsed.has(subKey(g.cat, x.key))) shown.push(...x.items); });
     filtered.push(...sg.loose);
     if (!hidden) shown.push(...sg.loose);
-    if (g.kind === "cat" && !items.length && (q || fPlat.size || fTag.size)) return;     // filtering: empty categories are left out
+    if (g.kind === "cat" && !items.length && (q || fPlat.size || fTag.size || fChan.size)) return;     // filtering: empty categories are left out
     if (g.kind === "source" && !items.length) return;
     const name = g.cat || "";
     let html = `<div class="group ${closed?"closed":""}" ${g.kind === "cat" ? `data-cat="${esc(g.cat)}"` : ""} data-label="${esc(g.label)}">
       <span class="gname" data-toggle><span class="caret">&#9662;</span>${g.kind === "source" ? pbadge({platform: g.label}) + " " : ""}${esc(g.label)}</span>
       <span class="gcount">${items.length}</span>
+      ${g.kind === "cat" && !hidden ? catFoldBtn("v:" + g.label, sg.subs.map(x => subKey(g.cat, x.key)), collapsed) : ""}
       ${name ? `<button class="ico" data-catmove="-1" title="Move up" ${gi===0?"disabled":""}>&#8593;</button>
                   <button class="ico" data-catmove="1" title="Move down" ${gi===cats.length-1?"disabled":""}>&#8595;</button>
                   <button class="ico" data-rename title="Rename">&#9998;</button>
@@ -5378,7 +5520,7 @@ function askDelete(rs){
   return new Promise(res => {
     const names = rs.slice(0, 4).map(r => "• " + r.label).join("\n") + (rs.length > 4 ? `\n• and ${rs.length - 4} more` : "");
     $("#ctitle").textContent = rs.length > 1 ? `Delete ${rs.length} reels?` : "Delete this reel?";
-    $("#cmsg").textContent = names + "\n\nVideo, snapshots, transcript, favorites and notes move to Downloads\\reels\\_trash, so you can still restore them.";
+    $("#cmsg").textContent = names + "\n\nVideo, snapshots, transcript, favorites and notes move to " + (trashDir || "_trash in the reels folder") + ", so you can still restore them.";
     const hasNotes = rs.some(r => r.obsidian && r.obsidian.name);
     $("#cobs").checked = false; $("#cobs").closest("label").hidden = !hasNotes || !vault.ok;
     $("#cobs").closest("label").lastChild.textContent = " Also delete their Obsidian notes and images"; $("#cyes").textContent = "Delete";
@@ -5439,7 +5581,7 @@ function renderGallery(){
   for (const g of groups) {
     if (g.kind === "cat" && !catShown(g.cat)) continue;
     const items = sortReels(reels.filter(r => g.test(r) && matches(r, q)));
-    if (!items.length && (g.kind !== "cat" || q || fPlat.size)) continue;
+    if (!items.length && (g.kind !== "cat" || q || fPlat.size || fTag.size || fChan.size)) continue;
     if (g.chan && !chHead) { chHead = true; html += `<h2 class="gchan">Channels</h2>`; }
     const card = r => `
         <div class="gcard ${current && current.id===r.id?"active":""} ${selected.has(r.id)?"sel":""}" data-open="${esc(r.id)}" tabindex="0" draggable="true">
@@ -5988,8 +6130,13 @@ document.addEventListener("click", async e => {
   if ((el = c("[data-fdtoggle]"))) { openDrop = openDrop === el.dataset.fdtoggle ? "" : el.dataset.fdtoggle; renderList();
     const qi = openDrop && document.querySelector(`[data-fdq="${openDrop}"]`); if (qi) qi.focus(); return; }
   if ((el = c("[data-fdclear]"))) { const k = el.dataset.fdclear;
-    if (k === "cat") { fCat.clear(); saveFilters(); } else if (k === "tcat") { tfCat.clear(); saveTrFilters(); } else if (k === "tag") { fTag.clear(); saveFilters(); } else if (k === "ttag") { tfTag.clear(); saveTrFilters(); } else { tfChan.clear(); saveTrFilters(); }
+    if (k === "cat") { fCat.clear(); saveFilters(); } else if (k === "tcat") { tfCat.clear(); saveTrFilters(); } else if (k === "tag") { fTag.clear(); saveFilters(); } else if (k === "ttag") { tfTag.clear(); saveTrFilters(); } else if (k === "chan") { fChan.clear(); saveFilters(); } else { tfChan.clear(); saveTrFilters(); }
     return renderList(); }
+  if ((el = c("[data-fmore],[data-fall],[data-fless]"))) {     // a filter list: Show N more / Show all / Show less
+    const k = el.dataset.fmore || el.dataset.fall || el.dataset.fless, sec = el.closest(".fsec");
+    if (el.dataset.fmore) fmore[k] = (fmore[k] || FLIMIT) + FSTEP; else if (el.dataset.fall) fmore[k] = Infinity; else delete fmore[k];
+    if (sec) { fsync(sec); if (el.dataset.fless) sec.scrollIntoView({block: "nearest"}); }
+    return; }
   if (c(".fdq")) return;
   if (openDrop && !c(".fdrop")) { openDrop = ""; renderList(); }
   if (c("#fpOpen") || (c(".fpane .rail-label"))) { panes.fp = true; return applyPanes(); }
@@ -6039,6 +6186,11 @@ document.addEventListener("click", async e => {
   if ((el = c("[data-bulkshare]"))) return shareReels([...selected], el.dataset.bulkshare);
   if ((el = c("[data-qrm]"))) return removeQueued(el);
   if (t.dataset && t.dataset.loglane) { logLane = t.dataset.loglane; return renderLog(); }
+  if ((el = c("[data-qall]"))) { const held = el.dataset.qall === "1"; let j;
+    try { j = await api("/api/queue/holdall", {held}); } catch (err) { toast(err.message); return ensurePoll(); }
+    toast(held ? `Paused: ${j.count} set for Later${j.running ? ". What runs now finishes first, then nothing starts until you resume" : ""}`
+               : `Resumed: ${j.count} will run when ${j.count === 1 ? "its" : "their"} turn comes`);
+    lastQueueHtml = null; return ensurePoll(); }
   if ((el = c("[data-qhold]"))) { const held = el.dataset.held !== "1";
     try { await api("/api/queue/hold", {seq: +el.dataset.qhold, held}); } catch (err) { toast(err.message); }
     toast(held ? "Set for later: it waits in line until you press \u25B6" : "It runs when its turn comes"); lastQueueHtml = null; return ensurePoll(); }
@@ -6051,13 +6203,15 @@ document.addEventListener("click", async e => {
   if ((el = c("[data-open]"))) { if (e.ctrlKey || e.metaKey || e.shiftKey) { e.preventDefault(); return pick(el.dataset.open, e); } clearSel(); return select(el.dataset.open); }
   if ((el = c("[data-fplat]"))) { const v = el.dataset.fplat; fPlat.has(v) ? fPlat.delete(v) : fPlat.add(v); saveFilters(); return renderList(); }
   if ((el = c("[data-fcat]"))) { const v = el.dataset.fcat; fCat.has(v) ? fCat.delete(v) : fCat.add(v); saveFilters(); return renderList(); }
-  if (t.id === "fclear") { fPlat.clear(); fCat.clear(); fTag.clear(); saveFilters(); return renderList(); }
+  if ((el = c("[data-fchan]"))) { const v = el.dataset.fchan; fChan.has(v) ? fChan.delete(v) : fChan.add(v); saveFilters(); return renderList(); }
+  if (t.id === "fclear") { fPlat.clear(); fCat.clear(); fTag.clear(); fChan.clear(); saveFilters(); return renderList(); }
   if ((el = c("[data-mv]"))) { const [i, d] = el.dataset.mv.split(":").map(Number), favs = current.state.favorites, j = i + d;
     if (j >= 0 && j < favs.length) { favs.splice(j, 0, favs.splice(i, 1)[0]); saveState(current, true); renderFavs(current);
       const card = document.querySelector(`.fav[data-i="${j}"]`); card && card.scrollIntoView({block:"nearest", inline:"nearest"}); } return; }
   if ((el = c("[data-reset]"))) { const f = current.state.favorites[+el.dataset.reset]; f.text = textAt(current, f.shot); f.corrected = false; saveState(current, true); return renderFavs(current); }
   if ((el = c("[data-rename]"))) { const old = el.closest(".group").dataset.cat; const n = prompt("Rename category", old); if (n && n.trim() && n.trim() !== old) catAction({action:"rename", name: old, new: n.trim()}); return; }
   if ((el = c("[data-delcat]"))) { const n = el.closest(".group").dataset.cat; if (confirm(`Delete category "${n}"? Its reels move to Unassigned.`)) catAction({action:"delete", name: n}); return; }
+  if ((el = c("[data-catfold]"))) return catFold(el.dataset.catfold);
   if ((el = c("[data-catmove]"))) return catAction({action:"move", name: el.closest(".group").dataset.cat, dir: +el.dataset.catmove});
   if ((el = c("[data-toggle]"))) { const g = el.closest(".group").dataset.label; collapsed.has(g) ? collapsed.delete(g) : collapsed.add(g);
     try { localStorage.setItem("rh-collapsed", JSON.stringify([...collapsed])); } catch (err) {} return renderList(); }
@@ -6167,8 +6321,10 @@ document.addEventListener("click", async e => {
 
 document.addEventListener("input", e => {
   if (e.target.id === "notes" && current) { $("#saved").hidden = true; return notesChanged(current, e.target.value); }
-  if (e.target.classList && e.target.classList.contains("fdq")) {     // filter the drop-down's list without redrawing it
+  if (e.target.classList && e.target.classList.contains("fdq")) {     // filter the list without redrawing it
     const k = e.target.dataset.fdq, q = e.target.value.toLowerCase(); dropQ[k] = e.target.value;
+    const sec = e.target.closest(".fsec[data-fkind]");
+    if (sec) return fsync(sec);
     e.target.closest(".fdpanel").querySelectorAll(".fdopt").forEach(o => o.hidden = !!q && !o.querySelector(".fdl").textContent.toLowerCase().includes(q));
     return;
   }
@@ -6297,6 +6453,9 @@ document.addEventListener("drop", e => {
 });
 
 document.addEventListener("keydown", e => {
+  const fq = document.activeElement;
+  if (e.key === "Escape" && fq && fq.classList && fq.classList.contains("fdq") && fq.value && fq.closest(".fsec[data-fkind]")) {
+    e.preventDefault(); fq.value = ""; dropQ[fq.dataset.fdq] = ""; return fsync(fq.closest(".fsec")); }
   if (e.key === "Escape" && $("#pmenu")) { e.preventDefault(); return closeMenu(); }
   if (e.key === "Escape" && $("#listdlg").classList.contains("show")) { e.preventDefault(); return $("#lno").click(); }
   if (ed) return edKey(e);
@@ -6556,9 +6715,9 @@ async function loadTr(){
 }
 const trCatOf = it => cats.includes(it.category) ? it.category : "";
 const chanName = key => { const c = tr.channels.find(x => x.key === key); return c ? c.name : key; };
-function saveTrFilters(){ try { localStorage.setItem("rh-trfilters", JSON.stringify({c: [...tfCat], p: [...tfPlat], t: [...tfTag]})); } catch (e) {} }
+function saveTrFilters(){ try { localStorage.setItem("rh-trfilters", JSON.stringify({c: [...tfCat], p: [...tfPlat], t: [...tfTag], h: [...tfChan]})); } catch (e) {} }
 function trMatches(it, q){
-  if (tfChan.size && !tfChan.has(it.ch)) return false;
+  if (tfChan.size && !tfChan.has(chKey(it))) return false;
   if (tfPlat.size && !tfPlat.has(it.platform)) return false;
   if (tfCat.size && !tfCat.has(trCatOf(it))) return false;
   if (tfTag.size && ![...tfTag].some(t => hasTag(it, t))) return false;
@@ -6567,21 +6726,25 @@ function trMatches(it, q){
   return `${it.title} ${it.author} ${it.date} ${ch ? ch.name + " " + ch.handle : ""} ${it.category} ${tagsOf(it).join(" ")}`.toLowerCase().includes(q);
 }
 function renderTrFilters(){
-  // Source chips as under Videos; the channels are in the category list (under Channels), so no separate Channel list
-  tfChan.clear();
+  // Source chips as under Videos, then Category, Channel (since 2026-11-09 the channels are groups, not categories) and Tags
   const plats = [...new Set(tr.items.map(it => it.platform))].sort();
   [...tfPlat].forEach(p => plats.includes(p) || tfPlat.delete(p));
   [...tfCat].forEach(c => (c === "" || cats.includes(c)) || tfCat.delete(c));
   const count = pred => tr.items.filter(pred).length;
   const chip = (attr, val, label, on, n) => `<button class="chip ${on?"on":""}" ${attr}="${esc(val)}">${label}<span class="cn">${n}</span></button>`;
   [...tfTag].forEach(t => tags.includes(t) || tfTag.delete(t));
-  const active = tfPlat.size + tfCat.size + tfTag.size;
-  $("#filters").innerHTML = (plats.length > 1 || tfPlat.size ? `<div class="frow"><span class="fl">Source</span>${plats.map(p =>
+  const but = skip => it => (skip === "p" || !tfPlat.size || tfPlat.has(it.platform)) && (skip === "c" || !tfCat.size || tfCat.has(trCatOf(it)))
+    && (skip === "h" || !tfChan.size || tfChan.has(chKey(it))) && (skip === "t" || !tfTag.size || [...tfTag].some(t => hasTag(it, t)));
+  const narrowed = tfPlat.size || tfChan.size || tfTag.size, okC = but("c");
+  const chans = chanOpts(tr.items, it => it.ch, it => chanName(it.ch), but("h"), tfChan);
+  const active = tfPlat.size + tfCat.size + tfTag.size + tfChan.size;
+  setFilters((plats.length > 1 || tfPlat.size ? `<div class="frow"><span class="fl">Source</span>${plats.map(p =>
       chip("data-tfplat", p, pbadge({platform: p}) + " " + esc(p), tfPlat.has(p), count(it => it.platform === p))).join("")}</div>` : "")
-    + flist("tcat", "Category", "data-tfcat", [...orderCats(cats).filter(c => !chanCats.has(c)), "", ...orderCats(cats).filter(c => chanCats.has(c))].map(c => ({val: c, label: c || "Unassigned", chan: chanCats.has(c), n: count(it => trCatOf(it) === c && (!tfPlat.size || tfPlat.has(it.platform)))}))
-        .filter(o => !tfPlat.size || o.n || tfCat.has(o.val)), tfCat)
-    + tagList("ttag", "data-tftag", tfTag, tr.items, it => !tfPlat.size || tfPlat.has(it.platform))
-    + (active ? `<div class="frow"><button class="link" id="tfclear">Clear filters (${active})</button></div>` : "");
+    + flist("tcat", "Category", "data-tfcat", ["", ...orderCats(cats).filter(c => !chanCats.has(c)), ...orderCats(cats).filter(c => chanCats.has(c))].map(c => ({val: c, label: c || "Unassigned", chan: chanCats.has(c), n: count(it => trCatOf(it) === c && okC(it))}))
+        .filter(o => !narrowed || o.n || tfCat.has(o.val)), tfCat)
+    + (chans.length ? flist("tchan", "Channel", "data-tfchan", chans, tfChan) : "")
+    + tagList("ttag", "data-tftag", tfTag, tr.items, but("t"))
+    + (active ? `<div class="frow"><button class="link" id="tfclear">Clear filters (${active})</button></div>` : ""));
 }
 function trGroups(){
   if (trGroupBy === "category")
@@ -6591,6 +6754,7 @@ function trGroups(){
   return tr.channels.map(ch => ({key: "ch:" + ch.key, label: ch.name, kind: "channel", ch, test: it => it.ch === ch.key}));
 }
 function renderTrList(){
+  catSubKeys.clear();
   const q = $("#search").value.trim().toLowerCase();
   renderTrFilters();
   const filtering = q || tfChan.size || tfCat.size || tfPlat.size || tfTag.size;
@@ -6603,9 +6767,11 @@ function renderTrList(){
     if (g.kind === "cat" && !items.length && filtering) return;
     const closed = trCollapsed.has(g.key);
     const ch = g.ch;
+    const sg = g.kind === "cat" ? subGroups(items, g.cat, it => it.ch, it => chanName(it.ch)) : {subs: [], loose: items};
     let html = `<div class="group ${closed?"closed":""}" data-trkey="${esc(g.key)}" ${g.kind === "cat" ? `data-cat="${esc(g.cat)}"` : ""} ${ch ? `data-trch="${esc(ch.key)}"` : ""}>
       <span class="gname" data-trtoggle title="${esc(ch ? (ch.handle || ch.name) : g.label)}"><span class="caret">&#9662;</span>${ch && ch.platform ? pbadge({platform: ch.platform}) + " " : ""}${esc(g.label)}</span>
       <span class="gcount">${ch && items.length !== ch.count ? `${items.length} / ${ch.count}` : items.length}</span>
+      ${g.kind === "cat" && !closed ? catFoldBtn("t:" + g.key, sg.subs.map(x => subKey(g.cat, x.key)), trCollapsed) : ""}
       ${ch && ch.note ? `<a class="ico" href="${esc(ch.note.uri)}" title="Open the channel note in Obsidian (${esc(ch.note.path)})">&#128196;</a>` : ""}
       ${ch && ch.url ? `<a class="ico" href="${esc(ch.url)}" target="_blank" rel="noopener" title="Open the channel on ${esc(ch.platform || "YouTube")}">&#8599;</a>` : ""}
       ${ch && ch.key !== "_unknown" ? `<button class="ico ${homeOf(ch.key) ? "homed" : ""}" data-chhome="${esc(ch.key)}" data-chname="${esc(ch.name)}" title="${homeOf(ch.key) ? `In ${esc(homeOf(ch.key))}. ` : ""}Put this channel in a category: its videos move there and its new videos start there">&#128193;</button>` : ""}
@@ -6620,7 +6786,6 @@ function renderTrList(){
         <div><div class="t">${esc(it.title)}</div>
         <div class="s">${g.kind !== "channel" && !sub ? esc(chanName(it.ch)) + " · " : ""}${esc(it.date)}${it.duration ? ` · ${mmss(+it.duration)}` : ""} · ${srcBadge(it)}${g.kind !== "cat" && trCatOf(it) ? ` · <span class="tcat">${esc(trCatOf(it))}</span>` : ""}${it.full ? ` · <span class="fc" title="This video is in Videos, in full">&#9654; video</span>` : ""}${it.note || !vault.ok ? "" : ` · <span title="No Obsidian note yet">no note</span>`}${tagsOf(it).length ? ` · <span class="ttg">${tagsOf(it).map(t => "#" + esc(t)).join(" ")}</span>` : ""}</div></div>
       </div>`;
-    const sg = g.kind === "cat" ? subGroups(items, g.cat, it => it.ch, it => chanName(it.ch)) : {subs: [], loose: items};
     const chPlat = key => { const c = tr.channels.find(x => x.key === key); return c ? c.platform : ""; };
     if (!closed) html += items.length
       ? sg.subs.map(x => subHead(g.cat, x, chPlat(x.key), trCollapsed) + (trCollapsed.has(subKey(g.cat, x.key)) ? "" : x.items.map(it => trItem(it, true)).join(""))).join("")
@@ -6932,6 +7097,8 @@ function showQueue(q){                    // the Waiting list under the progress
   $("#queue").hidden = !q.length;
   const later = q.filter(x => x.held).length;
   $("#qhead").textContent = q.length ? `Waiting · ${q.length}${later ? ` (${later} for later)` : ""}` : "";
+  $("#qpauseall").hidden = !q.some(x => !x.held);
+  $("#qresumeall").hidden = !later;
   const lanes = LANES.map(k => q.filter(x => (x.lane || "video") === k)), split = lanes.every(a => a.length);
   const html = lanes.map((part, li) => (split ? `<li class="qsub">${LANE_NAME[LANES[li]]}</li>` : "") + part.map((x, i, q) =>
     `<li class="${x.held ? "held" : ""}" draggable="true" data-qseq="${x.seq}" data-qlane="${x.lane || "video"}" title="Drag to move it up or down the line"><span class="qn">${i + 1}.</span>${x.platform ? pbadge({platform: x.platform}) : ""}`
@@ -7073,6 +7240,7 @@ def main():
     if cloud_settings():
         print(f"Sharing: inbox at {CONFIG['cloud']['url']} (checked every {PICKUP_EVERY} s while this runs)")
     threading.Thread(target=inbox_worker, daemon=True).start()
+    threading.Thread(target=awake_worker, daemon=True).start()          # keeps Windows awake while the line runs
     if not args.no_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     try:
