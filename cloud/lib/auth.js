@@ -66,7 +66,7 @@ async function verifyAccessJwt(token, env) {
   if (!payload.exp || payload.exp * 1000 < Date.now()) throw new Error('Expired');
   if (payload.nbf && payload.nbf * 1000 > Date.now() + 60_000) throw new Error('Not yet valid');
   // a person signed in with an email code, or a laptop with its service token (common_name = its Client ID)
-  return String(payload.email || payload.common_name || '').toLowerCase();
+  return { key: String(payload.email || payload.common_name || '').toLowerCase(), token: !payload.email };
 }
 
 function readPeople(env) {
@@ -96,9 +96,9 @@ export async function identify(request, env) {
   if (!env.ACCESS_TEAM_DOMAIN || !env.ACCESS_AUD) throw new HttpError(500, 'Not configured: ACCESS_TEAM_DOMAIN and ACCESS_AUD are required');
   const token = request.headers.get('Cf-Access-Jwt-Assertion');
   if (!token) throw new HttpError(401, 'Not signed in through Cloudflare Access');
-  let key;
+  let key, viaToken;
   try {
-    key = await verifyAccessJwt(token, env);
+    ({ key, token: viaToken } = await verifyAccessJwt(token, env));
   } catch (e) {
     console.error('Access token rejected:', e.message); // the reason stays in the log, the client gets a fixed text
     throw new HttpError(401, 'Not signed in through Cloudflare Access');
@@ -107,7 +107,8 @@ export async function identify(request, env) {
   if (!who) throw new HttpError(403, `${key || 'This sign-in'} is not in PEOPLE`);
   // a person may not delete videos if any of their entries (email or laptop) says "delete": false
   const canDelete = !Object.values(people).some((v) => v.person === who.person && v.delete === false);
-  return { key, person: who.person, name: who.name || who.person, can_delete: canDelete };
+  // token: a laptop's service token (only a laptop may write the online library); false: a person in a browser
+  return { key, person: who.person, name: who.name || who.person, can_delete: canDelete, token: viaToken };
 }
 
 export class HttpError extends Error {

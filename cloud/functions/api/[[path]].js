@@ -18,7 +18,9 @@
 //   GET    /api/inbox                   ready shares waiting for me (?count=1: only how many)
 //   GET    /api/inbox/<id>/image/<n>    an edited image of a share for me (base64 text)
 //   DELETE /api/inbox/<id>              picked up: delete a share for me
+//   /api/lib/...                        the online library (phase 3): lib/library.js
 import { identify, peopleList, HttpError } from '../../lib/auth.js';
+import { libraryRoute, libBinding } from '../../lib/library.js';
 
 const MAX_BODY = 3 * 1024 * 1024; // a share without its images (notes and favorite texts)
 const MAX_IMAGE_B64 = 1_800_000; // characters of base64 per edited image (about 1.35 MB); a D1 row holds 2 MB
@@ -112,8 +114,11 @@ async function route(request, env) {
   }
 
   if (parts[0] === 'whoami' && parts.length === 1 && method === 'GET') {
-    return json({ person: user.person, name: user.name, can_delete: user.can_delete, people: peopleList(env) });
+    return json({ person: user.person, name: user.name, can_delete: user.can_delete, people: peopleList(env),
+      library: !!env[libBinding(user.person)] });
   }
+
+  if (parts[0] === 'lib') return libraryRoute(parts, request, env, user, url, readJson, json);
 
   if (parts[0] === 'shares') {
     if (parts.length === 1 && method === 'POST') {
@@ -212,6 +217,10 @@ export async function onRequest({ request, env }) {
   } catch (e) {
     if (e instanceof HttpError) return json({ error: e.message }, e.status);
     console.error(e);
+    // the free plan's daily D1 limits (reads, writes, storage): say so, the laptop waits and tries again later
+    if (/limit|exceeded|too many|SQLITE_FULL|storage/i.test(String(e && e.message))) {
+      return json({ error: `Cloudflare limit reached: ${String(e.message).slice(0, 200)}` }, 503);
+    }
     return json({ error: 'Server error' }, 500);
   }
 }

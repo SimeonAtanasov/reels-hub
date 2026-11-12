@@ -34,7 +34,7 @@ Options:  --port 8765   --out PATH   --vault PATH   --no-browser
 Uses only the Python standard library. Listens on 127.0.0.1 only (not reachable from other devices).
 """
 import argparse, base64, itertools, json, mimetypes, os, re, shutil, subprocess, sys, tempfile, threading, time, webbrowser
-import urllib.error, urllib.request
+import urllib.error, urllib.parse, urllib.request
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse, unquote
@@ -136,6 +136,8 @@ def save_config(body):
     with INBOX_LOCK:
         INBOX.update(error="", whoami_at=time.time() if test and test["ok"] else 0, force=bool(cloud))
     INBOX_WAKE.set()
+    LIB["checked"] = False                       # compare with Cloudflare again (address, person or folder may be new)
+    LIB_WAKE.set()
     with INBOX_LOCK:
         _qsave()                                 # items set for Later move with the reels folder
     return {"config": public_config(), "warning": warn, "cloud_test": test}
@@ -172,6 +174,8 @@ def cloud_from_form(body, old):
     changed = (url, cid, sec) != (old.get("url"), old.get("id"), old.get("secret"))
     if not changed:                               # keep what the inbox said last time
         new.update({k: old[k] for k in ("person", "name", "people", "checked") if k in old})
+    if body.get("cloud_library"):                 # Online copy (phase 3): a read-only copy of the library for the phone
+        new["library"] = True
     return new, changed
 
 
@@ -187,7 +191,7 @@ def public_config():
 def config_info():
     return {"configured": bool(CONFIG.get("name")), "config": public_config(), "defaults": default_config(),
             "path": str(config_path()), "effective": {"out": str(OUT), "vault": str(VAULT) if vault_ok() else ""},
-            "overrides": sorted(OVERRIDES)}
+            "overrides": sorted(OVERRIDES), "online": lib_public()}
 
 
 def can_delete():
@@ -2763,12 +2767,15 @@ def cloud_settings(c=None):
     return c if isinstance(c, dict) and c.get("url") and c.get("id") and c.get("secret") else None
 
 
-def cloud_call(method, path, body=None, c=None, raw=False, timeout=30):
-    """One request to the Cloudflare inbox, signed in with this laptop's service token."""
+def cloud_call(method, path, body=None, c=None, raw=False, timeout=30, text=None):
+    """One request to the Cloudflare inbox, signed in with this laptop's service token. text: a body that is
+    already JSON text (the online copy sends it as it is, so the Worker need not parse it)."""
     c = cloud_settings(c)
     if not c:
         raise CloudError("Sharing is not set up: add the Cloudflare address and this laptop's token in Settings")
     data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
+    if text is not None:
+        data = text.encode("utf-8")
     req = urllib.request.Request(c["url"].rstrip("/") + path, data=data, method=method)
     req.add_header("CF-Access-Client-Id", c["id"])
     req.add_header("CF-Access-Client-Secret", c["secret"])
@@ -2825,7 +2832,8 @@ def cloud_whoami(c=None):
     people = [{"person": str(p["person"]), "name": _plain(p.get("name") or p["person"], 60)}
               for p in (j.get("people") or []) if isinstance(p, dict) and p.get("person") and p.get("person") != person]
     return {"person": person, "name": _plain(j.get("name") or person, 60), "people": people,
-            "can_delete": j.get("can_delete") is not False, "token": (c or {}).get("id"), "inbox": (c or {}).get("url")}
+            "can_delete": j.get("can_delete") is not False, "token": (c or {}).get("id"), "inbox": (c or {}).get("url"),
+            "library": j.get("library") is True}
 
 
 def remember_cloud(info):
@@ -2851,7 +2859,368 @@ def cloud_test(body):
     if not c:
         raise ValueError("Fill in the Cloudflare address, Client ID and Client Secret first")
     info = cloud_whoami(c)
-    return {k: info[k] for k in ("person", "name", "people", "can_delete")}
+    return {k: info[k] for k in ("person", "name", "people", "can_delete", "library")}
+
+
+# ---------------------------------------------------------------- online library (phase 3, 2026-11-12)
+# A read-only copy of this laptop's library in the person's own Cloudflare D1 database (cloud/lib/library.js), for
+# the phone: per video the title, link, platform, creator, date, category, tags, caption, transcript, on-screen text,
+# favorites (text and a web-sized image) and My notes. Never the video, the other snapshots or the vault note.
+# On only when Settings > Online copy is ticked. lib_worker checks every LIB_EVERY s what changed (file times of
+# note.md, hub.json, the shots folder, the channel file) and sends only that; _online.json in the reels folder
+# remembers what was sent. Once per start it compares with what Cloudflare holds (/api/lib/ids), so a lost
+# _online.json or a recreated database costs no more than the differences. The phone's links come in every
+# LINKS_EVERY s and go into the Run line like a Run pressed here.
+LIB_FILE = "_online.json"
+LIB_CHUNKS = 32                            # the phone's list in this many parts: one change rewrites one part
+LIB_EVERY = 120                            # seconds between checks for changes
+LINKS_EVERY = 60                           # seconds between looks for links pasted on the phone
+LIB_IMG_W = 720                            # favorite images go up at most this wide
+LIB_ITEM_MAX = 1_800_000                   # characters of one video's text (a D1 row holds 2 MB)
+LIB_FULL = 470_000_000                     # stop before the free plan's 500 MB per database
+LIB_PUBLISH_EVERY = 120                    # seconds: during a long pass the phone's list is sent this often
+LIB = {"state": "", "done": 0, "total": 0, "error": "", "at": "", "items": 0, "bytes": 0, "phone": "",
+       "backoff": 0.0, "checked": False}
+LIB_LOCK = threading.Lock()                # one pass at a time (the worker, Update now, Remove)
+LIB_WAKE = threading.Event()
+SHOT_NAME = re.compile(r"[\w.-]+\.jpg")
+
+
+def lib_on():
+    c = cloud_settings()
+    return bool(CONFIG.get("name") and c and c.get("library"))
+
+
+def lib_public():
+    out = {k: LIB.get(k, 0) for k in ("state", "done", "total", "error", "at", "items", "bytes", "phone", "skipped")}
+    out["on"] = lib_on()
+    return out
+
+
+def _sig(*paths):
+    """File times and sizes: changes when any of them changes."""
+    out = []
+    for p in paths:
+        try:
+            st = p.stat()
+            out.append(f"{st.st_mtime_ns}:{st.st_size}")
+        except OSError:
+            out.append("-")
+    return "|".join(out)
+
+
+def lib_scan():
+    """What goes online: {id: (folder, kind, channel key, signature)}. A transcript of a video that is in the
+    library in full is left out: the video carries it."""
+    found, vids = {}, set()
+    for f in OUT.iterdir():
+        if f.is_dir() and not f.name.startswith(("_", ".")) and (f / "note.md").is_file():
+            found[f.name] = (f, "video", "", _sig(f / "note.md", f / "hub.json", f / "shots", f / "video.info.json"))
+            vids.add(_video_id(f.name))
+    root = OUT / TR_DIR
+    for cdir in (root.iterdir() if root.is_dir() else []):
+        if not cdir.is_dir() or cdir.name.startswith((".", "_")):
+            continue
+        for f in cdir.iterdir():
+            if (f.is_dir() and not f.name.startswith((".", "_")) and (f / "note.md").is_file()
+                    and _video_id(f.name) not in vids):
+                found[f"t/{cdir.name}/{f.name}"] = (f, "transcript", cdir.name,
+                                                   _sig(f / "note.md", f / "hub.json", cdir / "_channel.json"))
+    return found
+
+
+def _num(v):
+    try:
+        return round(float(v), 1)
+    except (TypeError, ValueError):
+        return 0
+
+
+def lib_body(iid, folder, kind, chkey):
+    """One video for the online copy: (JSON text, list entry, favorite image files, their signature), or None."""
+    r = parse_note(folder)
+    if not r:
+        return None
+    st, times = r["state"], r["times"]
+    if kind == "video":
+        try:
+            ck, cn = reel_channel(folder)
+        except Exception:
+            ck, cn = "", ""
+    else:
+        ck, cn = chkey, _channel_meta(folder.parent).get("name") or chkey
+    favs, imgs = [], []
+    for fv in st["favorites"]:
+        if not isinstance(fv, dict):
+            continue
+        shot = str(fv.get("shot") or "")
+        t = times.get(shot, 0) if shot else _num(fv.get("t"))
+        p = folder / "shots" / shot
+        img = None
+        if SHOT_NAME.fullmatch(shot) and p.is_file() and len(imgs) < 200:
+            img = len(imgs)
+            imgs.append(p)
+        favs.append({"t": t, "tl": tlabel(r, t), "text": str(fv.get("text") or ""), "img": img})
+    ocr = [[times.get(o["shot"], 0), o["text"], tlabel(r, times.get(o["shot"], 0))] for o in r["ocr"]]
+    ocr.sort(key=lambda x: x[0])
+    title = (r["label"] if kind == "video" else r["title"]) or r["title"] or folder.name
+    body = {"v": 1, "id": iid, "kind": kind, "title": r["title"] or title, "label": title, "url": r["url"],
+            "platform": r["platform"], "author": r["author"], "channel": cn, "chkey": ck, "date": r["date"],
+            "duration": _num(r["duration"]), "slides": len(r["slides"] or []), "lang": r["lang"], "source": r["tsource"],
+            "category": st["category"], "tags": st["tags"], "caption": r["caption"], "notes": r["notes"],
+            "transcript": [[x["t"], x["text"]] for x in r["transcript"]], "ocr": ocr, "favorites": favs}
+    text = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+    while len(text) > LIB_ITEM_MAX and body["transcript"]:      # a very long transcript: the end is cut
+        body["transcript"] = body["transcript"][:len(body["transcript"]) * 3 // 4]
+        body["cut"] = True
+        text = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+    entry = {"i": iid, "k": "v" if kind == "video" else "t", "t": title[:200], "p": r["platform"],
+             "c": ck.lower(), "cn": cn, "g": st["category"], "tg": st["tags"], "d": r["date"], "a": r["added"],
+             "f": len(favs), "du": _num(r["duration"])}
+    entry = {k: v for k, v in entry.items() if v not in ("", [], 0, None) or k in ("i", "k")}
+    return text, entry, imgs, _sig(*imgs) if imgs else ""
+
+
+def lib_image(p):
+    """A favorite image at web size, as base64 (None if it can't be read)."""
+    fd, tmp = tempfile.mkstemp(suffix=".jpg")
+    os.close(fd)
+    try:
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(p), "-vf", f"scale='min({LIB_IMG_W},iw)':-2",
+                        "-q:v", "5", tmp], capture_output=True, timeout=60)
+        raw = Path(tmp).read_bytes()
+    except (OSError, subprocess.SubprocessError):
+        raw = b""
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    if not raw.startswith(b"\xff\xd8"):                      # no ffmpeg: the original if it is small enough
+        try:
+            raw = p.read_bytes() if p.stat().st_size <= 500_000 else b""
+        except OSError:
+            raw = b""
+    return base64.b64encode(raw).decode("ascii") if raw.startswith(b"\xff\xd8") else None
+
+
+def _lib_state(c):
+    """What was sent, from _online.json; a fresh start when the address or the person changed."""
+    try:
+        s = json.loads(read_text(OUT / LIB_FILE))
+    except (OSError, ValueError):
+        s = {}
+    if not isinstance(s, dict) or s.get("url") != c["url"] or s.get("person") != c.get("person"):
+        s = {}
+    return {"v": 1, "url": c["url"], "person": c.get("person"), "items": s.get("items") or {},
+            "chunks": s.get("chunks") or {}, "meta": s.get("meta") or ""}
+
+
+def _lib_save(state):
+    atomic_write(OUT / LIB_FILE, json.dumps(state, ensure_ascii=False, separators=(",", ":")))
+
+
+def _q(v):
+    return urllib.parse.quote(str(v), safe="")
+
+
+def _lib_publish(state, found, changed):
+    """Send the phone's list (only the parts that changed) and the summary. Also every LIB_PUBLISH_EVERY s during a
+    long pass, so the phone fills up while the first upload runs. Returns whether anything was sent."""
+    import hashlib, zlib
+    items = state["items"]
+    parts = [[] for _ in range(LIB_CHUNKS)]
+    for iid in sorted(found):
+        if iid in items:
+            parts[zlib.crc32(iid.encode("utf-8")) % LIB_CHUNKS].append(items[iid]["x"])
+    for n, part in enumerate(parts):
+        t = json.dumps(part, ensure_ascii=False, separators=(",", ":"))
+        h = hashlib.sha1(t.encode("utf-8")).hexdigest()
+        if state["chunks"].get(str(n)) != h:
+            cloud_call("PUT", f"/api/lib/index?n={n}", text=t, timeout=120)
+            state["chunks"][str(n)] = h
+            changed = True
+    kinds = [items[i]["x"]["k"] for i in found if i in items]
+    meta = {"name": CONFIG.get("name", ""), "categories": read_cats(), "tags": read_tags(),
+            "counts": {"v": kinds.count("v"), "t": kinds.count("t")}}
+    if LIB["state"] == "syncing" and LIB["done"] < LIB["total"]:
+        meta["sending"] = {"done": LIB["done"], "total": LIB["total"]}
+    mh = hashlib.sha1(json.dumps(meta, sort_keys=True).encode("utf-8")).hexdigest()
+    if changed or state["meta"] != mh:
+        meta["at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        cloud_call("PUT", "/api/lib/meta", text=json.dumps(meta, ensure_ascii=False))
+        state["meta"] = mh
+    LIB["items"] = len(kinds)
+    return changed
+
+
+def lib_sync():
+    """One pass: send what changed since the last one, remove what is gone, then the list parts and the summary."""
+    import hashlib, zlib
+    with LIB_LOCK:
+        c = cloud_settings()
+        state = _lib_state(c)
+        items = state["items"]
+        extra, cloud = set(), None                              # cloud: id -> hash on Cloudflare (first pass only)
+        if not LIB["checked"]:                                  # once per start (and after Settings): compare
+            st = cloud_call("GET", "/api/lib/status")
+            if not st.get("library"):
+                raise CloudError(f"No online library for {st.get('name') or 'you'} on Cloudflare yet: create its database "
+                                 "first (DEPLOY.md, online library)")
+            cloud = {i: h for i, h in (cloud_call("GET", "/api/lib/ids", timeout=180).get("ids") or [])}
+            for iid, v in list(items.items()):
+                if cloud.get(iid) != v.get("h"):               # Cloudflare lost it or has another copy: send again
+                    v["s"] = v["m"] = ""
+            extra = {i for i in cloud if i not in items}
+            state["chunks"], state["meta"] = {}, ""             # the list parts once per start, whatever they were
+            LIB["checked"] = True
+        found = lib_scan()
+        todo = [i for i, v in found.items() if (items.get(i) or {}).get("s") != v[3]]
+        gone = [i for i in items if i not in found] + [i for i in extra if i not in found]
+        LIB.update(state="syncing" if todo or gone else "ok", done=0, total=len(todo) + len(gone), error="")
+        used = sum(v.get("z", 0) for v in items.values())
+        saved = published = time.time()
+        changed, LIB["skipped"] = bool(todo or gone), 0
+        try:
+            _lib_send(state, found, todo, gone, cloud, used, saved, published, changed)
+        finally:
+            _lib_save(state)                                    # what is up stays up, also when the pass stops
+        changed = _lib_publish(state, found, changed)
+        _lib_save(state)
+        LIB.update(state="ok", at=time.strftime("%Y-%m-%d %H:%M"), bytes=sum(v.get("z", 0) for v in items.values()))
+
+
+def _lib_send(state, found, todo, gone, cloud, used, saved, published, changed):
+    """lib_sync's uploads and removals. A video the Worker refuses (a 4xx answer) is left out and tried again at the
+    next pass; anything else (offline, sign-in, Cloudflare's limits) stops the pass. During a long pass the phone's
+    list goes up every LIB_PUBLISH_EVERY s, so the phone fills up while the first upload runs."""
+    import hashlib
+    items = state["items"]
+    for iid in todo:
+        folder, kind, chkey, sig = found[iid]
+        try:
+            built = lib_body(iid, folder, kind, chkey)
+        except Exception as e:
+            print(f"  online copy: {iid} left out ({e})", flush=True)
+            built = None
+        if not built:
+            LIB["done"] += 1
+            continue
+        text, entry, imgs, msig = built
+        h = hashlib.sha1(text.encode("utf-8")).hexdigest()
+        old = items.get(iid) or {}
+        if used - old.get("z", 0) + len(text) + old.get("zi", 0) > LIB_FULL:
+            raise CloudError("The online copy is full (Cloudflare's free plan holds 500 MB per database)")
+        try:
+            zi = old.get("zi", 0)
+            if msig != old.get("m") or len(imgs) != old.get("n"):
+                zi = 0
+                for n, p in enumerate(imgs):
+                    b64 = lib_image(p)
+                    if b64:
+                        cloud_call("PUT", f"/api/lib/image?id={_q(iid)}&n={n}", text=json.dumps(b64))
+                        zi += len(b64)
+            if (cloud.get(iid) != h if cloud is not None else h != old.get("h")) or len(imgs) != old.get("n", len(imgs)):
+                cloud_call("PUT", f"/api/lib/item?id={_q(iid)}&hash={h}&images={len(imgs)}", text=text, timeout=120)
+        except CloudError as e:
+            if e.fatal:
+                raise
+            LIB["skipped"] = LIB.get("skipped", 0) + 1          # this one only: the next pass tries it again
+            LIB["done"] += 1
+            print(f"  online copy: {iid} not sent ({e})", flush=True)
+            continue
+        items[iid] = {"s": sig, "h": h, "n": len(imgs), "m": msig, "x": entry, "z": len(text) + zi, "zi": zi}
+        used += items[iid]["z"] - old.get("z", 0)
+        LIB["done"] += 1
+        if time.time() - saved > 30:                           # resumable: what is up stays up after a restart
+            _lib_save(state)
+            saved = time.time()
+        if time.time() - published > LIB_PUBLISH_EVERY:        # the phone's list grows during a long pass
+            _lib_publish(state, found, True)
+            _lib_save(state)
+            published = time.time()
+    for iid in gone:
+        cloud_call("DELETE", f"/api/lib/item?id={_q(iid)}")
+        used -= (items.pop(iid, None) or {}).get("z", 0)
+        LIB["done"] += 1
+
+
+def phone_link(url, transcripts):
+    """A link pasted on the phone: into the Run line like a Run pressed here. Returns what happened."""
+    if len(url) > 2000 or not re.fullmatch(r"https?://\S+", url):
+        return "left out: not a link"
+    if url in lined_up():
+        return "already waiting in line"
+    if transcripts:
+        queue_run({"kind": "run", "urls": [url], "max_shots": "auto", "redo": False, "flags": ["--transcripts"],
+                   "target": "", "label": "Phone · Transcripts: " + tr_label(url), "platform": platform_of(url),
+                   "transcripts": True})
+        return "queued for transcripts"
+    if tr_listing(url):
+        return "left out: a channel or playlist needs Run here (to choose the videos), or Transcripts only on the phone"
+    if find_done(url):
+        return "already in your library"
+    queue_run({"kind": "run", "urls": [url], "max_shots": "auto", "redo": False, "flags": [], "target": "",
+               "label": "Phone: " + short_url(url), "platform": platform_of(url), "transcripts": False})
+    return "queued"
+
+
+def lib_links():
+    """Links pasted on the phone: each goes into the line (or is left out with the reason) and is removed online."""
+    for l in cloud_call("GET", "/api/lib/links").get("links") or []:
+        url, lid = str(l.get("url") or "").strip(), str(l.get("id") or "")
+        try:
+            msg = phone_link(url, l.get("mode") == "transcripts")
+        except Exception as e:
+            msg = f"not added: {e}"
+        cloud_call("DELETE", f"/api/lib/links?id={_q(lid)}")
+        LIB["phone"] = f"{time.strftime('%H:%M')} {short_url(url)}: {msg}"
+        print(f"Phone link {url}: {msg}", flush=True)
+
+
+def lib_worker():
+    """Background: the online copy and the phone's links, while Online copy is on in Settings."""
+    last_sync = last_links = 0.0
+    while True:
+        woke = LIB_WAKE.wait(15)
+        LIB_WAKE.clear()
+        if not lib_on():
+            if LIB["state"] not in ("", "off"):
+                LIB.update(state="off", error="", done=0, total=0)
+            LIB["checked"] = False
+            continue
+        now = time.time()
+        if now < LIB["backoff"] and not woke:
+            continue
+        try:
+            if woke or now - last_links >= LINKS_EVERY:
+                last_links = now
+                lib_links()
+            if woke or now - last_sync >= LIB_EVERY:
+                last_sync = now
+                lib_sync()
+            LIB["backoff"] = 0.0
+        except Exception as e:
+            msg = str(e)
+            wait = 3600 if re.search(r"limit|full", msg, re.I) else 300
+            LIB.update(state="error", error=msg, backoff=time.time() + wait)
+            print(f"Online copy: {msg} (trying again in {wait // 60} min)", flush=True)
+
+
+def lib_remove():
+    """Settings > Remove the online copy: empties this person's database on Cloudflare (Online copy must be off)."""
+    if lib_on():
+        raise ValueError("Untick Online copy and Save first, then remove it")
+    if not cloud_settings():
+        raise ValueError("Sharing is not set up")
+    with LIB_LOCK:
+        cloud_call("DELETE", "/api/lib/all", timeout=120)
+        try:
+            (OUT / LIB_FILE).unlink()
+        except OSError:
+            pass
+        LIB.update(state="removed", items=0, bytes=0, done=0, total=0, error="", checked=False)
+    return lib_public()
 
 
 def _probe_duration(video):
@@ -3769,7 +4138,7 @@ def _set_awake(on):
 def awake_tick():
     """One check: switch the request on or off when the line's state has changed."""
     try:
-        busy = bool(line_busy())
+        busy = bool(line_busy()) or LIB["state"] == "syncing"   # also while the Online copy sends (2026-11-12)
     except Exception:
         return
     if busy == AWAKE["on"]:
@@ -4086,7 +4455,8 @@ class Handler(BaseHTTPRequestHandler):
                                    "can_delete": can_delete(),
                                    "share": {"on": bool(cloud_settings()), "people": cl.get("people") or [],
                                              "as": cl.get("name", "")}},
-                            "vault": {"path": str(VAULT), "ok": vault_ok()}, "trash": str(OUT / "_trash")})
+                            "vault": {"path": str(VAULT), "ok": vault_ok()}, "trash": str(OUT / "_trash"),
+                            "online": lib_public()})
         elif path == "/api/inbox":
             self.send_json(inbox_status())
         elif path == "/api/transcripts":
@@ -4096,7 +4466,7 @@ class Handler(BaseHTTPRequestHandler):
                             "busy": sorted(JOB["busy"]) if JOB["running"] else [],
                             "transcripts": bool(TRJOB["running"]),
                             "queue": queue_list(), "changed": CHANGED["list"], "boot": BOOT, "homes_job": dict(HOMES),
-                            "awake": AWAKE["on"]})
+                            "awake": AWAKE["on"], "online": lib_public()})
         elif path.startswith("/media/"):
             self.serve_file(path[len("/media/"):])
         else:
@@ -4254,6 +4624,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, **inbox_add(body)})
             elif path == "/api/inbox/dismiss":
                 self.send_json({"ok": True, **inbox_dismiss(body)})
+            elif path == "/api/online/sync":                # Settings > Update now: the next pass starts at once
+                LIB_WAKE.set()
+                self.send_json({"ok": True, "online": lib_public()})
+            elif path == "/api/online/remove":              # Settings > Remove the online copy (asks first)
+                self.send_json({"ok": True, "online": lib_remove()})
             elif path == "/api/cloud/test":
                 self.send_json({"ok": True, **cloud_test(body)})
             else:
@@ -4857,6 +5232,9 @@ body:has(#bulkbar.show) #log{bottom:84px}
 .stshare h4{margin:0;font-size:14px}
 .strow{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .st2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.stlib{display:flex;gap:8px;align-items:flex-start;font-size:13px;cursor:pointer}
+.stlib input{margin-top:3px}
+#stlibres.bad{color:#ef6f6c}
 @media (max-width:600px){ .st2{grid-template-columns:1fr} }
 #sttestres{font-size:12px}
 #sttestres.ok{color:var(--accent)}
@@ -5005,6 +5383,11 @@ body:has(#bulkbar.show) #log{bottom:84px}
         <input id="stcsec" type="password" autocomplete="new-password" spellcheck="false"></label>
     </div>
     <div class="strow"><button class="btn small" id="sttest" type="button">Test connection</button><span class="meta" id="sttestres"></span></div>
+    <label class="stlib"><input type="checkbox" id="stlib"><span><b>Online copy</b> <span class="meta">- a read-only copy of your library
+      (no videos) in this Cloudflare, for your phone at the same address; links you paste there come into the Run line here</span></span></label>
+    <div class="strow" id="stlibrow"><span class="meta" id="stlibres"></span>
+      <button class="btn small" id="stlibsync" type="button">Update now</button>
+      <button class="btn small" id="stlibdel" type="button">Remove the online copy</button></div>
   </div>
   <p class="sterr" id="sterr" hidden></p>
   <div class="cbtns"><button class="btn" id="stcancel" hidden>Cancel</button><button class="btn primary" id="stsave">Save and start</button></div>
@@ -5192,7 +5575,7 @@ async function loadReels(keepId, changedIds){
     return r;
   });
   cats = j.categories; chanCats = new Set(j.channel_cats || []); homes = j.homes || homes; tags = j.tags || tags; vault = j.vault || vault; trashDir = j.trash || trashDir; me = j.me || me;
-  trackHomes(j.homes_job);
+  trackHomes(j.homes_job); trackOnline(j.online);
   if (changedSeq === null) { changedSeq = j.changed_seq || 0; bootId = j.boot; }
   else if (j.boot && j.boot !== bootId) { bootId = j.boot; changedSeq = 0; }
   applyMe();
@@ -6508,6 +6891,8 @@ document.addEventListener("click", async e => {
     case "inboxclose": case "inbox": return closeInbox();
     case "inboxcheck": return inboxCheck();
     case "sttest": return testCloud();
+    case "stlibsync": return libSyncNow();
+    case "stlibdel": return libRemove();
     case "setbtn": return openSetup(false);
     case "stcancel": return $("#setup").classList.remove("show");
     case "stsave": return saveSetup();
@@ -6907,6 +7292,7 @@ async function testCloud(){
     out.className = "ok";
     out.textContent = `✓ Connected as ${j.name}` + (others ? ` · can share with ${others}` : " · no one else in PEOPLE yet")
       + (j.can_delete ? "" : ` · deleting videos is off for ${j.name}`)
+      + (j.library ? " · online library ready" : " · no online library database for this person yet")
       + (typed && typed.toLowerCase() !== String(j.name).toLowerCase() ? ` · note: this token belongs to ${j.name}, not ${typed}` : "");
   } catch (e) { out.className = "bad"; out.textContent = e.message; }
   finally { b.disabled = false; }
@@ -7286,6 +7672,55 @@ function trackHomes(h){
   };
   setTimeout(tick, 2000);
 }
+/* Online copy (phase 3, 2026-11-12): the laptop sends the library to Cloudflare in the background; the status line
+   shows how far a big pass is, Settings shows the state, Update now and Remove the online copy */
+let onlineWatch = false, onlineJob = null, libLast = {};
+$("#stlib").addEventListener("change", () => libText(libLast));
+function libText(o){
+  const out = $("#stlibres"); o = o || {};
+  const on = $("#stlib").checked, mb = o.bytes ? ` · about ${Math.max(1, Math.round(o.bytes / 1e6))} MB` : "";
+  out.className = o.state === "error" && on ? "bad" : "meta";
+  out.textContent = !on ? (o.state === "removed" ? "Removed from Cloudflare." : o.items ? `Off. Cloudflare still holds the last copy (${o.items} videos and transcripts).` : "Off.")
+    : o.state === "syncing" ? `Sending: ${o.done || 0} / ${o.total || "..."}`
+    : o.state === "ok" ? `Up to date (${o.at}): ${Number(o.items || 0).toLocaleString()} videos and transcripts${mb}`
+      + (o.skipped ? ` · ${o.skipped} not taken by Cloudflare (tried again next time)` : "") + (o.phone ? ` · last phone link: ${o.phone}` : "")
+    : o.state === "error" ? `Not sent: ${o.error} (it tries again by itself)`
+    : "Starts a few seconds after Save.";
+  $("#stlibsync").hidden = !on || !o.on;
+  $("#stlibdel").hidden = on || !(o.on === false && (o.items || o.state === "off" || o.state === "ok"));
+}
+function trackOnline(o, force){
+  if (!o || onlineWatch || (o.state !== "syncing" && !force)) return;
+  onlineWatch = true; onlineJob = o.total ? o : null;
+  const t0 = Date.now(); let seen = o.total > 0;
+  const tick = async () => {
+    let s; try { s = await api("/api/status"); } catch (e) { setTimeout(tick, 4000); return; }
+    const job = s.online || {};
+    if ($("#setup").classList.contains("show")) libText(job);
+    if (job.state === "syncing" || (force && !seen && job.state !== "error" && Date.now() - t0 < 90000)) {
+      if (job.state === "syncing") { seen = true; onlineJob = job; }
+      if (onlineJob && onlineJob.total && !$("#status").classList.contains("on") && !homesWatch) $("#status").textContent = `Online copy: ${job.done || 0} / ${job.total}`;
+      setTimeout(tick, 3000); return;
+    }
+    const big = onlineJob && onlineJob.total > 20;
+    onlineWatch = false; onlineJob = null;
+    if (!$("#status").classList.contains("on") && /^Online copy/.test($("#status").textContent)) $("#status").textContent = "Idle";
+    if (job.state === "error") toast(`Online copy: ${job.error}`);
+    else if (job.state === "ok" && (big || force)) toast("Online copy is up to date");
+  };
+  setTimeout(tick, 1000);
+}
+async function libSyncNow(){
+  try { const j = await api("/api/online/sync", {}); libText({...j.online, state: "syncing", total: 0}); trackOnline({state: "syncing"}, true); }
+  catch (e) { alert(e.message); }
+}
+async function libRemove(){
+  $("#setup").classList.remove("show");
+  const a = await askConfirm("Remove the online copy?", "Your library on Cloudflare (texts, favorites, notes) is deleted there. Nothing on this computer changes, "
+    + "and the links waiting from your phone stay. Tick Online copy again to send it all once more.", "", "Remove");
+  if (!a.ok) return;
+  try { await api("/api/online/remove", {}); toast("The online copy was removed from Cloudflare"); } catch (e) { alert(e.message); }
+}
 function ensurePoll(){ if (!polling) poll(); }
 async function poll(){
   polling = true;
@@ -7302,7 +7737,8 @@ async function poll(){
   const one = runs.length === 1 ? L[runs[0]] : null;
   $("#status").textContent = runs.length > 1 ? "Running · 2 at once"
     : one ? `Running · ${one.done || 0} / ${one.total != null ? one.total : one.urls.length} done`
-    : homesWatch && homesJob ? `Channel groups: ${homesJob.done || 0} / ${homesJob.total || "..."}` : (L.video.finished || L.tr.finished ? "Finished" : "Idle");
+    : homesWatch && homesJob ? `Channel groups: ${homesJob.done || 0} / ${homesJob.total || "..."}`
+    : onlineWatch && onlineJob && onlineJob.total ? `Online copy: ${onlineJob.done || 0} / ${onlineJob.total}` : (L.video.finished || L.tr.finished ? "Finished" : "Idle");
   showProgress(s); showQueue(q);
   $("#status").classList.toggle("on", s.running);
   const fresh = takeChanged(s.changed, s.boot);
@@ -7427,6 +7863,7 @@ async function openSetup(first){
   $("#stcsec").placeholder = cl.has_secret ? "Saved - leave empty to keep it" : "";
   $("#sttestres").className = "meta";
   $("#sttestres").textContent = cl.name ? `This laptop is ${cl.name} in the inbox` + (cl.checked ? ` (checked ${cl.checked})` : "") : "";
+  $("#stlib").checked = !!cl.library; libLast = c.online || {}; libText(libLast);
   $("#stcancel").hidden = first; $("#stcancel").textContent = "Cancel"; $("#stsave").textContent = first ? "Save and start" : "Save";
   $("#sterr").hidden = true; $("#sterr").className = "sterr";
   $("#stpath").textContent = "Saved on this computer in " + c.path + (c.overrides.length ? " · started with --" + c.overrides.join(" --") + ", which overrides these" : "");
@@ -7437,7 +7874,8 @@ async function saveSetup(){
   const b = $("#stsave"); b.disabled = true;
   try {
     const j = await api("/api/config", {name: $("#stname").value, out: $("#stout").value, vault: $("#stvault").value, sub_lang: $("#stlang").value,
-      cloud_url: $("#stcurl").value, cloud_id: $("#stcid").value, cloud_secret: $("#stcsec").value});
+      cloud_url: $("#stcurl").value, cloud_id: $("#stcid").value, cloud_secret: $("#stcsec").value, cloud_library: $("#stlib").checked});
+    if ($("#stlib").checked) trackOnline({state: "syncing"}, true);    // the first pass starts within a few seconds
     if (j.warning) { $("#sterr").textContent = j.warning; $("#sterr").className = "sterr stwarn"; $("#sterr").hidden = false; }
     const bad = j.cloud_test && !j.cloud_test.ok;
     if (bad) {                                     // saved, but the token or address needs a look
@@ -7508,6 +7946,9 @@ def main():
         print(f"Sharing: inbox at {CONFIG['cloud']['url']} (checked every {PICKUP_EVERY} s while this runs)")
     threading.Thread(target=inbox_worker, daemon=True).start()
     threading.Thread(target=awake_worker, daemon=True).start()          # keeps Windows awake while the line runs
+    threading.Thread(target=lib_worker, daemon=True).start()            # Online copy for the phone (Settings), phone links
+    if lib_on():
+        print(f"Online copy: on (your phone: {CONFIG['cloud']['url']})")
     if not args.no_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     try:

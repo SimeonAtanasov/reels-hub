@@ -1,4 +1,4 @@
-# Cloudflare Pages project for the Reels Hub inbox, read by wrangler (deploy, secrets, migrations).
+# Cloudflare Pages project for the Reels Hub inbox and online library, read by wrangler (deploy, secrets, migrations).
 # Copy this file to wrangler.toml (git-ignored: the project name is the private address) and fill in
 # the project name and the database_id. Only public/ and functions/ are published.
 name = "rh-CHANGE-ME"
@@ -11,3 +11,12 @@ database_name = "reels-hub"
 # Replace with the id printed by: npx wrangler d1 create reels-hub --jurisdiction eu
 database_id = "00000000-0000-0000-0000-000000000000"
 migrations_dir = "migrations"
+
+# Online library (phase 3): one database per person, bound as LIB_<PERSON> (the person as in PEOPLE, upper case,
+# other characters as _). Create each with: npx wrangler d1 create reels-hub-<person> --jurisdiction eu
+# and replace the zeros with the database_id it prints. A person without a block simply has no online library.
+[[d1_databases]]
+binding = "LIB_ANNA"
+database_name = "reels-hub-anna"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations-lib"

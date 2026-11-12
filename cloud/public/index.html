@@ -2,27 +2,61 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="robots" content="noindex, nofollow">
-<title>Reels Hub inbox</title>
-<style>
-:root{--bg:#0f1214;--panel:#171b1e;--line:#2a3035;--text:#e6e8ea;--muted:#8b949b;--accent:#5fd0c4;--warn:#f0b35a}
-*{box-sizing:border-box}
-body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
-main{width:min(520px,100%);background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:22px 24px}
-h1{font-size:18px;margin:0 0 10px}
-p{margin:0 0 10px;color:var(--muted)}
-#who{color:var(--accent);font-weight:600}
-#err{color:var(--warn)}
-</style>
+<meta name="theme-color" content="#0f1214">
+<title>Reels Hub</title>
+<link rel="stylesheet" href="/style.css">
 </head>
 <body>
-<main>
-  <h1>Reels Hub inbox</h1>
-  <p id="state">Checking...</p>
-  <p>Shares wait here until the other laptop's Reels Hub picks them up, then they are deleted. There is nothing else to do on this page.</p>
-  <p id="err" hidden></p>
+<header id="top">
+  <div class="brand"><h1><a href="#" id="home">Reels Hub</a></h1><span id="who" class="muted"></span></div>
+  <p id="counts" class="muted"></p>
+</header>
+
+<main id="listview">
+  <details id="addbox">
+    <summary>Add a link for your laptop <span id="waitn" class="pill" hidden></span></summary>
+    <form id="addform" autocomplete="off">
+      <input id="addurl" type="url" inputmode="url" placeholder="https://..." required>
+      <div class="row">
+        <select id="addmode" aria-label="What to make">
+          <option value="video">Video (Run)</option>
+          <option value="transcripts">Transcripts only</option>
+        </select>
+        <button class="btn primary" type="submit">Add</button>
+      </div>
+      <p class="muted small">Your laptop puts it in its line the next time Reels Hub runs (it looks every minute).</p>
+      <p id="adderr" class="err" hidden></p>
+    </form>
+    <ul id="links" class="links"></ul>
+  </details>
+
+  <div id="tools">
+    <div class="row">
+      <input id="q" type="search" placeholder="Search titles, channels, tags" aria-label="Search" enterkeyhint="search">
+      <button class="btn" id="deep" type="button" aria-pressed="false" title="Also search inside transcripts, notes and favorites">In text</button>
+    </div>
+    <div class="filters">
+      <select id="fkind" aria-label="Type"><option value="">All</option><option value="v">Videos</option><option value="t">Transcripts</option></select>
+      <select id="fplat" aria-label="Source"><option value="">All sources</option></select>
+      <select id="fcat" aria-label="Category"><option value="">All categories</option></select>
+      <select id="ftag" aria-label="Tag"><option value="">All tags</option></select>
+      <select id="fchan" aria-label="Channel"><option value="">All channels</option></select>
+      <button class="btn small" id="fclear" type="button" hidden>Clear</button>
+    </div>
+    <p id="found" class="muted small"></p>
+  </div>
+  <p id="state" class="muted">Loading your library...</p>
+  <p id="err" class="err" hidden></p>
+  <ul id="list" class="list"></ul>
+  <button class="btn wide" id="more" type="button" hidden>Show more</button>
 </main>
+
+<section id="itemview" hidden>
+  <div class="itembar"><button class="btn" id="back" type="button">&#8249; Back</button></div>
+  <article id="item"></article>
+</section>
 <script src="/app.js"></script>
 </body>
 </html>

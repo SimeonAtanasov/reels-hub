@@ -73,7 +73,7 @@ Double-click **Reels Hub** on the desktop (or `reels-hub.bat`). The first time, 
 - **Your name** - each laptop belongs to one person; every video you add is marked as yours.
 - **Reels folder** - where videos, snapshots and notes are saved (suggested: `Downloads\reels`).
 - **Obsidian vault** - optional; leave it empty if you don't use Obsidian.
-- **Sharing** - optional: the address of your Cloudflare inbox and this laptop's token (see below). Leave it empty if you don't share.
+- **Sharing** - optional: the address of your Cloudflare inbox and this laptop's token (see below), and **Online copy** for your phone. Leave it empty if you don't share.
 
 These are saved on that computer only (`%APPDATA%\ReelsHub\config.json`). Change them any time with **Settings** at the top right. Each of you has your own library, categories, favorites and notes on your own laptop.
 
@@ -185,9 +185,23 @@ Each laptop has its own library. To give the other person a video on purpose, pr
 
 The API checks Access's signed token on every request (audience, issuer, expiry), so it also refuses anything that did not come through Access.
 
+## Your library on the phone (optional)
+
+With **Online copy** ticked in Settings (under Sharing), Reels Hub keeps a read-only copy of your library in your own Cloudflare, at the same address as the inbox and behind the same sign-in. Open that address on your phone, sign in with the email code, and you have your videos and transcripts with you, even when the laptop is off.
+
+**What goes up, per video or transcript:** the title, the link, the platform, the creator, the date, the category and tags, the caption or description, the transcript, the on-screen text, your favorites (their text and a web-sized image, at most 720 px wide) and your My notes. Never the video, the other snapshots or the Obsidian note. Each person has their own database: nobody else's sign-in can read it.
+
+**On the phone:** search titles, creators and tags, or press **In text** to search inside transcripts, notes and favorites too (the words are marked when you open a video). Filter by type, source, category, tag and creator. A YouTube video plays in the page (and a transcript time plays it from there); Instagram, TikTok and X videos open in their apps.
+
+**Add a link from the phone:** paste it in **Add a link for your laptop**, choose Video or Transcripts only. Reels Hub on the laptop looks every minute while it runs and puts it in the Run line (it shows as "Phone: ..." under Waiting). A link already in your library or already waiting is left out. Channels, playlists and profiles go as Transcripts only (for videos, Run them on the laptop to pick which).
+
+**How it stays up to date:** every two minutes the laptop sends what changed (new videos, categories, tags, favorites, notes) and removes what you deleted. The first time it sends everything, which can take a while for a big library; the status line shows "Online copy: k / n", the phone's list fills up every two minutes while it runs, and the PC stays awake until it is done. `_online.json` in the reels folder remembers what was sent; if it is lost, the laptop compares with Cloudflare and sends only the differences. **Update now** in Settings starts a pass at once. Untick **Online copy** to stop sending; **Remove the online copy** (shown once it is off) empties your database on Cloudflare after asking.
+
+**Set up** (once, on top of the inbox): one D1 database per person in `cloud/wrangler.toml`, bound as `LIB_<PERSON>` (the person as in `PEOPLE`, in capitals) with `migrations_dir = "migrations-lib"` (see `wrangler.toml.example`): `npx wrangler d1 create reels-hub-<person> --jurisdiction eu`, put the `database_id` in, then `npm run db:remote` (it applies the tables to every database in `wrangler.toml`) and `npm run deploy`. No new Access setup or secrets. Free plan: 500 MB per database (a library of about 7,600 videos and transcripts is roughly 120 MB of text), 100,000 writes and 5 million reads a day; if a limit is reached, the laptop waits and tries again later.
+
 ## Notes
 
-- Everything runs on your own machine. The app listens on 127.0.0.1 only and ignores requests from other websites. Sharing is the only part that goes online, and it sends only what is listed above.
+- Everything runs on your own machine. The app listens on 127.0.0.1 only and ignores requests from other websites. Sharing and the Online copy are the only parts that go online, both optional, and they send only what is listed above.
 - My notes and favorite text save automatically. Re-processing a video keeps your notes; its favorites are cleared only if the run succeeds, and the video's controls pause while it runs (or waits in line).
 - Long videos: snapshots are capped per video (`--max-shots auto`, a number, or `every:5` for one every 5 seconds; set it next to Run in the app, where your choice is remembered), on-screen text is read from at most 60 of them, and transcription on CPU takes roughly a quarter to a half of the video's length (much less on an NVIDIA graphics card, see [Use the graphics card](#use-the-graphics-card-optional-nvidia-only)). The Log's `done in` line shows how long each step took, and `post checked in` how long the Instagram check took.
 - Running a link that is already done asks what to do: **New version** (a separate copy, v2, v3... - the original and its favorites stay) or **Skip**. On a reel, **+ New version** does the same and **Re-process** replaces that version. Both reuse the downloaded video.
