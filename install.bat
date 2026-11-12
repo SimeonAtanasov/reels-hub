@@ -52,7 +52,7 @@ if errorlevel 1 (
 rem ---- Python packages ---------------------------------------------------
 echo  [4/5] Installing Python packages (the biggest step) ...
 !PY! -m pip install --upgrade pip
-!PY! -m pip install --upgrade yt-dlp faster-whisper easyocr
+!PY! -m pip install --upgrade "yt-dlp[default,curl-cffi]" faster-whisper easyocr
 if errorlevel 1 (
   echo  Package install failed - check the internet connection and run install.bat again.
   pause & exit /b 1

@@ -289,11 +289,19 @@ def busy_check(rid):
         raise ValueError("This video is being processed - wait until the run finishes")
 
 
-def atomic_write(path, text):
-    """Write a file so readers never see it half-written (temp file + rename, retried while Windows has it open)."""
+def atomic_write(path, text, durable=False):
+    """Write a file so readers never see it half-written (temp file + rename, retried while Windows has it open).
+    durable: the bytes are forced onto the disk before the rename, so a crash or power cut right after cannot
+    leave an empty or broken file (used for the waiting line, 2026-11-11)."""
     path = Path(path)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    tmp.write_text(text, encoding="utf-8")
+    if durable:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+    else:
+        tmp.write_text(text, encoding="utf-8")
     for i in range(40):
         try:
             os.replace(tmp, path)
@@ -684,7 +692,7 @@ def _ensure_vault_note(folder, r):
     state = read_state(folder)
     if state.get("_bad"):
         return {"error": "hub.json is unreadable - not touching the Obsidian note"}
-    rel = find_vault_note(folder, r, state)
+    rel, created = find_vault_note(folder, r, state), False
     if not rel:
         if state.get("note_path") or state["note_name"]:
             return {"missing": True, "error": "Obsidian note not found (deleted?) - Send to Obsidian creates a new one"}
@@ -703,9 +711,11 @@ def _ensure_vault_note(folder, r):
         rel = f"{dname}/{name}.md"
         (VAULT / dname).mkdir(parents=True, exist_ok=True)
         atomic_write(VAULT / rel, vault_note_text(folder, r, state))
-        _new_note_creator(folder, rel)
+        created = True
     if rel != state.get("note_path"):
         st = read_state(folder); st["note_path"] = rel; st["note_name"] = Path(rel).stem; write_state(folder, st)
+    if created:                                 # after note_path is in hub.json: _set_creator_tag reads it there
+        _new_note_creator(folder, rel)
     return {"name": Path(rel).stem, "path": rel, "uri": obsidian_uri(rel), "sent": state["sent"]}
 
 
@@ -3221,6 +3231,7 @@ def _take_next(lane="video"):
 # the app is closed). The run going when the app closes comes back first in line, set for Later, so it never starts
 # again by itself. Written on every change of the line; read once at start (queue_restore).
 QUEUE_FILE = "_queue.json"
+QUEUE_PREV = "_queue.prev.json"             # the line one change before (2026-11-11): used when _queue.json can't be read
 _QKEYS = {"run": ("urls", "max_shots", "redo", "flags", "target", "label", "platform", "transcripts"),
           "add": ("id", "category", "new", "max_shots", "label", "platform", "fill")}
 
@@ -3244,10 +3255,15 @@ def _qsave():
                 items.append({**_qpublic(cur), "held": True, "was_running": True})
         items += [_qpublic(t) for t in sorted(RUNQ + INBOX["queue"], key=lambda x: x.get("seq", 0))]
         f = OUT / QUEUE_FILE
-        if items:
-            atomic_write(f, json.dumps({"items": items}, indent=1, ensure_ascii=False))
-        elif f.exists():
-            f.unlink()
+        try:                                         # keep the last good line as _queue.prev.json
+            cur = read_text(f) if f.exists() else ""
+            if cur and isinstance(json.loads(cur).get("items"), list):
+                atomic_write(OUT / QUEUE_PREV, cur, durable=True)
+        except (OSError, ValueError, AttributeError):
+            pass                                     # a broken file is never copied over the good one
+        # forced onto the disk; an empty line is written as such (never deleted), so a missing or broken file
+        # after a crash can't be mistaken for "nothing waits"
+        atomic_write(f, json.dumps({"items": items}, indent=1, ensure_ascii=False), durable=True)
     except Exception as e:
         print(f"  the waiting line could not be saved: {e}")
 
@@ -3255,12 +3271,31 @@ def _qsave():
 def queue_restore():
     """App start: what waited when the app closed waits again, in the same order; Later stays Later; the run that
     was going comes first, set for Later."""
-    f = OUT / QUEUE_FILE
+    f, prev = OUT / QUEUE_FILE, OUT / QUEUE_PREV
+
+    def _load(p):
+        d = json.loads(read_text(p))
+        if not isinstance(d, dict) or not isinstance(d.get("items", []), list):
+            raise ValueError("not a waiting line")
+        return d.get("items") or []
     try:
-        items = json.loads(read_text(f)).get("items") or [] if f.exists() else []
-    except (OSError, ValueError) as e:
-        print(f"  {QUEUE_FILE} could not be read ({e}); the line starts empty")
-        return 0
+        items = _load(f) if f.exists() else []
+    except (OSError, ValueError) as e:              # e.g. left empty by a crash: set it aside, take the copy before
+        bad, k = OUT / f"_queue.broken-{time.strftime('%Y%m%d-%H%M%S')}.json", 2
+        while bad.exists():
+            bad, k = OUT / f"_queue.broken-{time.strftime('%Y%m%d-%H%M%S')}-{k}.json", k + 1
+        try:
+            os.replace(f, bad)
+        except OSError:
+            bad = f
+        try:
+            items = _load(prev)
+            print(f"  {QUEUE_FILE} could not be read ({e}): kept as {bad.name}; the line comes back from {QUEUE_PREV}"
+                  " (one change older: something that had just finished may run again; done links are skipped)")
+        except (OSError, ValueError) as e2:
+            print(f"  {QUEUE_FILE} could not be read ({e}) and neither could {QUEUE_PREV} ({e2}); the line starts empty"
+                  f" ({bad.name} is kept)")
+            return 0
     n = 0
     with INBOX_LOCK:
         for d in items:
@@ -3318,6 +3353,39 @@ def queue_hold(body):
     if not held:
         start_next()
     return {"seq": seq, "held": held}
+
+
+BLOCKED = {}                                # the last site that refused downloads, for the page's toast (2026-11-12)
+
+
+def _site_blocked(info, max_shots, flags, job):
+    """reels2notes stopped a run because a site kept refusing (@@BLOCKED {site, reason, urls}): the refused and untried
+    links go back to the top of the lane as one group set for Later, and every waiting group of that site in the lane
+    is set for Later too, so the line does not burn through hundreds of links that would all fail. Other sites go on."""
+    urls = [str(u) for u in info.get("urls") or [] if isinstance(u, str)]
+    site = str(info.get("site") or (platform_of(urls[0]) if urls else ""))
+    lane = job["lane"]
+    held = 0
+    with INBOX_LOCK:
+        for t in RUNQ:
+            if lane_of(t) == lane and not t.get("held") and t.get("platform") == site:
+                t["held"] = True
+                held += 1
+        seq = None
+        if urls:
+            t = {"kind": "run", "urls": urls, "max_shots": max_shots, "redo": False, "flags": list(flags), "target": "",
+                 "label": f"{site} refused: {len(urls)} link{'s' if len(urls) != 1 else ''} put back",
+                 "platform": site, "transcripts": False, "held": True, "seq": next(QSEQ)}
+            RUNQ.append(t)
+            seq = t["seq"]
+        _qsave()
+    if seq is not None:
+        queue_move({"seq": seq, "to": 0})
+    msg = (f"{site} is refusing downloads, so its links are paused: {len(urls)} put back at the top, "
+           f"{held} more group{'s' if held != 1 else ''} set for Later. Try again later with \u25b6 or Resume all.")
+    job["log"].append("== " + msg)
+    BLOCKED.update(site=site, at=time.time(), put_back=len(urls), held=held, msg=msg)
+    print("  " + msg)
 
 
 def queue_hold_all(body):
@@ -3849,6 +3917,7 @@ def _run_job(urls, max_shots, redo, flags, target, share, done, job=JOB):
         job["log"].append("-- using cookies.txt for sites that need login")
     cmd += urls
     channels = set()                        # transcripts run: channels whose own note is written at the end
+    blocked = None
     try:
         proc = subprocess.Popen(cmd, cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, encoding="utf-8", errors="replace", env=env)
@@ -3881,6 +3950,12 @@ def _run_job(urls, max_shots, redo, flags, target, share, done, job=JOB):
                 continue
             if line.startswith("@@CHANNEL "):
                 continue                               # channel notes are written below, once per channel
+            if line.startswith("@@BLOCKED "):          # the site refuses downloads: put the links back, hold the site
+                try:
+                    blocked = json.loads(line[10:])
+                except ValueError:
+                    blocked = None
+                continue
             if line and "warnings.warn" not in line:
                 job["log"].append(line)
                 if DONE_LINE.match(line) or "already done" in line:
@@ -3900,6 +3975,11 @@ def _run_job(urls, max_shots, redo, flags, target, share, done, job=JOB):
                     job["log"].append(f"-- channel note: {rel}")
             except Exception as e:
                 job["log"].append(f"-- channel note of {key}: {e}")
+        if isinstance(blocked, dict) and "--transcripts" not in flags:
+            try:
+                _site_blocked(blocked, max_shots, flags, job)
+            except Exception as e:
+                job["log"].append(f"-- could not put the refused links back in line: {e}")
         if share:
             _finish_add(share, proc.returncode, done)
         if redo and target and proc.returncode == 0:   # snapshots were replaced: old favorites no longer apply
@@ -4012,7 +4092,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/transcripts":
             self.send_json(list_transcripts() if CONFIG.get("name") else {"channels": [], "items": []})
         elif path == "/api/status":                          # both lanes; busy (reels being changed) is the video lane's
-            self.send_json({"running": any_running(), "lanes": {lane: lane_status(JOBS[lane]) for lane in LANES},
+            self.send_json({"running": any_running(), "blocked": dict(BLOCKED), "lanes": {lane: lane_status(JOBS[lane]) for lane in LANES},
                             "busy": sorted(JOB["busy"]) if JOB["running"] else [],
                             "transcripts": bool(TRJOB["running"]),
                             "queue": queue_list(), "changed": CHANGED["list"], "boot": BOOT, "homes_job": dict(HOMES),
@@ -4371,6 +4451,7 @@ body.resizing-y,body.resizing-y *{cursor:row-resize!important;user-select:none}
 #qlist .qlater{flex:none;font-size:10px;text-transform:uppercase;letter-spacing:.4px;color:var(--star);border:1px solid currentColor;border-radius:4px;padding:0 4px}
 #qlist .ico[disabled]{opacity:.3}
 #qlist .qhold{font-size:9px;letter-spacing:-1px;min-width:18px}
+#qlist .qtop{font-weight:700}
 .runbox .row{flex-wrap:wrap}
 .modebar{display:flex;gap:4px;padding:10px 12px 0;align-items:center}
 .pbtn.foldall{font-size:19px;line-height:1;padding-bottom:2px}
@@ -5188,8 +5269,12 @@ const hasTag = (x, t) => tagsOf(x).some(y => y.toLowerCase() === t.toLowerCase()
 function tagList(kind, attr, sel, items, platOk){
   // the Tags section of the filters pane: ticks with counts (any ticked tag matches), rename / delete on each row
   [...sel].forEach(t => tags.includes(t) || sel.delete(t));
-  const opts = tags.map(t => ({val: t, label: t, html: "#" + esc(t), tools: `<span class="tgtools"><button class="ico" data-tagren="${esc(t)}" title="Rename this tag">&#9998;</button><button class="ico" data-tagdel="${esc(t)}" title="Delete this tag (taken off every video)">&#10005;</button></span>`,
-    n: items.filter(x => hasTag(x, t) && platOk(x)).length}));
+  // 2026-11-11: A-Z so a family stays together (ai/..., biz/...); while Source, Category or Channel narrow the list,
+  // only tags with videos there show (a ticked one stays), as in the Channel list; with no filter every tag shows
+  // (also unused ones, so they can still be renamed or deleted)
+  const narrowed = items.some(x => !platOk(x));
+  const opts = [...tags].sort((a, b) => a.localeCompare(b, undefined, {sensitivity: "base"})).map(t => ({val: t, label: t, html: "#" + esc(t), tools: `<span class="tgtools"><button class="ico" data-tagren="${esc(t)}" title="Rename this tag">&#9998;</button><button class="ico" data-tagdel="${esc(t)}" title="Delete this tag (taken off every video)">&#10005;</button></span>`,
+    n: items.filter(x => hasTag(x, t) && platOk(x)).length})).filter(o => !narrowed || o.n || sel.has(o.val));
   return (tags.length ? flist(kind, "Tags", attr, opts, sel) : `<div class="fsec"><span class="fl">Tags</span><div class="fhint">No tags yet: add one on a video (Tags, under Category).</div></div>`)
     + `<div class="frow"><button class="link" data-tagnew>+ New tag</button></div>`;
 }
@@ -5538,6 +5623,8 @@ function moveReels(ids, cat){
 }
 function updateNavSafe(){ if ($("#pos")) updateNav(); }
 let toastTimer;
+let lastBlockedAt = null;                 // the blocked notice already seen (null: not read yet, so an old one is not shown)
+function toastLong(msg){ toast(msg); clearTimeout(toastTimer); toastTimer = setTimeout(() => $("#toast").classList.remove("show"), 12000); }
 function toast(msg){ const t = $("#toast"); t.textContent = msg; t.classList.add("show"); clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove("show"), 2200); }
 
 /* ---------- snapshots: delete, re-process ---------- */
@@ -6362,6 +6449,13 @@ document.addEventListener("click", async e => {
   if ((el = c("[data-qhold]"))) { const held = el.dataset.held !== "1";
     try { await api("/api/queue/hold", {seq: +el.dataset.qhold, held}); } catch (err) { toast(err.message); }
     toast(held ? "Set for later: it waits in line until you press \u25B6" : "It runs when its turn comes"); lastQueueHtml = null; return ensurePoll(); }
+  if ((el = c("[data-qtop]"))) {        // Run next (2026-11-11): to the top of its lane, and off Later if it was set so
+    try {
+      const j = await api("/api/queue/move", {seq: +el.dataset.qtop, to: 0});      // moving renumbers: use the new seq
+      if (el.dataset.held === "1") await api("/api/queue/hold", {seq: j.seq, held: false});
+      toast("Next in line: it starts as soon as what runs now is done");
+    } catch (err) { toast(err.message); }
+    lastQueueHtml = null; return ensurePoll(); }
   if ((el = c("[data-qmove]"))) { try { await api("/api/queue/move", {seq: +el.dataset.qs, dir: +el.dataset.qmove}); } catch (err) { toast(err.message); }
     lastQueueHtml = null; return ensurePoll(); }
   if ((el = c("[data-iadd]"))) return inboxAdd(el.dataset.iadd);
@@ -7201,6 +7295,10 @@ async function poll(){
   catch (e) { setTimeout(poll, 3000); return; }          // server hiccup: keep trying
   const q = s.queue || [], L = s.lanes, runs = LANES.filter(k => L[k].running);
   lastStatus = s; renderLog();
+  if (s.blocked && s.blocked.at && s.blocked.at !== lastBlockedAt) {   // a site refused downloads (2026-11-12)
+    if (lastBlockedAt !== null) toastLong(s.blocked.msg);
+    lastBlockedAt = s.blocked.at;
+  } else if (lastBlockedAt === null) lastBlockedAt = (s.blocked && s.blocked.at) || 0;
   const one = runs.length === 1 ? L[runs[0]] : null;
   $("#status").textContent = runs.length > 1 ? "Running · 2 at once"
     : one ? `Running · ${one.done || 0} / ${one.total != null ? one.total : one.urls.length} done`
@@ -7272,6 +7370,7 @@ function showQueue(q){                    // the Waiting list under the progress
     `<li class="${x.held ? "held" : ""}" draggable="true" data-qseq="${x.seq}" data-qlane="${x.lane || "video"}" title="Drag to move it up or down the line"><span class="qn">${i + 1}.</span>${x.platform ? pbadge({platform: x.platform}) : ""}`
     + `<span class="ql" title="${esc(x.label)}">${esc(x.label)}</span>`
     + (x.held ? `<span class="qlater" title="${x.interrupted ? "It was running when the app closed. Press &#9654; to run it again (what is done is skipped for transcripts)" : "Set for later: it stays in line and waits until you press &#9654;"}">${x.interrupted ? "stopped" : "later"}</span>` : "")
+    + `<button class="ico qtop" data-qtop="${x.seq}" data-held="${x.held ? 1 : 0}" title="Run next: move it to the top of its line${x.held ? " and run it when its turn comes (off Later)" : ""}; what runs now finishes first" aria-label="Run next" ${i === 0 && !x.held ? "disabled" : ""}>&#10514;</button>`
     + `<button class="ico" data-qmove="-1" data-qs="${x.seq}" title="Move up" ${i === 0 ? "disabled" : ""}>&#8593;</button>`
     + `<button class="ico" data-qmove="1" data-qs="${x.seq}" title="Move down" ${i === q.length - 1 ? "disabled" : ""}>&#8595;</button>`
     + `<button class="ico qhold" data-qhold="${x.seq}" data-held="${x.held ? 1 : 0}" title="${x.held ? "Run it when its turn comes" : "Later: keep it in line but don't run it (stays so when you close the app)"}">${x.held ? "&#9654;" : "&#10074;&#10074;"}</button>`

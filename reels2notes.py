@@ -46,6 +46,32 @@ warnings.filterwarnings("ignore", category=UserWarning)
 VIDEO_EXT = (".mp4", ".webm", ".mkv", ".mov", ".m4v")
 
 
+# ---------------------------------------------------------------- failures and blocks (2026-11-12)
+# failed.txt keeps every failure, one line each: "<time>\t<link>\t<reason>", added the moment it happens (it used to be
+# rewritten per run, so with groups of 10 it only ever held the last group). A site that refuses to serve you (Instagram's
+# "redirected to the login page ... rate-limit", TikTok's "IP address is blocked", 429) fails every link in a few
+# seconds: after BLOCK_STOP such failures in a row from one site the run stops and prints @@BLOCKED with the links that
+# were refused or not tried yet; Reels Hub puts them back in line, set for Later, and holds that site's other groups.
+BLOCK_STOP = 3
+BLOCK_RE = re.compile(r"rate.?limit|redirected to the login page|login required|ip address is blocked|"
+                      r"429|too many requests|temporarily blocked|please wait a few minutes", re.I)
+
+
+def is_block(msg):
+    return bool(BLOCK_RE.search(str(msg or "")))
+
+
+def log_failed(out, url, reason):
+    """Add one line to <reels folder>/failed.txt (never rewrite it)."""
+    try:
+        why = re.sub(r"\s+", " ", str(reason or "")).strip()[:300]
+        line = time.strftime("%Y-%m-%d %H:%M:%S") + "\t" + str(url) + "\t" + why + "\n"
+        with open(Path(out, "failed.txt"), "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except OSError as e:
+        print(f"  could not write failed.txt: {e}")
+
+
 def platform_of(url, info=None):
     key = ((info or {}).get("extractor_key") or "").lower()
     u = url.lower()
@@ -1838,7 +1864,7 @@ def transcripts_main(urls, args):
                 if consecutive_429 >= 3:
                     print("  YouTube keeps refusing (429 Too Many Requests): stopping here, run it again later - "
                           "what is done stays done")
-                    failed.append(url)
+                    failed.append(url); log_failed(args.out, url, e)
                     ended = "interrupted"
                     if rec:
                         rec.step(k, False)
@@ -1856,7 +1882,7 @@ def transcripts_main(urls, args):
             if d.get("channel") and not d.get("skipped"):
                 channels[d["channel"]] = channels.get(d["channel"], 0) + 1
         except Exception as e:
-            print(f"  FAILED: {e}"); failed.append(url)
+            print(f"  FAILED: {e}"); failed.append(url); log_failed(args.out, url, e)
         finally:
             flag_clear(out, TRBUSY)                  # between videos the other lane may download
         if rec:
@@ -1881,7 +1907,7 @@ def transcripts_main(urls, args):
     else:
         print(f"\n{ended} after {attempted} of {len(todo)}: {ok} done, {len(failed)} failed, {len(todo) - attempted} not done yet")
     if failed:
-        Path(args.out, "failed.txt").write_text("\n".join(failed), encoding="utf-8")
+        print(f"  (failed links are added to {args.out}/failed.txt)")
     return 0 if ok or not (failed or failed_lists) else 1
 
 
@@ -1929,18 +1955,38 @@ def main():
 
     failed = []
     stats = load_stats(args.out)
+    streak, streak_site, refused = 0, "", []      # block-type failures in a row from one site
     for i, url in enumerate(urls):
         try:
             process(url, args, i + 1, len(urls), stats)
+            streak, refused = 0, []
         except Exception as e:
-            print(f"  FAILED: {e}"); failed.append(url)
+            print(f"  FAILED: {e}"); failed.append(url); log_failed(args.out, url, e)
+            site = platform_of(url)
+            if is_block(e):
+                if site != streak_site:
+                    streak, refused = 0, []
+                streak, streak_site = streak + 1, site
+                refused.append(url)
+                if streak >= BLOCK_STOP:
+                    back = refused + urls[i + 1:]
+                    print(f"\n{site} is refusing downloads ({streak} in a row: {friendly_short(e)}). Stopping this run;"
+                          f" {len(back)} link(s) go back in line, set for Later.")
+                    print("@@BLOCKED " + json.dumps({"site": site, "reason": str(e)[:300], "urls": back}), flush=True)
+                    return 1
+            else:
+                streak, refused = 0, []
         if i < len(urls) - 1:
             time.sleep(5)  # be gentle with the sites
     if failed:
-        Path(args.out, "failed.txt").write_text("\n".join(failed), encoding="utf-8")
-        print(f"\n{len(failed)} failed - see {args.out}/failed.txt")
+        print(f"\n{len(failed)} failed - added to {args.out}/failed.txt")
         return 1
     return 0
+
+
+def friendly_short(e):
+    m = BLOCK_RE.search(str(e))
+    return m.group(0) if m else str(e)[:80]
 
 
 if __name__ == "__main__":
