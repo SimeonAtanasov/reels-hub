@@ -191,7 +191,7 @@ def public_config():
 def config_info():
     return {"configured": bool(CONFIG.get("name")), "config": public_config(), "defaults": default_config(),
             "path": str(config_path()), "effective": {"out": str(OUT), "vault": str(VAULT) if vault_ok() else ""},
-            "overrides": sorted(OVERRIDES), "online": lib_public()}
+            "overrides": sorted(OVERRIDES), "online": lib_public(), **version_info()}
 
 
 def can_delete():
@@ -203,6 +203,51 @@ FAV_START, FAV_END = "<!-- reels-hub:favorites start -->", "<!-- reels-hub:favor
 VID_START, VID_END = "<!-- reels-hub:video start -->", "<!-- reels-hub:video end -->"
 TXT_START, TXT_END = "<!-- reels-hub:text start -->", "<!-- reels-hub:text end -->"   # a transcript-only note's text
 VIDS_START, VIDS_END = "<!-- reels-hub:videos start -->", "<!-- reels-hub:videos end -->"   # a channel note's list
+
+
+class MarkersDamaged(ValueError):
+    """A block's marker lines in a vault note are missing, doubled or swapped: the note is left as it is."""
+
+
+def _marker_line_re(marker):
+    """A marker counts only as a whole line of its own (spaces around it allowed): the same text quoted inside a
+    sentence, a title or a code span is not a marker (2026-11-15, audit R-01 and R-14)."""
+    return re.compile(r"^[ \t]*" + re.escape(marker) + r"[ \t]*$", re.M)
+
+
+def _block_span(text, start, end, name):
+    """Where the app's block is in a note: (a, b) from the first character of the start marker line to the last
+    character of the end marker line. None when neither marker line is there (the caller may add a fresh block).
+    Raises MarkersDamaged when there is not exactly one start line and one end line, start first: then nothing
+    in the note may be changed, since the app cannot tell its own text from yours (audit R-01)."""
+    s = list(_marker_line_re(start).finditer(text))
+    e = list(_marker_line_re(end).finditer(text))
+    if not s and not e:
+        return None
+    if len(s) == 1 and len(e) == 1 and s[0].start() < e[0].start():
+        return s[0].start(), e[0].end()
+    raise MarkersDamaged(f"The {name} markers of this note are damaged (missing, doubled or swapped): the note was "
+                         f"not changed. In Obsidian put the two lines {start} and {end} back around that part, "
+                         f"each on a line of its own, or delete both lines.")
+
+
+def _defuse_block(text):
+    """Text from a site, a transcript or a favorite that goes inside one of the app's blocks: a copy of the app's
+    marker text in it would turn into a marker line later, so its '<' is written as &lt; (Obsidian shows the same)."""
+    return str(text).replace("<!-- reels-hub:", "&lt;!-- reels-hub:")
+
+
+def _set_block(text, start, end, body, name):
+    """The note with the block between the marker lines replaced by body; None when the note has no such block."""
+    span = _block_span(text, start, end, name)
+    if span is None:
+        return None
+    return text[:span[0]] + start + "\n" + _defuse_block(body) + "\n" + end + text[span[1]:]
+
+
+def has_channel_marker(text, key):
+    """The note is this channel's own note: its channel marker as a whole line (audit R-02, R-14)."""
+    return _marker_line_re(f"<!-- reels-hub:channel={key} -->").search(text) is not None
 TR_DIR = "_transcripts"                  # transcript-only videos, one folder per channel (see reels2notes --transcripts)
 TR_VIDEO_LINE = "_Video not downloaded: paste the link in Reels Hub and press Run to add it._"
 def tr_source_label(source):
@@ -279,6 +324,47 @@ INBOX_LOCK = threading.RLock()           # also guards RUNQ: both lines of waiti
 INBOX_WAKE = threading.Event()
 CHANGED = {"seq": 0, "list": []}         # reels an inbox Add filled in [{seq, folder}]: the page reloads them
 BOOT = os.urandom(6).hex()               # a new count each start: an open page notices the restart
+APP_DATE = "2026-11-15"                  # the day of the last change to reels_hub.py or reels2notes.py: set it with each
+
+
+def _code_hash():
+    """8 hex digits of reels_hub.py and reels2notes.py as they are on disk now (line endings ignored, so a copy from
+    GitHub and one from the USB stick give the same stamp). Audit R-41."""
+    import hashlib
+    h = hashlib.sha256()
+    for p in (Path(__file__).resolve(), SCRIPT):
+        try:
+            h.update(p.read_bytes().replace(b"\r\n", b"\n"))
+        except OSError:
+            h.update(b"(missing)")
+    return h.hexdigest()[:8]
+
+
+CODE_HASH = _code_hash()                  # the files this server was started from
+VERSION = f"{APP_DATE} {CODE_HASH}"       # in the black window, /api/ping, Settings and the page
+_DISK = {"sig": None, "hash": CODE_HASH}
+
+
+def disk_hash():
+    """The stamp of the two files on disk now, hashed again only when one's size or time changed. Differs from
+    CODE_HASH when they were replaced while Reels Hub runs (a USB update): the server and page in memory are the
+    old ones, but every new run starts the new reels2notes.py (audit R-41)."""
+    sig = []
+    for p in (Path(__file__).resolve(), SCRIPT):
+        try:
+            st = p.stat()
+            sig.append((st.st_mtime_ns, st.st_size))
+        except OSError:
+            sig.append(None)
+    sig = tuple(sig)
+    if sig != _DISK["sig"]:
+        _DISK.update(sig=sig, hash=_code_hash())
+    return _DISK["hash"]
+
+
+def version_info():
+    files = disk_hash()
+    return {"version": VERSION, "files": files, "updated": files != CODE_HASH}
 
 
 def mark_changed(name):
@@ -694,7 +780,8 @@ def _vault_index(max_age=VIDX_AGE):
             except OSError:
                 continue
             n += 1
-            ids = set(re.findall(r"<!-- reels-hub:id=(\S+?) -->", head)) | set(re.findall(r"^reel_id:\s*(\S+)\s*$", head, re.M))
+            ids = set(re.findall(r"^[ \t]*<!-- reels-hub:id=(\S+?) -->[ \t]*$", head, re.M)) \
+                | set(re.findall(r"^reel_id:\s*(\S+)\s*$", head, re.M))           # whole lines only (R-14)
             for i in ids:
                 idx.setdefault(i, []).append(rel.as_posix())
         VIDX.update(at=time.time(), map=idx, n=n)
@@ -714,7 +801,8 @@ def _needs_search(r, state):
 
 def has_marker(text, rid):
     """The note belongs to this reel: exact id marker (new notes) or exact reel_id line (older notes)."""
-    return _marker(rid) in text or re.search(rf"^reel_id:\s*{re.escape(rid)}\s*$", text, re.M) is not None
+    return _marker_line_re(_marker(rid)).search(text) is not None \
+        or re.search(rf"^reel_id:\s*{re.escape(rid)}\s*$", text, re.M) is not None   # a quoted marker is not one (R-14)
 
 
 def ensure_vault_note(folder, r):
@@ -863,6 +951,8 @@ def send_to_obsidian(reel_id):
         raise ValueError(info["error"])
     state = read_state(folder)
     favs = state["favorites"]
+    path = VAULT / info["path"]
+    _check_send_blocks(read_text(path), reel_id, info["path"])   # damaged markers: stop before any image is touched
     att_rel = f"{ATTACH_DIR}/{reel_id}"
     att = VAULT / att_rel
     att.mkdir(parents=True, exist_ok=True)
@@ -902,24 +992,23 @@ def send_to_obsidian(reel_id):
         block = ["_No starred images._"]
     block = "\n".join(block).rstrip("\n")
 
-    path = VAULT / info["path"]
     with DATA_LOCK:
         text = read_text(path)
-        if not has_marker(text, reel_id):
-            raise ValueError(f"{info['path']} does not belong to this video (its id line is missing) - not changing it")
-        if FAV_START in text and FAV_END in text and text.find(FAV_START) < text.find(FAV_END):
-            pre, rest = text.split(FAV_START, 1)
-            text = pre + FAV_START + "\n" + block + "\n" + FAV_END + rest.split(FAV_END, 1)[1]
-        else:                                          # markers removed by hand: append a fresh section
-            text = text.rstrip() + f"\n\n## Favorites (Reels Hub)\n{FAV_START}\n{block}\n{FAV_END}\n"
+        _check_send_blocks(text, reel_id, info["path"])   # again: the note may have changed while the images copied
+        new = _set_block(text, FAV_START, FAV_END, block, "Favorites")
+        if new is None:                                # both marker lines removed by hand: append a fresh section
+            new = text.rstrip() + f"\n\n## Favorites (Reels Hub)\n{FAV_START}\n{_defuse_block(block)}\n{FAV_END}\n"
+        text = new
         vid_block = f"{VID_START}\n{vid_line}\n{VID_END}"
-        if VID_START in text and VID_END in text and text.find(VID_START) < text.find(VID_END):
-            pre, rest = text.split(VID_START, 1)
-            text = pre + vid_block + rest.split(VID_END, 1)[1]
-        elif _marker(reel_id) in text:                 # notes made before the video block: right under the id line
-            text = text.replace(_marker(reel_id), _marker(reel_id) + "\n" + vid_block, 1)
+        new = _set_block(text, VID_START, VID_END, vid_line, "Video")
+        idl = _marker_line_re(_marker(reel_id)).search(text)
+        if new is not None:
+            text = new
+        elif idl:                                      # notes made before the video block: right under the id line
+            text = text[:idl.end()] + "\n" + vid_block + text[idl.end():]
         else:                                          # oldest notes (reel_id line): top of the favorites block
-            text = text.replace(FAV_START + "\n", FAV_START + "\n" + vid_line + "\n\n", 1)
+            fs = _marker_line_re(FAV_START).search(text)
+            text = text[:fs.end()] + "\n" + vid_line + "\n" + text[fs.end():]
         cat = state["category"]
         text = re.sub(r'^\*\*Category\*\*:.*$', lambda m: f'**Category**: {cat or "-"}', text, count=1, flags=re.M)
         fm = re.match(r"^---\n.*?\n---\n", text, re.S)                # older notes: only inside the frontmatter
@@ -929,6 +1018,18 @@ def send_to_obsidian(reel_id):
         atomic_write(path, text)
         st = read_state(folder); st["sent"] = time.strftime("%Y-%m-%d %H:%M"); write_state(folder, st)
     return {"name": info["name"], "uri": info["uri"], "count": len(favs), "sent": st["sent"]}
+
+
+def _check_send_blocks(text, reel_id, rel):
+    """Send to Obsidian changes a note only when it is this video's note and its Favorites and Video markers are
+    whole (audit R-01): otherwise it says why and changes nothing, not even the images."""
+    if not has_marker(text, reel_id):
+        raise ValueError(f"{rel} does not belong to this video (its id line is missing) - not changing it")
+    try:
+        _block_span(text, FAV_START, FAV_END, "Favorites")
+        _block_span(text, VID_START, VID_END, "Video")
+    except MarkersDamaged as e:
+        raise MarkersDamaged(f"{rel}: {e}") from None
 
 
 def _at(url, t):
@@ -1829,6 +1930,12 @@ def transcript_note(folder, from_channel):
         base = NOTE_PREFIX.get(r["platform"], "") + clean_name(r["label"], r["id"])
         name, k = base, 2
         while (VAULT / dname / f"{name}.md").exists():
+            rel = f"{dname}/{name}.md"
+            if has_marker(read_text(VAULT / rel), folder.name):   # this video's note from before (its channel was
+                st.update(note_path=rel, note_name=name,          # removed and run again): kept, not made twice (R-02)
+                          **{"from": "channel" if from_channel else "link"})
+                atomic_write(folder / "hub.json", json.dumps(st, indent=1, ensure_ascii=False))
+                return {"name": name, "path": rel, "uri": obsidian_uri(rel)}
             name = f"{base} ({k})"; k += 1
         rel = f"{dname}/{name}.md"
         (VAULT / dname).mkdir(parents=True, exist_ok=True)
@@ -1841,10 +1948,12 @@ def transcript_note(folder, from_channel):
         return {"name": name, "path": rel, "uri": obsidian_uri(rel)}
 
 
-def channel_note(key):
+def channel_note(key, strict=False):
     """The channel's own note, '<channel> (channel).md in the channel's folder (YouTube/<home category>/<channel>/
     or YouTube/Channels/<channel>/): the list of its videos' notes. Only the block between the videos markers is
-    ever rewritten; the rest of the note is yours."""
+    ever rewritten; the rest of the note is yours. A note of this channel that is already there (its channel marker
+    as a line) is taken and only its list updated, even when _channel.json no longer names it (audit R-02); damaged
+    videos markers leave the note as it is (R-01): strict=True raises that as an error for the run's log."""
     if not vault_ok():
         return None
     cdir = tr_cdir(key)
@@ -1862,35 +1971,56 @@ def channel_note(key):
     with DATA_LOCK:
         rel = meta.get("note_path") or ""
         mark = f"<!-- reels-hub:channel={key} -->"
-        if rel and (VAULT / rel).is_file():
+        if not (rel and (VAULT / rel).is_file()):
+            rel = _channel_note_path(key, meta, cname)
+        if (VAULT / rel).is_file():
             text = read_text(VAULT / rel)
-            if mark not in text:
+            if not has_channel_marker(text, key):
                 print(f"  {rel} is not this channel's note (its marker is missing) - not changing it")
                 return None
-            if VIDS_START in text and VIDS_END in text and text.find(VIDS_START) < text.find(VIDS_END):
-                pre, rest = text.split(VIDS_START, 1)
-                text = pre + VIDS_START + "\n" + block + "\n" + VIDS_END + rest.split(VIDS_END, 1)[1]
-            else:
-                text = text.rstrip() + f"\n\n## Videos (Reels Hub)\n{VIDS_START}\n{block}\n{VIDS_END}\n"
+            try:
+                new = _set_block(text, VIDS_START, VIDS_END, block, "Videos")
+            except MarkersDamaged as e:
+                if meta.get("note_path") != rel:
+                    meta["note_path"] = rel
+                    _save_channel_meta(cdir, meta)
+                print(f"  {rel}: {e}")
+                if strict:
+                    raise MarkersDamaged(f"{rel}: {e}") from None
+                return None
+            text = new if new is not None else \
+                text.rstrip() + f"\n\n## Videos (Reels Hub)\n{VIDS_START}\n{_defuse_block(block)}\n{VIDS_END}\n"
         else:
-            plat = meta.get("platform") or "YouTube"
-            dname = note_home(plat, home_of(key), meta.get("name") or key)     # next to its videos' notes
-            rel = f"{dname}/{NOTE_PREFIX.get(plat, '')}{cname} (channel).md"
-            if (VAULT / rel).is_file() and mark not in read_text(VAULT / rel):
-                rel = f"{dname}/{NOTE_PREFIX.get(plat, '')}{cname} (channel, Reels Hub).md"
-            (VAULT / dname).mkdir(parents=True, exist_ok=True)
+            (VAULT / rel).parent.mkdir(parents=True, exist_ok=True)
             text = "\n".join([time.strftime("%Y-%m-%d"), time.strftime("%H:%M"),
                               f"**Channel:** {meta.get('name') or key}" + (f" ({meta['handle']})" if meta.get("handle") else ""),
                               f"**Source**: {meta.get('url') or '-'}",
                               f"**Tags**: #{meta.get('platform') or 'YouTube'} #Channel",
                               f"**Related**: {NOTE_RELATED.get(meta.get('platform') or 'YouTube', '')}".rstrip(),
                               mark, "",
-                              "## Videos (Reels Hub)", VIDS_START, block, VIDS_END, "",
+                              "## Videos (Reels Hub)", VIDS_START, _defuse_block(block), VIDS_END, "",
                               "## My notes", "", ""])
         atomic_write(VAULT / rel, text)
         meta["note_path"] = rel
         _save_channel_meta(cdir, meta)
     return rel
+
+
+def _channel_note_path(key, meta, cname):
+    """Where the channel note goes when _channel.json names none (a new channel, or one removed and run again, or a
+    _channel.json rebuilt after a crash): this channel's own note at the usual place if there is one (taken, never
+    written over), else the first free name. A file of yours with that name is never touched (audit R-02)."""
+    plat = meta.get("platform") or "YouTube"
+    dname = note_home(plat, home_of(key), meta.get("name") or key)     # next to its videos' notes
+    base = f"{dname}/{NOTE_PREFIX.get(plat, '')}{cname}"
+    names = [f"{base} (channel).md", f"{base} (channel, Reels Hub).md"] + \
+            [f"{base} (channel, Reels Hub {k}).md" for k in range(2, 50)]
+    for rel in names:
+        if not (VAULT / rel).is_file():
+            return rel
+        if has_channel_marker(read_text(VAULT / rel), key):
+            return rel
+    raise ValueError(f"no free name for the channel note of {key} in {dname}")
 
 
 def _adopt_transcript_note(folder, r):
@@ -1910,10 +2040,14 @@ def _adopt_transcript_note(folder, r):
         text = read_text(VAULT / rel)
         if not has_marker(text, folder.name):
             continue
-        if r["transcript"] and TXT_START in text and TXT_END in text and text.find(TXT_START) < text.find(TXT_END):
-            pre, rest = text.split(TXT_START, 1)
+        try:
+            span = _block_span(text, TXT_START, TXT_END, "text") if r["transcript"] else None
+        except MarkersDamaged as e:                    # the text stays as it is (audit R-01)
+            print(f"  {rel}: {e}")
+            span = None
+        if span:
             ocr = ["## On-screen text", ""] + [f"- **{tlabel(r, r['times'].get(x['shot'], 0))}** {x['text']}" for x in r["ocr"]] + [""] if r["ocr"] else []
-            text = pre + "\n".join(ocr + _text_lines(r)) + "\n" + rest.split(TXT_END, 1)[1].lstrip("\n")
+            text = text[:span[0]] + _defuse_block("\n".join(ocr + _text_lines(r))) + "\n" + text[span[1]:].lstrip("\n")
             text = re.sub(r"^\*\*Transcript:\*\* .*\n", "", text, count=1, flags=re.M)
             text = re.sub(r"^<!-- reels-hub:transcript=.*-->\n", "", text, count=1, flags=re.M)
             atomic_write(VAULT / rel, text)
@@ -1979,7 +2113,7 @@ def remove_transcripts(body):
     if whole and not errors:
         meta = _channel_meta(cdir)
         rel = meta.get("note_path") or ""
-        if with_obsidian and vault_ok() and rel and (VAULT / rel).is_file() and f"<!-- reels-hub:channel={key} -->" in read_text(VAULT / rel):
+        if with_obsidian and vault_ok() and rel and (VAULT / rel).is_file() and has_channel_marker(read_text(VAULT / rel), key):
             vtrash.mkdir(exist_ok=True)
             try:
                 os.replace(VAULT / rel, _unique(vtrash / Path(rel).name))
@@ -2374,7 +2508,7 @@ def _channel_note_plan(cdir, meta, homes=None, extra=()):
     if cur.casefold() == dest.casefold():
         return None
     new = f"{dest}/{rel.rsplit('/', 1)[-1]}"
-    if (VAULT / new).exists() or f"<!-- reels-hub:channel={cdir.name} -->" not in read_text(VAULT / rel):
+    if (VAULT / new).exists() or not has_channel_marker(read_text(VAULT / rel), cdir.name):
         return None
     return (rel, new)
 
@@ -4322,6 +4456,10 @@ def _run_job(urls, max_shots, redo, flags, target, share, done, job=JOB):
     if cookies.exists():
         cmd += ["--cookies", str(cookies)]
         job["log"].append("-- using cookies.txt for sites that need login")
+    if disk_hash() != CODE_HASH:            # files replaced while the app runs (R-41): say so, the run still goes
+        job["log"].append(f"-- Reels Hub was updated on disk while it runs ({VERSION} in memory, files now "
+                          f"{disk_hash()}): close this black window and start Reels Hub again, so the server, "
+                          f"the page and the pipeline are the same version")
     cmd += urls
     channels = set()                        # transcripts run: channels whose own note is written at the end
     blocked = None
@@ -4377,7 +4515,7 @@ def _run_job(urls, max_shots, redo, flags, target, share, done, job=JOB):
                 pass
         for key in sorted(channels):                   # the channel notes list every video, so once at the end
             try:
-                rel = channel_note(key)
+                rel = channel_note(key, strict=True)
                 if rel:
                     job["log"].append(f"-- channel note: {rel}")
             except Exception as e:
@@ -4479,7 +4617,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
         elif path == "/api/ping":                     # the page's heartbeat (status "Connected to this PC")
-            self.send_json({"ok": True, "boot": BOOT})
+            self.send_json({"ok": True, "boot": BOOT, **version_info()})   # + which version runs (R-41)
         elif path == "/api/config":
             self.send_json(config_info())
         elif path == "/api/reels/count":
@@ -5101,6 +5239,8 @@ video.seekflash{animation:seekflash 1s}
 .cbtns{display:flex;gap:8px;justify-content:flex-end}
 #toast{position:fixed;left:50%;top:70px;transform:translateX(-50%);background:var(--accent);color:var(--accent-ink);font-weight:600;padding:7px 14px;border-radius:10px;opacity:0;pointer-events:none;transition:opacity .2s;z-index:70;max-width:calc(100vw - 32px);text-align:center}
 #toast.show{opacity:1}
+#verbar{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);z-index:71;max-width:calc(100vw - 32px);background:var(--warn);color:#000;font-weight:600;padding:8px 14px;border-radius:10px;display:flex;gap:10px;align-items:center;box-shadow:0 2px 10px rgba(0,0,0,.3)}
+#verbar[hidden]{display:none}
 #dragghost{position:fixed;top:-100px;left:-100px;background:var(--accent);color:var(--accent-ink);font-weight:700;padding:5px 12px;border-radius:14px;font-size:13px}
 .gcard:hover,.gcard:focus{background:var(--panel);border-color:var(--line);outline:none}
 .gcard.active{border-color:#2f5551;background:#1a2423}
@@ -5378,6 +5518,7 @@ body:has(#bulkbar.show) #log{bottom:84px}
   <button class="btn small" id="bulkclear">Clear</button>
 </div>
 <div id="toast"></div>
+<div id="verbar" role="alert" hidden><span id="vertext"></span><button class="btn" id="verreload" hidden>Reload</button></div>
 <div id="editor">
   <div class="edbar">
     <div class="edgrp" id="edtools">
@@ -5576,11 +5717,24 @@ function setConn(up){
   if (!up) pingSoon(2000);
 }
 function pingSoon(ms){ clearTimeout(connTimer); connTimer = setTimeout(ping, ms); }
+const PAGE_VERSION = "@@VERSION@@";        // the version that made this page (audit R-41)
+function checkVersion(j){                  // the server's version, from /api/ping
+  if (!j || !j.version) return;
+  const old = j.version !== PAGE_VERSION;
+  const msg = j.updated ? "Reels Hub was updated on this PC while it runs: close its black window and start Reels Hub again."
+            : old ? "Reels Hub was updated: reload this page." : "";
+  $("#vertext").textContent = msg;
+  $("#verreload").hidden = !old || !!j.updated;
+  $("#verbar").hidden = !msg;
+}
 async function ping(){                     // heartbeat: every 5 s, every 2 s while the server does not answer
   if (connBusy) return;
   connBusy = true;
   const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), 10000);
-  try { await fetch("/api/ping", {cache: "no-store", signal: ctl.signal}); setConn(true); }
+  try {
+    const res = await fetch("/api/ping", {cache: "no-store", signal: ctl.signal}); setConn(true);
+    res.json().then(checkVersion).catch(() => {});
+  }
   catch (e) { setConn(false); }
   finally { clearTimeout(t); connBusy = false; }
   pingSoon(connUp ? 5000 : 2000);
@@ -6938,6 +7092,7 @@ document.addEventListener("click", async e => {
     case "stlibsync": return libSyncNow();
     case "stlibdel": return libRemove();
     case "setbtn": return openSetup(false);
+    case "verreload": return location.reload();
     case "stcancel": return $("#setup").classList.remove("show");
     case "stsave": return saveSetup();
     case "slprev": return stepSlide(-1);
@@ -7917,7 +8072,8 @@ async function openSetup(first){
   $("#stlib").checked = !!cl.library; libLast = c.online || {}; libText(libLast);
   $("#stcancel").hidden = first; $("#stcancel").textContent = "Cancel"; $("#stsave").textContent = first ? "Save and start" : "Save";
   $("#sterr").hidden = true; $("#sterr").className = "sterr";
-  $("#stpath").textContent = "Saved on this computer in " + c.path + (c.overrides.length ? " · started with --" + c.overrides.join(" --") + ", which overrides these" : "");
+  $("#stpath").textContent = "Saved on this computer in " + c.path + (c.overrides.length ? " · started with --" + c.overrides.join(" --") + ", which overrides these" : "")
+    + (c.version ? " · Reels Hub " + c.version + (c.updated ? " (the files on disk are newer: " + c.files + ", start Reels Hub again)" : "") : "");
   $("#setup").classList.add("show");
   setTimeout(() => (first && !cfg.name ? $("#stname") : $("#stsave")).focus(), 0);
 }
@@ -7955,7 +8111,7 @@ async function saveSetup(){
 </body>
 </html>
 """
-PAGE = PAGE.replace("@@ICON@@", ICON_BODY)
+PAGE = PAGE.replace("@@ICON@@", ICON_BODY).replace("@@VERSION@@", VERSION)
 
 
 def main():
@@ -7987,7 +8143,7 @@ def main():
         print(f"Port {args.port} is busy - Reels Hub is probably already running. Opening it.")
         webbrowser.open(url)
         return
-    print(f"Reels Hub running at {url}  (reels folder: {OUT})\nPress Ctrl+C to stop.")
+    print(f"Reels Hub {VERSION} running at {url}  (reels folder: {OUT})\nPress Ctrl+C to stop.")
     if cfg:
         n = queue_restore()
         if n:

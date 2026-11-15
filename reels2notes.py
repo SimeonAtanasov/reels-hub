@@ -1749,11 +1749,17 @@ class RunRecord:
         self.cdir.mkdir(parents=True, exist_ok=True)
         f = self.cdir / "_channel.json"
         try:
-            meta = json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
+            raw = f.read_text(encoding="utf-8") if f.exists() else ""
+            meta = json.loads(raw) if raw.strip() else {}       # empty (left by a crash): made again
             if not isinstance(meta, dict):
-                meta = {}
-        except (OSError, ValueError):
-            meta = {}
+                raise ValueError("not an object")
+        except (OSError, ValueError) as e:
+            # a file that is there but cannot be read is never written over: it may hold the channel note's place
+            # (note_path). This save is skipped and tried again after the next video (audit R-02).
+            if not getattr(self, "_unreadable", False):
+                print(f"  ({f.name} cannot be read ({e}); not changing it, the run goes on)")
+                self._unreadable = True
+            return
         if not meta.get("key"):
             d, u = self.data, self.rec["url"]
             plat = platform_of(u, d)
