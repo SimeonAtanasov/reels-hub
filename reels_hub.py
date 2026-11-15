@@ -66,12 +66,122 @@ def person_id(name):
     return re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")[:40] or "me"
 
 
+CONFIG_PREV = "config.prev.json"             # the settings one change before (audit R-16), next to config.json
+
+
+def _config_usable(raw):
+    """The settings from a config file's bytes; ValueError when it is not the app's (cut off, empty, no name or folder)."""
+    c = _json_dict(raw)
+    if not (c.get("name") and c.get("out")):
+        raise ValueError("no name or reels folder in it")
+    return c
+
+
 def load_config():
+    """This laptop's settings; {} only when there are none yet. A config.json that is there but can't be used is
+    never taken for a first start (audit R-16: the Welcome box was shown and its Save wrote a new file without the
+    Cloudflare address, the Client ID and the Client Secret, which Cloudflare shows only once): _config_unreadable."""
+    p = config_path()
+    for i in range(5):
+        try:
+            raw = p.read_bytes()
+            break
+        except (FileNotFoundError, NotADirectoryError):
+            return {}
+        except OSError as e:                      # open elsewhere for a moment (an antivirus, a sync client)
+            if i == 4:
+                file_note("config", f"config.json (this laptop's settings) can't be opened ({e}). Nothing was changed: close"
+                                    " Reels Hub's black window and start it again.", bad=True)
+                return {}
+            time.sleep(0.2)
     try:
-        c = json.loads(config_path().read_text(encoding="utf-8"))
-        return c if isinstance(c, dict) and c.get("name") and c.get("out") else {}
-    except (OSError, ValueError):
+        return _config_usable(raw)
+    except ValueError as e:
+        return _config_unreadable(p, e)
+
+
+def _config_unreadable(p, err):
+    """config.json can't be used: it is kept as config.broken-<time>.json (never deleted or written over). With a good
+    copy from one change before (config.prev.json) the settings come from that; otherwise the app asks for them
+    again, and says why (config_lost)."""
+    with CONFIG_LOCK:
+        try:
+            ptext = p.with_name(CONFIG_PREV).read_bytes()
+            prev = _config_usable(ptext)
+        except (OSError, ValueError):
+            prev = None
+        try:
+            name = keep_broken(p, move=True)
+        except OSError as e:
+            file_note("config", f"config.json (this laptop's settings) can't be read ({err}) and could not be set aside ({e})."
+                                f" Nothing was changed: look at {p}.", bad=True)
+            return {}
+        if prev is not None:
+            try:
+                atomic_write_bytes(p, ptext)
+                file_note("config", f"config.json (this laptop's settings) could not be read ({err}). It is kept as {name} in "
+                                    f"{p.parent}, and the settings come from the copy of one change before ({CONFIG_PREV}): "
+                                    "open Settings and check them.")
+                return prev
+            except OSError as e:
+                print(f"  {CONFIG_PREV} could not be put in place of config.json ({e})")
+        file_note("config", f"config.json (this laptop's settings) could not be read ({err}), and there is no copy from "
+                            f"before. It is kept as {name} in {p.parent}. Reels Hub asks for your settings again: enter "
+                            "the same reels folder and vault as before.", bad=True)
         return {}
+
+
+def config_lost():
+    """Not set up, yet an unreadable config.json was set aside here before: the name of the newest such file, for
+    the Welcome box (it then says so, and suggests no folders). "" on a real first start."""
+    if CONFIG.get("name"):
+        return ""
+    try:
+        kept = sorted(config_path().parent.glob("config.broken-*.json"), key=lambda f: f.stat().st_mtime)
+        return kept[-1].name if kept else ""
+    except OSError:
+        return ""
+
+
+def seed_prev():
+    """App start: config.json and _categories.json get their copy from before even if nothing changes them for
+    months (config.json is written only by Settings and when the inbox's answer changes). Only where there is no
+    copy yet and the file itself reads fine: a copy that is there is never replaced here."""
+    if not CONFIG.get("name"):
+        return
+    for f, prev, good in ((config_path(), CONFIG_PREV, _config_usable), (cats_file(), CATS_PREV, _json_dict)):
+        try:
+            if f.is_file() and not f.with_name(prev).exists():
+                raw = f.read_bytes()
+                good(raw)
+                atomic_write_bytes(f.with_name(prev), raw)
+        except ValueError:
+            pass                                    # unreadable: its own reader deals with it
+        except OSError as e:
+            print(f"  {prev} could not be made at start ({e})")
+
+
+def _config_write(cfg):
+    """config.json, forced onto the disk (R-17). The file as it was goes to config.prev.json first, so one bad write
+    or hand edit does not cost the Cloudflare token (it holds the Client Secret a second time, in the same folder:
+    Simeon's yes of 2026-11-15). A config.json that can't be used is set aside, never written over. Call with
+    CONFIG_LOCK held."""
+    p = config_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        cur = p.read_bytes()
+    except OSError:
+        cur = None
+    if cur is not None:
+        try:
+            _config_usable(cur)
+            atomic_write_bytes(p.with_name(CONFIG_PREV), cur)
+        except ValueError:
+            keep_broken(p, move=True)
+        except OSError as e:
+            print(f"  {CONFIG_PREV} could not be written ({e})")
+    atomic_write(p, json.dumps(cfg, indent=1, ensure_ascii=False))
+    FILE_NOTES.pop("config", None)
 
 
 def apply_config(cfg):
@@ -121,9 +231,7 @@ def save_config(body):
             cfg["can_delete"] = old["can_delete"]        # set by the Cloudflare inbox (PEOPLE), not by this form
         if cloud:
             cfg["cloud"] = cloud
-        p = config_path()
-        p.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write(p, json.dumps(cfg, indent=1, ensure_ascii=False))
+        _config_write(cfg)
         apply_config(cfg)
     MISS.clear()
     test = None
@@ -190,6 +298,7 @@ def public_config():
 
 def config_info():
     return {"configured": bool(CONFIG.get("name")), "config": public_config(), "defaults": default_config(),
+            "lost": config_lost(),                # an unreadable config.json was set aside: the Welcome box says so
             "path": str(config_path()), "effective": {"out": str(OUT), "vault": str(VAULT) if vault_ok() else ""},
             "overrides": sorted(OVERRIDES), "online": lib_public(), **version_info()}
 
@@ -380,19 +489,33 @@ def busy_check(rid):
         raise ValueError("This video is being processed - wait until the run finishes")
 
 
-def atomic_write(path, text, durable=False):
+def atomic_write(path, text, durable=True):
     """Write a file so readers never see it half-written (temp file + rename, retried while Windows has it open).
-    durable: the bytes are forced onto the disk before the rename, so a crash or power cut right after cannot
-    leave an empty or broken file (used for the waiting line, 2026-11-11)."""
-    path = Path(path)
+    durable: the bytes are forced onto the disk before the rename (flush + fsync), so a crash or power cut right
+    after cannot leave an empty or broken file. First only the waiting line (2026-11-11); since 2026-11-15 every
+    file the app writes (audit R-17): hub.json, note.md, vault notes, _categories.json, _channel.json, config.json."""
+    _write_then_replace(Path(path), text, durable)
+
+
+def atomic_write_bytes(path, raw, durable=True):
+    """Like atomic_write, for bytes (an image, a copy of a file)."""
+    _write_then_replace(Path(path), raw, durable)
+
+
+def _write_then_replace(path, data, durable):
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    if durable:
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(text)
-            fh.flush()
-            os.fsync(fh.fileno())
-    else:
-        tmp.write_text(text, encoding="utf-8")
+    try:
+        with (open(tmp, "wb") if isinstance(data, bytes) else open(tmp, "w", encoding="utf-8")) as fh:
+            fh.write(data)
+            if durable:
+                fh.flush()
+                os.fsync(fh.fileno())
+    except OSError:                               # e.g. a full disk: no empty temp file stays behind
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
     for i in range(40):
         try:
             os.replace(tmp, path)
@@ -404,6 +527,118 @@ def atomic_write(path, text, durable=False):
     except OSError:
         pass
     raise PermissionError(f"could not write {path.name} (open in another program?)")
+
+
+# ---------------------------------------------------------------- unreadable files (audit R-05, R-06, R-16)
+# "Unreadable" is not "empty". A hub.json, _categories.json or config.json that is there but is not what the app
+# wrote (cut off, empty, a typo from a hand edit, another shape) is never taken for "nothing here yet", never
+# deleted and never written over: it is kept next to the original as <name>.broken-<time>.json. _categories.json
+# and config.json also have a copy from one change before (<name>.prev.json), which then takes the file's place;
+# without a usable copy, and always for hub.json, the file stays where it is and every change that would write it
+# is refused with a message, until it is repaired or moved away by hand.
+KEPT = {}                                    # an unreadable file -> ((time, size), its .broken copy): one copy, not one per look
+FILE_NOTES = {}                              # what the page must say about the app's own files: key -> {id, text, bad}
+
+
+def _json_dict(raw):
+    """A JSON object from a file's bytes (a UTF-8 BOM, as Notepad writes it, is fine); ValueError for anything else."""
+    d = json.loads(raw.decode("utf-8-sig", errors="replace"))
+    if not isinstance(d, dict):
+        raise ValueError("not a JSON object")
+    return d
+
+
+def broken_name(path):
+    """A free name next to path: <name>.broken-<YYYYmmdd-HHMMSS>[-k].json."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    cand, k = path.with_name(f"{path.stem}.broken-{stamp}{path.suffix}"), 2
+    while cand.exists():
+        cand, k = path.with_name(f"{path.stem}.broken-{stamp}-{k}{path.suffix}"), k + 1
+    return cand
+
+
+def keep_broken(path, move=False):
+    """Keep an unreadable file as <name>.broken-<time>.json next to it and return that name ("" if it could not be
+    kept). move: rename it there (the caller puts a good file in its place). Otherwise the file stays where it is
+    and gets one copy; a second look at the same bytes makes no second copy."""
+    path = Path(path)
+    if move:
+        dest = broken_name(path)
+        os.replace(path, dest)
+        KEPT.pop(str(path), None)
+        return dest.name
+    try:
+        st, raw = path.stat(), path.read_bytes()
+        sig, hit = (st.st_mtime_ns, st.st_size), KEPT.get(str(path))
+        if hit and hit[0] == sig and path.with_name(hit[1]).is_file():
+            return hit[1]
+        name = ""
+        for old in sorted(path.parent.glob(f"{path.stem}.broken-*{path.suffix}")):
+            if old.stat().st_size == len(raw) and old.read_bytes() == raw:
+                name = old.name
+                break
+        if not name:
+            dest = broken_name(path)
+            atomic_write_bytes(dest, raw)
+            name = dest.name
+        KEPT[str(path)] = (sig, name)
+        return name
+    except OSError as e:
+        print(f"  {path.name} can't be read, and no copy of it could be kept ({e})")
+        return ""
+
+
+def file_note(key, text, bad=False):
+    """Tell the user in the black window and on the page (the bar at the bottom, sent with /api/ping). bad: it stays
+    until the file is in order again; otherwise OK on the page takes it away."""
+    FILE_NOTES[key] = {"id": f"{key}-{time.time():.0f}", "text": text, "bad": bool(bad)}
+    print("  " + text, flush=True)
+
+
+def file_note_ok(nid):
+    """OK pressed on the page: a note that is only a notice goes."""
+    for k, v in list(FILE_NOTES.items()):
+        if v["id"] == nid and not v["bad"]:
+            FILE_NOTES.pop(k, None)
+    return {"files": list(FILE_NOTES.values())}
+
+
+TMP_RE = re.compile(r"\.[^/\\]+?(\.\d+){1,2}\.tmp")     # a write's own temp file: .<name>.<process>.<thread>.tmp
+TMP_AGE = 86400                              # seconds: only what is older than a day goes (never a write in progress)
+
+
+def clean_tmp():
+    """App start, in the background (audit R-17; removing them is Simeon's yes of 2026-11-15): a write that is cut
+    off (a crash, a power cut, a full disk) leaves its temp file behind, and nothing took those away. Only files
+    named .<name>.<numbers>.tmp, older than a day, in the folders the app writes to: the settings folder, the reels
+    folder with the video folders, _transcripts and _inbox one level each, and the vault's platform folders."""
+    limit, gone = time.time() - TMP_AGE, []
+
+    def look(d, depth):
+        try:
+            entries = list(os.scandir(d))
+        except OSError:
+            return
+        for e in entries:
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    if depth > 0 and not e.name.startswith(".") and e.name not in ("_trash", "_tmp"):
+                        look(e.path, depth - 1)
+                elif TMP_RE.fullmatch(e.name) and e.is_file(follow_symlinks=False) and e.stat().st_mtime < limit:
+                    os.unlink(e.path)
+                    gone.append(e.path)
+            except OSError:
+                pass
+    look(config_path().parent, 0)
+    if CONFIG.get("name"):                        # not before the first start has said where the folders are
+        look(OUT, 3)                              # <reel>/, _transcripts/<channel>/<video>/, _inbox/<share>/
+        if vault_ok():
+            for d in PLATFORM_DIRS:
+                look(VAULT / d, 4)                # <platform>/<category>/<channel>/ and one more
+    if gone:
+        print(f"  removed {len(gone)} left-over temp file(s) of earlier writes that were cut off (older than a day),"
+              f" e.g. {gone[0]}", flush=True)
+    return gone
 
 
 def read_text(path):
@@ -488,6 +723,7 @@ def parse_note(folder):
     generic = (not title or title.startswith("Video by") or title.startswith("Post by")
                or title in folder.name or platform == "X")
     label = ((caption.splitlines()[0] if caption else title) if generic else title)[:80]
+    state = read_state(folder)
     times = shot_times(folder, shots)
     shots = sorted(shots, key=lambda x: (times[x], x))       # time order (manual snapshots slot in between)
     return {
@@ -507,7 +743,9 @@ def parse_note(folder):
         "slides": read_slides(folder),
         "added": _added(folder),
         "owner": meta.get("owner", "") or CONFIG.get("person", ""),
-        "state": read_state(folder),
+        "state": state,
+        # unreadable hub.json (R-05): the page shows a banner on this video and pauses its controls
+        **({"bad_hub": {"folder": str(folder), "copy": keep_broken(folder / "hub.json")}} if state.get("_bad") else {}),
     }
 
 
@@ -590,16 +828,45 @@ def shot_times(folder, shots):
     return {s: float(saved.get(s, i * 2)) for i, s in enumerate(shots)}
 
 
+def _hub_read(folder):
+    """(hub.json as a dict, bad). bad: the file is there and is not the JSON object the app wrote: cut off, empty
+    (what a crash can leave), a typo from a hand edit, another shape. Never the same as "no hub.json yet"."""
+    try:
+        raw = (Path(folder) / "hub.json").read_bytes()
+    except (FileNotFoundError, NotADirectoryError):
+        return {}, False
+    except OSError:
+        return {}, True
+    try:
+        return _json_dict(raw), False
+    except ValueError:
+        return {}, True
+
+
+def hub_bad_text(folder, copy=""):
+    return (f"hub.json of this video can't be read: nothing was changed. It is in {folder}"
+            + (f" (a copy is kept as {copy})" if copy else "") + ". Repair that file, or move it out of the folder to"
+            " start this video again without its favorites, category and tags; then reload the page.")
+
+
+def _hub_ok(folder):
+    """hub.json as a dict, for a change that ends in writing it again. Raises when the file is there and can't be
+    read (audit R-05): its bytes may still hold the favorites, the corrected texts and the note's place, so nothing
+    writes over it. A copy is kept next to it first."""
+    st, bad = _hub_read(folder)
+    if bad:
+        raise ValueError(hub_bad_text(folder, keep_broken(Path(folder) / "hub.json")))
+    return st
+
+
+def _hub_write(folder, st):
+    """The one place a hub.json is written (reels and transcript folders): never over an unreadable one."""
+    _hub_ok(folder)
+    atomic_write(Path(folder) / "hub.json", json.dumps(st, indent=1, ensure_ascii=False))
+
+
 def read_state(folder):
-    s, bad = {}, False
-    f = folder / "hub.json"
-    if f.exists():
-        try:
-            s = json.loads(read_text(f))
-            if not isinstance(s, dict):
-                s, bad = {}, True
-        except (ValueError, OSError):
-            s, bad = {}, True                     # unreadable: never treat it as "no note yet"
+    s, bad = _hub_read(folder)                    # bad = unreadable: never treat it as "no note yet"
     out = {"category": s.get("category", "") or "", "favorites": s.get("favorites", []) or [],
            "note_name": s.get("note_name", "") or "", "note_path": s.get("note_path", "") or "", "sent": s.get("sent", "") or "",
            # sharing: who shared this video with you {person, name, at}; whom you shared it with [{to, name, at}]
@@ -614,7 +881,7 @@ def read_state(folder):
 
 def write_state(folder, state):
     state = {k: v for k, v in state.items() if not k.startswith("_") and not (k in ("shared_by", "shared", "tags", "tag_tokens", "cat_tag", "creator_tag") and not v)}
-    atomic_write(folder / "hub.json", json.dumps(state, indent=1, ensure_ascii=False))
+    _hub_write(folder, state)
 
 
 LIST_COND = threading.Condition()
@@ -749,7 +1016,7 @@ def find_vault_note(folder, r, state):
         old = f"{vault_dir(r['platform'])}/{state['note_name']}.md"
         if (VAULT / old).is_file():
             return old
-    if not (rel or state["note_name"]):
+    if not (rel or state["note_name"]) and not _lost_hub(folder):
         return None                                         # never created: nothing to look for
     if time.time() - MISS.get(r["id"], 0) < 1800:        # a full vault scan is costly on OneDrive
         return None
@@ -790,12 +1057,22 @@ def _vault_index(max_age=VIDX_AGE):
         return idx
 
 
-def _needs_search(r, state):
+def _lost_hub(folder):
+    """This video's hub.json could not be read once (a hub.broken-<time>.json is next to it) and has been moved away
+    or made again by hand since, so the note's place is no longer known: the note is looked for by its id marker
+    before a new one is made (audit R-05: no second note for one video)."""
+    try:
+        return any(Path(folder).glob("hub.broken-*.json"))
+    except OSError:
+        return False
+
+
+def _needs_search(r, state, folder=None):
     """The note is not where hub.json says and was not looked for in the last 30 minutes."""
     rel = state.get("note_path") or ""
     if rel and (VAULT / rel).is_file():
         return False
-    if not (rel or state.get("note_name")):
+    if not (rel or state.get("note_name")) and not (folder and _lost_hub(folder)):
         return False
     return time.time() - MISS.get(r["id"], 0) >= 1800
 
@@ -811,7 +1088,7 @@ def ensure_vault_note(folder, r):
     if not vault_ok():
         return {"error": f"Vault not found: {VAULT}"}
     try:
-        if _needs_search(r, read_state(folder)):
+        if _needs_search(r, read_state(folder), folder):
             _vault_index()                          # the slow part, before DATA_LOCK, so other requests go on
     except Exception as e:
         print(f"  vault search: {e}")
@@ -827,6 +1104,8 @@ def _ensure_vault_note(folder, r):
     if not rel:
         if state.get("note_path") or state["note_name"]:
             return {"missing": True, "error": "Obsidian note not found (deleted?) - Send to Obsidian creates a new one"}
+        if _lost_hub(folder) and len([h for h in VIDX["map"].get(r["id"], []) if (VAULT / h).is_file()]) > 1:
+            return {"error": "More than one note in the vault carries this video's id - not making another"}
         with INBOX_LOCK:
             waiting = folder.name in INBOX["partial"].values()       # downloaded, fill-in to be tried again
         if waiting or (JOB["running"] and JOB.get("share") and r.get("url") in (JOB.get("urls") or [])):
@@ -940,6 +1219,7 @@ def send_to_obsidian(reel_id):
     r = parse_note(folder)
     if not r:
         raise ValueError("unknown reel")
+    _hub_ok(folder)                                           # unreadable hub.json: nothing is sent or changed (R-05)
     info = ensure_vault_note(folder, r)
     if info.get("missing"):                                   # note was deleted: make a fresh one
         with DATA_LOCK:
@@ -1099,12 +1379,9 @@ def tr_dir(key, rid):
 
 
 def _hub(folder):
-    """hub.json as it is (a transcript folder's note_path, note_name, full)."""
-    try:
-        d = json.loads(read_text(folder / "hub.json"))
-        return d if isinstance(d, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    """hub.json as it is (a transcript folder's note_path, note_name, full); {} when there is none or it can't be
+    read. For reading only: a change goes through _hub_ok, which tells the two apart."""
+    return _hub_read(folder)[0]
 
 
 CH_META = {}                                # str(cdir) -> (mtime, _channel.json as a dict): read once per change
@@ -1272,9 +1549,7 @@ def _tr_set_category(folder, cat, prev=None, refresh=True):
     line (the tag the app set before is taken out) plus the **Category** line where the note has one; then the note
     moves to <platform>/<category>/ (move_note)."""
     with DATA_LOCK:
-        st = _hub(folder)
-        if not st and (folder / "hub.json").is_file() and read_text(folder / "hub.json").strip():
-            raise ValueError(f"{folder.name}/hub.json can't be read - not changing it")
+        st = _hub_ok(folder)                       # unreadable (also empty): refused, nothing changes (R-05)
         old_cat = str(st.get("category") or "") if prev is None else prev
         st["category"] = cat
         tag = ("#" + re.sub(r"[^0-9A-Za-z]+", "", cat.title())) if cat else ""
@@ -1292,7 +1567,7 @@ def _tr_set_category(folder, cat, prev=None, refresh=True):
                 if new != text:
                     atomic_write(VAULT / rel, new)
         st["cat_tag"] = tag
-        atomic_write(folder / "hub.json", json.dumps(st, indent=1, ensure_ascii=False))
+        _hub_write(folder, st)
         TR_CACHE.pop(str(folder), None)
         try:
             move_note(folder, cat, extra=[old_cat], refresh=refresh)
@@ -1421,7 +1696,7 @@ def move_note(folder, cat, extra=(), refresh=True):
         (VAULT / new).parent.mkdir(parents=True, exist_ok=True)
         _move_file(VAULT / old, VAULT / new)
         st = _hub(folder); st["note_path"] = new; st["note_name"] = Path(new).stem
-        atomic_write(folder / "hub.json", json.dumps(st, indent=1, ensure_ascii=False))
+        _hub_write(folder, st)
         TR_CACHE.pop(str(folder), None)
         keys = set()
         root = OUT / TR_DIR                      # the same video's transcript folder points to the same note
@@ -1432,7 +1707,7 @@ def move_note(folder, cat, extra=(), refresh=True):
                     h = _hub(rec)
                     if h.get("note_path") == old:
                         h["note_path"] = new; h["note_name"] = Path(new).stem
-                        atomic_write(rec / "hub.json", json.dumps(h, indent=1, ensure_ascii=False))
+                        _hub_write(rec, h)
                         TR_CACHE.pop(str(rec), None)
                     if rec == folder or h.get("note_path") == new:
                         keys.add(cdir.name)
@@ -1453,6 +1728,7 @@ def sort_notes(dry=False):
         raise ValueError("Wait for the current run (and the ones waiting) to finish")
     if not vault_ok():
         raise ValueError("No Obsidian vault set (Settings)")
+    cats_need()                                    # with the lists unreadable every note would leave its category folder
     folders = [f for f in OUT.iterdir() if f.is_dir() and not f.name.startswith((".", "_")) and (f / "note.md").is_file()]
     root = OUT / TR_DIR
     if root.is_dir():
@@ -1508,6 +1784,7 @@ def sort_notes(dry=False):
 
 def tr_set_category(key, rid, cat):
     cat = str(cat or "")[:100]
+    cats_need()
     if cat and cat not in read_cats():
         raise ValueError("No such category")
     return {"category": _tr_set_category(tr_dir(key, rid), cat)}
@@ -1550,14 +1827,12 @@ def write_tags(tags):
     raw = _cats_raw()
     raw.setdefault("categories", read_cats())
     raw["tags"] = _clean_tags(tags, limit=None)
-    atomic_write(cats_file(), json.dumps(raw, indent=1, ensure_ascii=False))
+    _cats_write(raw)
 
 
 def _write_item_tags(folder, tags):
     """hub.json "tags" and the note's Tags line. Caller holds DATA_LOCK."""
-    st = _hub(folder)
-    if not st and (folder / "hub.json").is_file() and read_text(folder / "hub.json").strip():
-        raise ValueError(f"{folder.name}/hub.json can't be read - not changing it")
+    st = _hub_ok(folder)                           # unreadable (also empty): refused, nothing changes (R-05)
     tags = _clean_tags(tags)
     old = [t for t in st.get("tag_tokens") or [] if isinstance(t, str)]
     want = [t for t in dict.fromkeys(_tag_tok(x) for x in tags) if t]
@@ -1575,7 +1850,7 @@ def _write_item_tags(folder, tags):
     st["tags"], st["tag_tokens"] = tags, want
     if not tags:
         st.pop("tags"); st.pop("tag_tokens")
-    atomic_write(folder / "hub.json", json.dumps(st, indent=1, ensure_ascii=False))
+    _hub_write(folder, st)
     TR_CACHE.pop(str(folder), None)
     return tags
 
@@ -1591,6 +1866,8 @@ def set_tags(body):
         busy_check(folder.name)
     tags = _clean_tags(body.get("tags"))
     with DATA_LOCK:
+        _hub_ok(folder)                               # before a new tag joins the list (R-05)
+        cats_need()
         known = read_tags()
         low = {t.lower(): t for t in known}
         tags = [low.get(t.lower(), t) for t in tags]          # same spelling as the list
@@ -1637,12 +1914,8 @@ def _creator_tok(key):
 def _set_creator_tag(folder, write=True):
     """Put the creator token on the note's Tags line. Caller holds DATA_LOCK. Returns added | same | a reason it
     was left alone (no creator, no note, not the app's note, no Tags line, unreadable hub.json)."""
-    hp = folder / "hub.json"
-    try:
-        st = json.loads(read_text(hp)) if hp.is_file() else {}
-        if not isinstance(st, dict):
-            return "unreadable hub.json"
-    except (ValueError, OSError):
+    st, bad = _hub_read(folder)
+    if bad:
         return "unreadable hub.json"
     want = _creator_tok(_creator_key(folder))
     if not want:
@@ -1669,7 +1942,7 @@ def _set_creator_tag(folder, write=True):
     if line_changes:
         atomic_write(VAULT / rel, text[:m.start()] + "**Tags**: " + " ".join(parts) + text[m.end():])
     st["creator_tag"] = want
-    atomic_write(hp, json.dumps(st, indent=1, ensure_ascii=False))
+    _hub_write(folder, st)
     TR_CACHE.pop(str(folder), None)
     return "added" if line_changes else "same"
 
@@ -1737,6 +2010,7 @@ def change_tags(body):
     if not name:
         raise ValueError("Tag name is empty")
     with DATA_LOCK:
+        cats_need()
         tags = read_tags()
         low = [t.lower() for t in tags]
         if action == "add":
@@ -1916,7 +2190,10 @@ def transcript_note(folder, from_channel):
         r = parse_note(folder)
         if not r:
             return {"error": "no note.md"}
-        st = _hub(folder)
+        st, bad = _hub_read(folder)
+        if bad:                                     # its note's place may be in there: no second note (R-05)
+            keep_broken(folder / "hub.json")
+            return {"error": "hub.json is unreadable - not touching the Obsidian note"}
         rel = st.get("note_path") or ""
         if rel and (VAULT / rel).is_file():
             return {"name": Path(rel).stem, "path": rel, "uri": obsidian_uri(rel)}
@@ -1935,7 +2212,7 @@ def transcript_note(folder, from_channel):
             if has_marker(read_text(VAULT / rel), folder.name):   # this video's note from before (its channel was
                 st.update(note_path=rel, note_name=name,          # removed and run again): kept, not made twice (R-02)
                           **{"from": "channel" if from_channel else "link"})
-                atomic_write(folder / "hub.json", json.dumps(st, indent=1, ensure_ascii=False))
+                _hub_write(folder, st)
                 return {"name": name, "path": rel, "uri": obsidian_uri(rel)}
             name = f"{base} ({k})"; k += 1
         rel = f"{dname}/{name}.md"
@@ -1944,7 +2221,7 @@ def transcript_note(folder, from_channel):
             vault_note_text(folder, r, read_state(folder), tonly={"label": label, "video": TR_VIDEO_LINE})
         atomic_write(VAULT / rel, text)
         st.update(note_path=rel, note_name=name, **{"from": "channel" if from_channel else "link"})
-        atomic_write(folder / "hub.json", json.dumps(st, indent=1, ensure_ascii=False))
+        _hub_write(folder, st)
         _new_note_creator(folder, rel)
         return {"name": name, "path": rel, "uri": obsidian_uri(rel)}
 
@@ -2054,7 +2331,7 @@ def _adopt_transcript_note(folder, r):
             atomic_write(VAULT / rel, text)
             print(f"  {rel}: the caption text was replaced by the full video's transcript")
         st["full"] = folder.name
-        atomic_write(rec / "hub.json", json.dumps(st, indent=1, ensure_ascii=False))
+        _hub_write(rec, st)
         TR_CACHE.pop(str(rec), None)
         # the category and tags you gave the transcript carry over to the video (instead of the channel's category
         # the download started with), with the note tokens that go with them, so the note stays where it is
@@ -2065,7 +2342,7 @@ def _adopt_transcript_note(folder, r):
             for k in ("tags", "tag_tokens", "cat_tag", "creator_tag"):
                 if st.get(k):
                     rh[k] = st[k]
-            atomic_write(folder / "hub.json", json.dumps(rh, indent=1, ensure_ascii=False))
+            _hub_write(folder, rh)
         try:
             channel_note(rec.parent.name)                   # the channel's list now says the video is here in full
         except Exception as e:
@@ -2264,6 +2541,8 @@ def save_state(reel_id, state):
                          "corrected": bool(f.get("corrected"))})
     with DATA_LOCK:
         old = read_state(folder)                     # keep server-owned fields (vault note name, last send, sharing)
+        if old.get("_bad"):                          # unreadable is not empty (R-05): refused, the file is kept
+            _hub_ok(folder)
         page_sb = state.get("shared_by")
         _share_guard(old, page_sb.get("at") if isinstance(page_sb, dict) else None)
         clean = {"category": str(state.get("category", ""))[:100], "favorites": favs,
@@ -2271,6 +2550,8 @@ def save_state(reel_id, state):
                  "shared_by": old["shared_by"], "shared": old["shared"],
                  "tags": old["tags"], "tag_tokens": old["tag_tokens"], "cat_tag": old["cat_tag"],
                  "creator_tag": old["creator_tag"]}
+        if clean["category"] != old["category"]:
+            cats_need()                              # the note's folder follows the category list (R-06)
         write_state(folder, clean)
         write_note_favorites(folder, favs)
         if clean["category"] != old["category"]:          # the note follows at once: tag, Category line, folder
@@ -2321,22 +2602,128 @@ def cats_file():
     return OUT / "_categories.json"
 
 
+CATS_PREV = "_categories.prev.json"         # the file one change before (audit R-06): used when _categories.json can't be read
+CATS = {"bad": None, "bad_raw": None, "good": b""}   # bad: {file, copy, why} while the file is unreadable and no copy helps
+CATS_LOCK = threading.RLock()               # taken after DATA_LOCK where both are held, never before it
+
+
 def read_cats():
-    f = cats_file()
-    if f.exists():
-        try:
-            return [c for c in json.loads(f.read_text(encoding="utf-8", errors="replace")).get("categories", []) if c]
-        except ValueError:
-            pass
-    return []
+    c = _cats_raw().get("categories")
+    return [x for x in c if x] if isinstance(c, list) else []
 
 
 def _cats_raw():
+    """_categories.json as a dict. No file = a new library = {}. A file that is there but can't be read (cut off,
+    empty, a list, a typo) is never taken for that (audit R-06: one start with such a file wrote an empty one over
+    the category list, its order, the tags and every channel's home): see _cats_unreadable. A UTF-8 BOM is fine."""
+    f = cats_file()
     try:
-        d = json.loads(read_text(cats_file())) if cats_file().exists() else {}
-        return d if isinstance(d, dict) else {}
-    except (OSError, ValueError):
+        raw = f.read_bytes()
+    except (FileNotFoundError, NotADirectoryError):
+        _cats_fine()
         return {}
+    except OSError:                                # open elsewhere for a moment: what was read last, for showing
+        try:
+            return _json_dict(CATS["good"])
+        except ValueError:
+            return {}
+    try:
+        d = _json_dict(raw)
+    except ValueError as e:
+        return _cats_unreadable(f, raw, e)
+    CATS["good"] = raw
+    _cats_fine()
+    return d
+
+
+def _cats_fine():
+    if CATS["bad"]:
+        CATS.update(bad=None, bad_raw=None)
+        if FILE_NOTES.get("cats", {}).get("bad"):
+            FILE_NOTES.pop("cats", None)
+
+
+def _cats_unreadable(f, raw, err):
+    """_categories.json can't be read. With a readable copy from one change before: the unreadable file is kept as
+    _categories.broken-<time>.json and the copy takes its place (your last change to the lists may be missing; each
+    video keeps its own category and tags). Without one: the file stays where it is, a copy of it is kept under
+    that name, the lists show empty and every change that needs them is refused (cats_need) until it is repaired."""
+    with CATS_LOCK:
+        try:
+            if f.read_bytes() != raw:               # another request has dealt with it meanwhile
+                return _json_dict(f.read_bytes())
+        except (OSError, ValueError):
+            return {}
+        if CATS["bad_raw"] == raw:
+            return {}
+        prev = f.with_name(CATS_PREV)
+        try:
+            ptext = prev.read_bytes()
+            pd = _json_dict(ptext)
+        except (OSError, ValueError):
+            pd = None
+        if pd is not None:
+            name = keep_broken(f)                   # its bytes are kept under the .broken name first; then the copy
+            if name:                                # from before takes its place in one step (no moment without a file)
+                try:
+                    atomic_write_bytes(f, ptext)
+                except OSError as e:
+                    print(f"  {f.name}: could not put the copy from before in its place ({e})")
+                    name = ""
+            if name:
+                CATS.update(bad=None, bad_raw=None, good=ptext)
+                file_note("cats", f"{f.name} (your categories, tags and channel homes) could not be read ({err}). It is kept as "
+                                  f"{name} in {f.parent}, and the lists come from the copy of one change before "
+                                  f"({CATS_PREV}): check that your last change to them is there.")
+                return pd
+        CATS.update(bad={"file": str(f), "copy": keep_broken(f), "why": str(err)}, bad_raw=raw)
+        file_note("cats", cats_bad_text(), bad=True)
+        return {}
+
+
+def cats_bad_text():
+    b = CATS["bad"] or {}
+    return (f"_categories.json (your categories, tags and channel homes) can't be read, and there is no copy from before"
+            f" to take its place. The lists show empty, and categories, tags and channel homes can't be changed until"
+            f" it is in order. The file is {b.get('file', cats_file())}" + (f" (a copy is kept as {b['copy']})" if b.get("copy") else "")
+            + ". Repair it, or move it away to start with empty lists (every video keeps its own category and tags);"
+              " then reload the page.")
+
+
+def cats_need():
+    """Before a change that rests on the category list, the tag list or the channel homes: refused while
+    _categories.json can't be read, so nothing is worked out from lists that only look empty (audit R-06)."""
+    _cats_raw()
+    if CATS["bad"]:
+        raise ValueError(cats_bad_text())
+
+
+def _cats_write(raw):
+    """The one place _categories.json is written: never over a file that can't be read; the file as it was goes to
+    _categories.prev.json first (one change before); both forced onto the disk (R-17)."""
+    with CATS_LOCK:
+        f = cats_file()
+        try:
+            cur = f.read_bytes()
+        except (FileNotFoundError, NotADirectoryError):
+            cur = None
+        except OSError as e:
+            raise ValueError(f"{f.name} can't be opened right now ({e}): nothing was changed, try again")
+        if cur is not None:
+            try:
+                _json_dict(cur)
+            except ValueError:
+                _cats_raw()                          # keeps it, takes the copy from before if there is one, says so
+                raise ValueError(cats_bad_text() if CATS["bad"] else
+                                 f"{f.name} could not be read and was put back from the copy of one change before: "
+                                 "nothing was changed, reload the page and try again")
+            try:
+                atomic_write_bytes(f.with_name(CATS_PREV), cur)
+            except OSError as e:                     # the copy is a help, never a reason to refuse the change
+                print(f"  {CATS_PREV} could not be written ({e})")
+        text = json.dumps(raw, indent=1, ensure_ascii=False)
+        atomic_write(f, text)
+        CATS["good"] = text.encode("utf-8")
 
 
 def write_cats(cats, channels=None):
@@ -2347,7 +2734,7 @@ def write_cats(cats, channels=None):
     raw.update(categories=cats, channels=ch, tags=read_tags())      # other keys (homes, homes_v1, ...) are kept
     if isinstance(raw.get("homes"), dict):                         # a channel's home that is gone: no home
         raw["homes"] = {k: v for k, v in raw["homes"].items() if v in cats}
-    atomic_write(cats_file(), json.dumps(raw, indent=1, ensure_ascii=False))
+    _cats_write(raw)
 
 
 def channel_cats():
@@ -2358,7 +2745,7 @@ def channel_cats():
     raw = _cats_raw()
     cats = read_cats()
     ch = [c for c in raw.get("channels") or [] if c in cats]
-    if raw.get("channels_checked"):
+    if raw.get("channels_checked") or CATS["bad"]:      # unreadable: nothing is worked out or written (R-06)
         return ch
     try:
         import reels2notes as r2n
@@ -2384,7 +2771,7 @@ def channel_cats():
         ch = list(dict.fromkeys(ch + [c for c in cats if c in found and c not in other]))
         with DATA_LOCK:
             raw = _cats_raw(); raw.update(categories=read_cats(), channels=ch, channels_checked=True)
-            atomic_write(cats_file(), json.dumps(raw, indent=1, ensure_ascii=False))
+            _cats_write(raw)
     except Exception as e:
         print(f"  channel categories not worked out: {e}")
     return ch
@@ -2446,7 +2833,7 @@ def _write_homes(homes):
     raw = _cats_raw()
     raw.setdefault("categories", read_cats())
     raw["homes"] = homes
-    atomic_write(cats_file(), json.dumps(raw, indent=1, ensure_ascii=False))
+    _cats_write(raw)
 
 
 def _in_tr(folder):
@@ -2537,6 +2924,7 @@ def set_channel_home(key, cat):
     cat = str(cat or "").strip()[:100]
     if not key or key.startswith(("_", ".")) or "/" in key or "\\" in key:
         raise ValueError("This channel is not known")
+    cats_need()
     if cat and cat not in read_cats():
         raise ValueError("No such category")
     with DATA_LOCK:
@@ -2585,7 +2973,7 @@ def start_homes():
         if HOMES["state"] in ("running", "done", "error"):
             return
         try:
-            if not OUT.is_dir() or not cats_file().exists() or _cats_raw().get("homes_v1") or line_busy():
+            if not OUT.is_dir() or not cats_file().exists() or _cats_raw().get("homes_v1") or CATS["bad"] or line_busy():
                 return
         except OSError:
             return
@@ -2606,7 +2994,7 @@ def ensure_homes():
     named after its channel: its videos go to Unassigned, where they show under their channel, and the category goes.
     A channel category you renamed, or one that holds videos of other channels too, stays as your own category; the
     channel it was named after (or its only channel) gets it as its home."""
-    if not OUT.is_dir() or not cats_file().exists() or _cats_raw().get("homes_v1"):
+    if not OUT.is_dir() or not cats_file().exists() or _cats_raw().get("homes_v1") or CATS["bad"]:
         return None
     if line_busy():
         return None                                 # a run may be writing categories: next time
@@ -2658,7 +3046,7 @@ def ensure_homes():
         _write_homes({**read_homes(), **{k: v for k, v in homes.items() if v in cats}})
         write_cats(cats, [])
         raw = _cats_raw(); raw["homes_v1"] = True
-        atomic_write(cats_file(), json.dumps(raw, indent=1, ensure_ascii=False))
+        _cats_write(raw)
     for f, c in sorted(stay, key=lambda x: _in_tr(x[0])):     # a channel at home in a kept category: its notes
         try:                                                    # into <platform>/<category>/<channel>/
             move_note(f, c, refresh=False)
@@ -2736,9 +3124,7 @@ def save_edit(reel_id, name, data_url):
         raise ValueError("image too large")
     with DATA_LOCK:
         _backup(p)
-        tmp = p.with_suffix(".tmp")
-        tmp.write_bytes(raw)
-        tmp.replace(p)
+        atomic_write_bytes(p, raw)                # an edited image is your work: forced onto the disk (R-17)
     return int(p.stat().st_mtime)
 
 
@@ -2780,6 +3166,8 @@ def delete_shots(reel_id, names, force=False):
         raise ValueError("bad snapshot list")
     with DATA_LOCK:
         st = read_state(folder)
+        if st.get("_bad"):                             # which snapshots are favorites is not known (R-05)
+            _hub_ok(folder)
         favs = {f["shot"] for f in st["favorites"]}
         if force:                                          # deleting favorites too: unstar them first
             drop = {str(n) for n in names} & favs
@@ -2868,6 +3256,7 @@ def change_cats(body):
     action = body.get("action")
     name = str(body.get("name", "")).strip()[:100]
     with DATA_LOCK:
+        cats_need()
         cats = read_cats()
         if action == "add":
             if not name:
@@ -3018,10 +3407,14 @@ def remember_cloud(info):
             return
         if (cfg["cloud"].get("id"), cfg["cloud"].get("url")) != (info.get("token"), info.get("inbox")):
             return
+        was = (cfg["cloud"].get("person"), cfg["cloud"].get("name"), cfg["cloud"].get("people"), cfg.get("can_delete"))
         cfg["cloud"] = {**cfg["cloud"], "person": info["person"], "name": info["name"], "people": info["people"],
                         "checked": time.strftime("%Y-%m-%d %H:%M")}
         cfg["can_delete"] = info["can_delete"]
-        atomic_write(config_path(), json.dumps(cfg, indent=1, ensure_ascii=False))
+        # the file is written only when the answer changed (it was rewritten at every start and every 30 minutes:
+        # audit R-16); the time of the last check lives in memory and goes into the file with the next change
+        if was != (info["person"], info["name"], info["people"], info["can_delete"]):
+            _config_write(cfg)
         CONFIG["cloud"] = cfg["cloud"]
         CONFIG["can_delete"] = cfg["can_delete"]
 
@@ -3509,6 +3902,7 @@ def share_reels(ids, to):
             r = parse_note(folder)
             if not r:
                 raise ValueError("unknown reel")
+            _hub_ok(folder)                             # unreadable hub.json: not shared without its favorites (R-05)
             label = r["label"]
             if not r["url"]:
                 raise ValueError("it has no source link")
@@ -3593,7 +3987,7 @@ def _save_share(s, sid):
             raw = _fetch_image(sid, n)
             if raw:
                 img = f"img_{i:03d}.jpg"
-                (tmp / img).write_bytes(raw)
+                atomic_write_bytes(tmp / img, raw)      # on the disk before the share is deleted online (R-17)
             else:
                 lost += 1
         favs.append({"t": round(t, 3), "text": _defuse(f.get("text"))[:2000], "corrected": bool(f.get("corrected")), "image": img})
@@ -4152,24 +4546,6 @@ def run_fill(task, chained=False):
         end_run()
 
 
-def atomic_write_bytes(path, raw):
-    """Like atomic_write, for an image: temp file + rename, retried while Windows has the file open."""
-    path = Path(path)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    tmp.write_bytes(raw)
-    for i in range(40):
-        try:
-            os.replace(tmp, path)
-            return
-        except PermissionError:
-            time.sleep(0.05)
-    try:
-        tmp.unlink()
-    except OSError:
-        pass
-    raise PermissionError(f"could not write {path.name} (open in another program?)")
-
-
 def apply_share(folder, item, category):
     """Fill a freshly processed reel from a share: the favorites re-captured at the sender's times (with the
     sender's edited image where there is one), their text and Corrected mark, My notes, the category, and who
@@ -4623,7 +4999,8 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
         elif path == "/api/ping":                     # the page's heartbeat (status "Connected to this PC")
-            self.send_json({"ok": True, "boot": BOOT, **version_info()})   # + which version runs (R-41)
+            self.send_json({"ok": True, "boot": BOOT, **version_info(),    # + which version runs (R-41)
+                            "files": list(FILE_NOTES.values())})            # + a file that could not be read (R-05, R-06, R-16)
         elif path == "/api/config":
             self.send_json(config_info())
         elif path == "/api/reels/count":
@@ -4817,6 +5194,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "online": lib_public()})
             elif path == "/api/online/remove":              # Settings > Remove the online copy (asks first)
                 self.send_json({"ok": True, "online": lib_remove()})
+            elif path == "/api/files/ok":                   # OK on the bar that says a file came from its copy
+                self.send_json(file_note_ok(str(body.get("id") or "")))
             elif path == "/api/cloud/test":
                 self.send_json({"ok": True, **cloud_test(body)})
             else:
@@ -5247,6 +5626,11 @@ video.seekflash{animation:seekflash 1s}
 #toast.show{opacity:1}
 #verbar{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);z-index:71;max-width:calc(100vw - 32px);background:var(--warn);color:#000;font-weight:600;padding:8px 14px;border-radius:10px;display:flex;gap:10px;align-items:center;box-shadow:0 2px 10px rgba(0,0,0,.3)}
 #verbar[hidden]{display:none}
+#filebar{position:fixed;left:50%;bottom:64px;transform:translateX(-50%);z-index:71;width:min(820px,calc(100vw - 32px));background:#2a2412;border:1px solid var(--warn);color:var(--warn);padding:8px 14px;border-radius:10px;font-size:13px;display:flex;flex-direction:column;gap:8px;box-shadow:0 2px 10px rgba(0,0,0,.3);overflow-wrap:anywhere;max-height:40vh;overflow-y:auto}
+#filebar[hidden],body:has(#setup.show) #filebar{display:none}   /* not over Settings or the Welcome box, which says it itself */
+.fnote{display:flex;gap:10px;align-items:flex-start}
+.fnote span{flex:1;min-width:0}
+.setbox .stlost{color:var(--warn)}
 #dragghost{position:fixed;top:-100px;left:-100px;background:var(--accent);color:var(--accent-ink);font-weight:700;padding:5px 12px;border-radius:14px;font-size:13px}
 .gcard:hover,.gcard:focus{background:var(--panel);border-color:var(--line);outline:none}
 .gcard.active{border-color:#2f5551;background:#1a2423}
@@ -5390,6 +5774,8 @@ body:has(#bulkbar.show) #log{bottom:84px}
 #main.busy #notes,#main.busy .favtext,#main.busy .favs,#main.busy .shots,#main.busy .capbar,#main.busy #favs + *,#main.busy .rowbtns{opacity:.45;pointer-events:none}
 #main.busy .detail::before{content:"Re-processing this video... favorites and snapshots are paused until it finishes";grid-column:1/-1;background:#2a2412;border:1px solid var(--warn);color:var(--warn);border-radius:8px;padding:8px 12px;font-size:13px}
 #main.busy.waiting .detail::before{content:"Waiting in line to be re-processed... favorites and snapshots are paused until it is done (× in the Waiting list cancels it)"}
+#main.badhub #notes,#main.badhub .favtext,#main.badhub .favs,#main.badhub .shots,#main.badhub .capbar,#main.badhub #favs + *,#main.badhub .rowbtns{opacity:.45;pointer-events:none}
+#main.badhub .detail::before{content:attr(data-bad);grid-column:1/-1;background:#2a2412;border:1px solid var(--warn);color:var(--warn);border-radius:8px;padding:8px 12px;font-size:13px;overflow-wrap:anywhere}
 
 /* sharing: share buttons, inbox, shared-by marks, Settings section */
 #inboxbtn .ib{display:inline-block;min-width:18px;margin-left:6px;padding:0 6px;border-radius:9px;background:var(--accent);color:var(--accent-ink);font-size:11px;font-weight:700;line-height:17px;text-align:center}
@@ -5524,6 +5910,7 @@ body:has(#bulkbar.show) #log{bottom:84px}
   <button class="btn small" id="bulkclear">Clear</button>
 </div>
 <div id="toast"></div>
+<div id="filebar" role="alert" hidden></div>
 <div id="verbar" role="alert" hidden><span id="vertext"></span><button class="btn" id="verreload" hidden>Reload</button></div>
 <div id="editor">
   <div class="edbar">
@@ -5733,13 +6120,27 @@ function checkVersion(j){                  // the server's version, from /api/pi
   $("#verreload").hidden = !old || !!j.updated;
   $("#verbar").hidden = !msg;
 }
+let fileSig = "", fileHidden = new Set();
+function checkFiles(j){                    // a file of the app's that could not be read, from /api/ping (audit R-05, R-06, R-16)
+  const list = ((j && j.files) || []).filter(f => !fileHidden.has(f.id)), sig = list.map(f => f.id).join("|");
+  if (sig === fileSig) return;
+  fileSig = sig;
+  const bar = $("#filebar");
+  bar.innerHTML = list.map(f => `<div class="fnote"><span>${esc(f.text)}</span><button class="btn small" ${f.bad ? "data-filehide" : "data-fileok"}="${esc(f.id)}" title="${f.bad ? "Hide this note until the page is loaded again" : "Understood: take this note away"}">${f.bad ? "Hide" : "OK"}</button></div>`).join("");
+  bar.hidden = !list.length;
+}
+$("#filebar").addEventListener("click", async e => {
+  const b = e.target.closest("[data-fileok],[data-filehide]"); if (!b) return;
+  if (b.dataset.filehide) { fileHidden.add(b.dataset.filehide); return ping(); }
+  try { checkFiles(await api("/api/files/ok", {id: b.dataset.fileok})); } catch (err) {}
+});
 async function ping(){                     // heartbeat: every 5 s, every 2 s while the server does not answer
   if (connBusy) return;
   connBusy = true;
   const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), 10000);
   try {
     const res = await fetch("/api/ping", {cache: "no-store", signal: ctl.signal}); setConn(true);
-    res.json().then(checkVersion).catch(() => {});
+    res.json().then(j => { checkVersion(j); checkFiles(j); }).catch(() => {});
   }
   catch (e) { setConn(false); }
   finally { clearTimeout(t); connBusy = false; }
@@ -5798,7 +6199,12 @@ async function loadReels(keepId, changedIds){
 const saveTimers = {}, pending = {};
 let busyIds = new Set();                  // reels being re-processed (or waiting for it): edits are paused
 let waitingIds = new Set(), busyEpoch = 0; // waitingIds: Re-process still in line; busyEpoch: see syncBusy
+const hubBad = r => !!(r && r.state && r.state._bad);   // its hub.json can't be read (audit R-05): nothing is saved over it
+const hubBadText = r => "This video's hub.json can't be read, so its favorites, category, tags and snapshots are paused and nothing is changed. The file is in "
+  + ((r.bad_hub && r.bad_hub.folder) || "the video's folder") + (r.bad_hub && r.bad_hub.copy ? " (a copy is kept as " + r.bad_hub.copy + ")" : "")
+  + ". Repair it, or move it out of that folder to start this video again without them; then reload this page.";
 function isBusy(r, quiet){
+  if (hubBad(r)) { if (!quiet) toast("This video's hub.json can't be read - changes are paused (see the note above the video)"); return true; }
   if (!r || !busyIds.has(r.id)) return false;
   if (!quiet) toast(waitingIds.has(r.id) ? "This video is waiting in line to be re-processed - changes are paused until it is done"
                                          : "This video is being re-processed - changes are paused until it finishes");
@@ -5808,6 +6214,12 @@ function showBusy(){                      // the banner over the open reel
   if (!current) return;
   $("#main").classList.toggle("busy", busyIds.has(current.id));
   $("#main").classList.toggle("waiting", waitingIds.has(current.id));
+  showHubBad(current);
+}
+function showHubBad(r){                   // the banner over a video whose hub.json can't be read
+  const d = document.querySelector("#main .detail");
+  $("#main").classList.toggle("badhub", hubBad(r) && !!d);
+  if (d) { if (hubBad(r)) d.dataset.bad = hubBadText(r); else delete d.dataset.bad; }
 }
 function saveState(r, now){
   if (isBusy(r)) return;
@@ -5834,6 +6246,8 @@ function saveFailed(r, e, what){
     return loadReels(current && current.id, new Set([r.id])).catch(() => {});
   }
   alert(`Could not save${what ? " " + what : ""}: ` + e.message);
+  if (/hub\.json of this video can't be read/.test(e.message))   // it went bad while this page was open (R-05): show it as it is now
+    return loadReels(current && current.id, new Set([r.id])).catch(() => {});
 }
 async function flushSaves(){               // write anything typed but not yet saved
   for (const k of Object.keys(pending)) { clearTimeout(saveTimers[k]); clearTimeout(notesTimers[k.replace(/^n:/, "")]); }
@@ -6462,6 +6876,7 @@ function select(id, scroll=true, keepView=false){
 }
 
 function setCategory(r, cat){
+  if (hubBad(r)) { isBusy(r); if (current && current.id === r.id && $("#catsel")) $("#catsel").value = catOf(r); return; }
   r.state.category = cat;
   saveState(r, true);
   renderList();
@@ -6493,7 +6908,7 @@ function updateNav(){
 }
 
 function render(r){
-  setTimeout(() => { $("#main").classList.toggle("busy", busyIds.has(r.id)); $("#main").classList.toggle("waiting", waitingIds.has(r.id)); }, 0);
+  setTimeout(() => { $("#main").classList.toggle("busy", busyIds.has(r.id)); $("#main").classList.toggle("waiting", waitingIds.has(r.id)); showHubBad(r); }, 0);
   const tabs = [["transcript","Transcript",r.transcript.length],["caption","Caption",""],["ocr","On-screen text",r.ocr.length],["notes","My notes",""]];
   $("#main").innerHTML = `
   <div class="detail">
@@ -8069,10 +8484,14 @@ async function openSetup(first){
   setupFirst = first;
   const cfg = c.configured ? c.config : c.defaults;
   $("#sttitle").textContent = first ? "Welcome to Reels Hub" : "Settings";
-  $("#stintro").textContent = first ? "Tell the app who you are and where to keep things. You can change this later under Settings."
+  const lost = first && c.lost;             // an unreadable config.json was set aside (audit R-16): say so, suggest no folders
+  $("#stintro").textContent = lost ? `Your settings file could not be read. It is kept as ${c.lost} in the folder named at the bottom of this box; nothing was changed in your reels folder or your vault. Enter the same reels folder and vault as before. Sharing needs the Cloudflare address, the Client ID and the Client Secret again.`
+                            : first ? "Tell the app who you are and where to keep things. You can change this later under Settings."
                                     : "Your name and folders on this computer.";
+  $("#stintro").classList.toggle("stlost", !!lost);
   $("#stsortrow").hidden = !cfg.name || !(cfg.vault || "").trim();
-  $("#stname").value = cfg.name || ""; $("#stout").value = cfg.out || ""; $("#stvault").value = cfg.vault || "";
+  $("#stname").value = cfg.name || ""; $("#stout").value = lost ? "" : cfg.out || ""; $("#stvault").value = lost ? "" : cfg.vault || "";
+  $("#stout").placeholder = lost ? "the folder your reels are in, as before" : "";
   $("#stlang").value = cfg.sub_lang !== undefined ? cfg.sub_lang : "en";
   const cl = (c.configured && c.config.cloud) || {};
   $("#stcurl").value = cl.url || ""; $("#stcid").value = cl.id || ""; $("#stcsec").value = "";
@@ -8085,7 +8504,7 @@ async function openSetup(first){
   $("#stpath").textContent = "Saved on this computer in " + c.path + (c.overrides.length ? " · started with --" + c.overrides.join(" --") + ", which overrides these" : "")
     + (c.version ? " · Reels Hub " + c.version + (c.updated ? " (the files on disk are newer: " + c.files + ", start Reels Hub again)" : "") : "");
   $("#setup").classList.add("show");
-  setTimeout(() => (first && !cfg.name ? $("#stname") : $("#stsave")).focus(), 0);
+  setTimeout(() => (lost ? $("#stout") : first && !cfg.name ? $("#stname") : $("#stsave")).focus(), 0);
 }
 async function saveSetup(){
   const b = $("#stsave"); b.disabled = true;
@@ -8140,7 +8559,10 @@ def main():
     cfg = load_config()
     apply_config(cfg or default_config())
     CONFIG.clear(); CONFIG.update(cfg)          # empty until the setup screen has been filled in
-    if not cfg:
+    if not cfg and config_lost():
+        print(f"The settings could not be read ({config_lost()} is kept in {config_path().parent}): the app will ask"
+              " for them again. Enter the same reels folder and vault as before.")
+    elif not cfg:
         print(f"First start: the app will ask who you are and where your folders are (saved in {config_path()}).")
     elif not vault_ok():
         print(f"No Obsidian vault set (or not found) - Obsidian notes are off. Change it under Settings.")
@@ -8161,6 +8583,10 @@ def main():
         start_homes()                               # one time: channel categories -> channel groups (background)
     if cloud_settings():
         print(f"Sharing: inbox at {CONFIG['cloud']['url']} (checked every {PICKUP_EVERY} s while this runs)")
+    seed_prev()                                 # a copy from before for config.json and _categories.json, from day one
+    t = threading.Timer(20, clean_tmp)          # left-over temp files of writes that were cut off (R-17)
+    t.daemon = True
+    t.start()
     threading.Thread(target=inbox_worker, daemon=True).start()
     threading.Thread(target=awake_worker, daemon=True).start()          # keeps Windows awake while the line runs
     threading.Thread(target=lib_worker, daemon=True).start()            # Online copy for the phone (Settings), phone links

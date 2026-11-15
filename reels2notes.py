@@ -513,8 +513,7 @@ def snapshots(video, workdir, scene, max_shots=200, speech=(), prog=None, every=
         f.replace(dest)
         files.append(dest); times.append(round(t, 2))
     print(f"  {len(files)} snapshots (every {interval:.3g} s + {len(extra)} scene cuts of {len(all_cuts)} found)")
-    (workdir / "shots.json").write_text(json.dumps(dict(zip([f.name for f in files], times)), indent=1),
-                                        encoding="utf-8")
+    write_forced(workdir / "shots.json", json.dumps(dict(zip([f.name for f in files], times)), indent=1))
     return files
 
 
@@ -665,6 +664,27 @@ def old_owner(note):
 
 
 
+def write_forced(path, text):
+    """Write a file of the library (note.md, hub.json, _channel.json, shots.json, video.info.json): to a temp file
+    next to it, forced onto the disk (flush + fsync), then renamed over the old one. After a crash or a power cut
+    the file is the old or the new one, never an empty one (audit R-17: a note.md written the plain way could be
+    empty in the seconds after, and with it the My notes it carries over on a Re-process). Raises OSError."""
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        replace_retry(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def replace_retry(src, dst, tries=60):
     """os.replace that waits while Windows has the target open for a moment (Reels Hub reading _channel.json for
     the Transcripts tab, an antivirus or indexer): up to about 6 s, then the error as before."""
@@ -769,9 +789,7 @@ def write_note(workdir, url, info, shots, transcript, lang, ocr_lines, owner="",
     note = workdir / "note.md"
     md += ["## Snapshots", *(f"![[{workdir.name}/shots/{s.name}]]" for s in shots), "",
            "## My notes", NOTES_S, old_notes(note), NOTES_E, ""]
-    tmp = note.with_name(".note.md.tmp")
-    tmp.write_text("\n".join(md), encoding="utf-8")
-    replace_retry(tmp, note)
+    write_forced(note, "\n".join(md))
     return note
 
 
@@ -964,8 +982,8 @@ def download_slideshow(url, post, workdir, browser, cookies, prog=None):
         "requested_subtitles", "comments", "http_headers", "url")}
     info["duration"] = round(sum(s["dur"] for s in slides), 3)
     info["slideshow"] = len(slides)
-    (workdir / "video.info.json").write_text(json.dumps(info, indent=1, ensure_ascii=False), encoding="utf-8")
-    (workdir / "slides.json").write_text(json.dumps({"secs": SLIDE_SECS, "slides": slides}, indent=1), encoding="utf-8")
+    write_forced(workdir / "video.info.json", json.dumps(info, indent=1, ensure_ascii=False))
+    write_forced(workdir / "slides.json", json.dumps({"secs": SLIDE_SECS, "slides": slides}, indent=1))
     return video, info
 
 
@@ -1013,8 +1031,7 @@ def slide_shots(workdir, slides, max_shots=0, every=0, into=None):
         shutil.rmtree(d, ignore_errors=True)
     print(f"  {len(files)} snapshots ({len(photos)} photo slides"
           f"{f' + {len(frames)} frames from video slides' if frames else ''})")
-    (into / "shots.json").write_text(json.dumps(dict(zip([f.name for f in files], times)), indent=1),
-                                        encoding="utf-8")
+    write_forced(into / "shots.json", json.dumps(dict(zip([f.name for f in files], times)), indent=1))
     return files
 
 
@@ -1046,7 +1063,7 @@ def channel_category(out, workdir, info, url):
     videos without hub.json (new downloads). Since 2026-11-09 no category is made per channel any more."""
     f = out / "_categories.json"
     try:
-        raw = json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
+        raw = json.loads(f.read_text(encoding="utf-8-sig")) if f.exists() else {}   # a BOM in front is fine, as in the app
     except (OSError, ValueError):
         return                                               # unreadable: leave it to the app
     homes, cats = raw.get("homes"), raw.get("categories") or []
@@ -1056,7 +1073,7 @@ def channel_category(out, workdir, info, url):
     cat = next((v for k, v in homes.items() if str(k).casefold() == key), "")
     if not cat or cat not in cats:
         return
-    (workdir / "hub.json").write_text(json.dumps({"category": cat, "favorites": []}, indent=1, ensure_ascii=False), encoding="utf-8")
+    write_forced(workdir / "hub.json", json.dumps({"category": cat, "favorites": []}, indent=1, ensure_ascii=False))
     print(f"  category: {cat} (the channel's)")
 
 
@@ -1599,7 +1616,7 @@ def transcript_one(url, args, out, prog, source_hint="link"):
         source, how = "whisper", "Whisper"
         prog.start("captions")
     tinfo = trim_info(info)
-    (tmp / "video.info.json").write_text(json.dumps(tinfo, ensure_ascii=False, indent=1), encoding="utf-8")
+    write_forced(tmp / "video.info.json", json.dumps(tinfo, ensure_ascii=False, indent=1))
     write_note(tmp, url, tinfo, [], lines, lang, None, args.owner, extra=[f"transcript: {source}"])
     for p in tmp.iterdir():                                   # nothing else stays (a leftover caption file)
         if p.name not in ("note.md", "video.info.json"):
@@ -1611,17 +1628,15 @@ def transcript_one(url, args, out, prog, source_hint="link"):
             meta = json.loads(chan.read_text(encoding="utf-8"))
             if isinstance(meta, dict) and name and meta.get("name") in ("", key, meta.get("handle", "").lstrip("@")) and meta.get("name") != name:
                 meta["name"] = name
-                tmp_c = chan.with_name("._channel.json.tmp")
-                tmp_c.write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
-                replace_retry(tmp_c, chan)
+                write_forced(chan, json.dumps(meta, ensure_ascii=False, indent=1))
         except (OSError, ValueError):
             pass
     if not chan.exists():
-        chan.write_text(json.dumps({"key": key, "name": name, "id": info.get("channel_id") or info.get("uploader_id") or "",
-                                    "handle": ("@" + _handle(info, url).lstrip("@")) if _handle(info, url) else "",
-                                    "url": _channel_url(url, info),
-                                    "platform": platform_of(url, info), "at": time.strftime("%Y-%m-%d %H:%M")},
-                                   ensure_ascii=False, indent=1), encoding="utf-8")
+        write_forced(chan, json.dumps({"key": key, "name": name, "id": info.get("channel_id") or info.get("uploader_id") or "",
+                                       "handle": ("@" + _handle(info, url).lstrip("@")) if _handle(info, url) else "",
+                                       "url": _channel_url(url, info),
+                                       "platform": platform_of(url, info), "at": time.strftime("%Y-%m-%d %H:%M")},
+                                      ensure_ascii=False, indent=1))
     replace_retry(tmp, dest)
     took = time.time() - t_start
     if source != "whisper":
@@ -1842,16 +1857,10 @@ class RunRecord:
                          "platform": plat, "at": time.strftime("%Y-%m-%d %H:%M")})
         self.rec["at"] = time.strftime("%Y-%m-%d %H:%M")
         meta["run"] = self.rec
-        tmp = f.with_name("._channel.json.tmp")
-        tmp.write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
         try:
-            replace_retry(tmp, f)
+            write_forced(f, json.dumps(meta, ensure_ascii=False, indent=1))
         except OSError as e:          # only the "where it got to" line in the app: never worth stopping the run for
             print(f"  (could not update {f.name}: {e}; the run goes on)")
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
 
     def step(self, k, ok):
         """Video number k of this listing (1-based) finished (ok) or failed."""
