@@ -859,10 +859,70 @@ def _hub_ok(folder):
     return st
 
 
-def _hub_write(folder, st):
-    """The one place a hub.json is written (reels and transcript folders): never over an unreadable one."""
-    _hub_ok(folder)
+REV_KEYS = ("category", "favorites", "tags", "shared_by")   # what a page shows and sends back: a change raises rev
+_REQ = threading.local()                     # .revs: the revisions this request raised {video: [before, after]}
+
+
+def _rev(d):
+    """A hub.json's revision: 0 until its first save with this version (audit R-04)."""
+    v = d.get("rev") if isinstance(d, dict) else None
+    return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else 0
+
+
+def _rev_key(folder):
+    """How a page names this folder: the reel id, or t/<channel>/<id> for a transcript."""
+    f = Path(folder)
+    return f"t/{f.parent.name}/{f.name}" if f.parent.parent.name == TR_DIR else f.name
+
+
+def _hub_write(folder, st, bump=False):
+    """The one place a hub.json is written (reels and transcript folders): never over an unreadable one.
+    It also keeps the video's revision (audit R-04): "rev" is taken from the file as it is now, never from the
+    caller, and goes up by one when the category, favorites, tags or the share fill-in change, or when the caller
+    says so (bump: a save of the state, the tags or My notes). Returns the revision written. The number stays on this
+    laptop: build_share and lib_body never read it."""
+    cur = _hub_ok(folder)
+    rev = _rev(cur)
+    st = {k: v for k, v in st.items() if k != "rev"}
+    new = rev + 1 if bump or any((cur.get(k) or None) != (st.get(k) or None) for k in REV_KEYS) else rev
+    if new:
+        st["rev"] = new
     atomic_write(Path(folder) / "hub.json", json.dumps(st, indent=1, ensure_ascii=False))
+    revs = getattr(_REQ, "revs", None)
+    if new != rev and revs is not None:           # the page that asked learns the new number with the answer
+        key = _rev_key(folder)
+        revs[key] = [revs[key][0] if key in revs else rev, new]
+    return new
+
+
+class StaleCopy(ValueError):
+    """A save from a copy of a video that is older than the one on this laptop (audit R-04): answered with 409."""
+    def __init__(self, msg, rev=0):
+        super().__init__(msg)
+        self.rev = rev
+
+
+STALE_TEXT = ("This video was changed somewhere else after this page loaded it (another tab, or a program), so your "
+              "change was not saved. It reloads now: then make your change again")
+OLD_PAGE_TEXT = ("This page is from an older version of Reels Hub and can no longer save: reload it (F5), then make "
+                 "your change again")
+
+
+def rev_check(folder, ask):
+    """Refuse a save made from an older copy. ask: {"rev": the revision the sender's copy has, or None; "page": the
+    request came from a browser page (it carries an Origin header)} or None (the app's own calls). A page must always
+    send its revision, so a page from before this check is refused and told to reload; a script that sends none is
+    taken as before, and one that sends it (the state it read from /api/reels carries it) is checked. Caller holds
+    DATA_LOCK and has made sure hub.json is readable."""
+    if not ask:
+        return
+    cur, rev = _rev(_hub(folder)), ask.get("rev")
+    if rev is None:
+        if ask.get("page"):
+            raise StaleCopy(OLD_PAGE_TEXT, cur)
+        return
+    if isinstance(rev, bool) or not isinstance(rev, int) or rev != cur:
+        raise StaleCopy(STALE_TEXT, cur)
 
 
 def read_state(folder):
@@ -873,15 +933,16 @@ def read_state(folder):
            "shared_by": s["shared_by"] if isinstance(s.get("shared_by"), dict) else None,
            "shared": [x for x in s["shared"] if isinstance(x, dict)][-10:] if isinstance(s.get("shared"), list) else [],
            "tags": _clean_tags(s.get("tags")), "tag_tokens": [str(t) for t in s.get("tag_tokens") or [] if isinstance(t, str)],
-           "cat_tag": str(s.get("cat_tag") or ""), "creator_tag": str(s.get("creator_tag") or "")}
+           "cat_tag": str(s.get("cat_tag") or ""), "creator_tag": str(s.get("creator_tag") or ""),
+           "rev": _rev(s)}                         # this copy's revision: a page sends it back with every save (R-04)
     if bad:
         out["_bad"] = True
     return out
 
 
-def write_state(folder, state):
+def write_state(folder, state, bump=False):
     state = {k: v for k, v in state.items() if not k.startswith("_") and not (k in ("shared_by", "shared", "tags", "tag_tokens", "cat_tag", "creator_tag") and not v)}
-    _hub_write(folder, state)
+    return _hub_write(folder, state, bump)
 
 
 LIST_COND = threading.Condition()
@@ -941,6 +1002,13 @@ def _list_reels():
             r["obsidian"] = ensure_vault_note(f, r)
         except Exception as e:
             r["obsidian"] = {"error": f"Obsidian: {e}"}
+        # ensure_vault_note may have changed hub.json after parse_note read it: a video that took over its
+        # transcript's note also takes its category and tags (_adopt_transcript_note). The page must get that state,
+        # not the one from before (audit R-07: its first save put the old category back and moved the note).
+        if not r["state"].get("_bad"):
+            fresh = read_state(f)
+            if not fresh.get("_bad"):
+                r["state"] = fresh
         try:
             r["ch"], r["chname"] = reel_channel(f)      # the channel group it shows in, inside its category
         except Exception:
@@ -1449,6 +1517,7 @@ def tr_item(folder, key):
         it["full_flag"] = st.get("full") or ""
         it["category"] = str(st.get("category") or "")[:100]
         it["tags"] = _clean_tags(st.get("tags"))
+        it["rev"] = _rev(st)                         # sent back with a save of its tags (R-04)
         it["cat_set"] = "category" in st             # no category yet: its channel's home, if any (_auto_category)
         TR_CACHE[str(folder)] = (mt, dict(it))
     rel = it.pop("note_path")
@@ -1830,8 +1899,8 @@ def write_tags(tags):
     _cats_write(raw)
 
 
-def _write_item_tags(folder, tags):
-    """hub.json "tags" and the note's Tags line. Caller holds DATA_LOCK."""
+def _write_item_tags(folder, tags, bump=False):
+    """hub.json "tags" and the note's Tags line. Caller holds DATA_LOCK. bump: a save of this video's tags."""
     st = _hub_ok(folder)                           # unreadable (also empty): refused, nothing changes (R-05)
     tags = _clean_tags(tags)
     old = [t for t in st.get("tag_tokens") or [] if isinstance(t, str)]
@@ -1850,13 +1919,14 @@ def _write_item_tags(folder, tags):
     st["tags"], st["tag_tokens"] = tags, want
     if not tags:
         st.pop("tags"); st.pop("tag_tokens")
-    _hub_write(folder, st)
+    _hub_write(folder, st, bump)
     TR_CACHE.pop(str(folder), None)
     return tags
 
 
-def set_tags(body):
-    """POST /api/tags/set {id (a reel) | channel + id (a transcript), tags}: new names join the tag list."""
+def set_tags(body, ask=None):
+    """POST /api/tags/set {id (a reel) | channel + id (a transcript), tags, rev}: new names join the tag list.
+    ask: see rev_check (a save from an older copy is refused, audit R-04)."""
     if body.get("channel"):
         folder = tr_dir(body.get("channel"), body.get("id"))
     else:
@@ -1867,6 +1937,7 @@ def set_tags(body):
     tags = _clean_tags(body.get("tags"))
     with DATA_LOCK:
         _hub_ok(folder)                               # before a new tag joins the list (R-05)
+        rev_check(folder, ask)                        # and before anything is written (R-04)
         cats_need()
         known = read_tags()
         low = {t.lower(): t for t in known}
@@ -1874,8 +1945,9 @@ def set_tags(body):
         new = [t for t in tags if t.lower() not in low]
         if new:
             write_tags(known + new)
-        tags = _write_item_tags(folder, tags)
-    return {"tags": tags, "all": read_tags()}
+        tags = _write_item_tags(folder, tags, bump=True)
+        rev = _rev(_hub(folder))
+    return {"tags": tags, "all": read_tags(), "rev": rev}
 
 
 def _all_tagged():
@@ -2499,12 +2571,20 @@ def _share_guard(old, page_at):
         raise ValueError("This video was just filled in from a share: it reloads now, then make your change again")
 
 
-def save_notes(reel_id, notes, page_at=None):
+def save_notes(reel_id, notes, page_at=None, ask=None):
+    """My notes of one video (they live in note.md). Returns the video's revision after the save. ask: see rev_check.
+    With an unreadable hub.json the notes are still saved, as before (R-05): there is no revision to check or raise."""
     folder = reel_dir(reel_id)
     busy_check(folder.name)
     with DATA_LOCK:
-        _share_guard(read_state(folder), page_at)
+        old = read_state(folder)
+        _share_guard(old, page_at)
+        if old.get("_bad"):
+            _write_notes(folder, notes)
+            return 0
+        rev_check(folder, ask)
         _write_notes(folder, notes)
+        return _hub_write(folder, _hub(folder), bump=True)
 
 
 def _write_notes(folder, notes):
@@ -2522,7 +2602,10 @@ def _write_notes(folder, notes):
         atomic_write(note, text)
 
 
-def save_state(reel_id, state):
+def save_state(reel_id, state, ask=None, notes=None, page_at=None):
+    """The page's save of one video: category and favorites. ask: see rev_check (a save from an older copy is
+    refused, audit R-04). notes: My notes in the same save (a page being closed sends both in one request, so the two
+    cannot refuse each other); page_at: the share fill-in the notes' copy shows."""
     folder = reel_dir(reel_id)
     if not (folder / "note.md").exists():
         raise ValueError("unknown reel")
@@ -2545,6 +2628,9 @@ def save_state(reel_id, state):
             _hub_ok(folder)
         page_sb = state.get("shared_by")
         _share_guard(old, page_sb.get("at") if isinstance(page_sb, dict) else None)
+        if notes is not None:
+            _share_guard(old, page_at)
+        rev_check(folder, ask)
         clean = {"category": str(state.get("category", ""))[:100], "favorites": favs,
                  "note_name": old["note_name"], "note_path": old["note_path"], "sent": old["sent"],
                  "shared_by": old["shared_by"], "shared": old["shared"],
@@ -2552,14 +2638,16 @@ def save_state(reel_id, state):
                  "creator_tag": old["creator_tag"]}
         if clean["category"] != old["category"]:
             cats_need()                              # the note's folder follows the category list (R-06)
-        write_state(folder, clean)
+        clean["rev"] = write_state(folder, clean, bump=True)
         write_note_favorites(folder, favs)
+        if notes is not None:
+            _write_notes(folder, notes)
         if clean["category"] != old["category"]:          # the note follows at once: tag, Category line, folder
             try:
                 _tr_set_category(folder, clean["category"], prev=old["category"])
             except Exception as e:
                 print(f"  {folder.name}: note not updated for the category ({e})")
-            clean = {**clean, **{k: v for k, v in read_state(folder).items() if k in ("note_path", "note_name", "cat_tag")}}
+            clean = {**clean, **{k: v for k, v in read_state(folder).items() if k in ("note_path", "note_name", "cat_tag", "rev")}}
     return clean
 
 
@@ -4959,7 +5047,19 @@ class Handler(BaseHTTPRequestHandler):
                 return False
         return True
 
+    def asker(self, body, state=None):
+        """Who sends this save, for rev_check: the revision of the copy it was made from ("rev" in the body, else in
+        the state it sends back) and whether it is a browser page (a page's POST carries an Origin header; a script's
+        does not unless it adds one)."""
+        rev = body.get("rev")
+        if rev is None and isinstance(state, dict):
+            rev = state.get("rev")
+        return {"rev": rev, "page": self.headers.get("Origin") is not None}
+
     def send_json(self, obj, code=200):
+        revs = getattr(_REQ, "revs", None)
+        if revs and code == 200 and isinstance(obj, dict):   # the revisions this request raised (R-04)
+            obj = {**obj, "revs": revs}
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -5048,6 +5148,13 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"error": "Bad request"}, 400)
         if not isinstance(body, dict):
             return self.send_json({"error": "Bad request"}, 400)
+        _REQ.revs = {}
+        try:
+            self._post(path, body)
+        finally:
+            _REQ.revs = None
+
+    def _post(self, path, body):
         try:
             if path == "/api/run":                           # starts now, or waits in line behind the run going now
                 urls = [u.strip() for u in re.split(r"[\s,]+", str(body.get("urls") or "")) if u.strip().startswith("http")]
@@ -5121,10 +5228,10 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/config":
                 self.send_json({"ok": True, **save_config(body), **config_info()})
             elif path == "/api/notes":
-                save_notes(body["id"], body.get("notes", ""), body.get("sb"))
-                self.send_json({"ok": True})
+                self.send_json({"ok": True, "rev": save_notes(body["id"], body.get("notes", ""), body.get("sb"), self.asker(body))})
             elif path == "/api/state":
-                self.send_json({"ok": True, "state": save_state(body["id"], body.get("state", {}))})
+                st = body.get("state", {})
+                self.send_json({"ok": True, "state": save_state(body["id"], st, self.asker(body, st), body.get("notes"), body.get("sb"))})
             elif path == "/api/obsidian":
                 self.send_json({"ok": True, **send_to_obsidian(body["id"])})
             elif path == "/api/aiprompt":
@@ -5156,7 +5263,7 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/tags":
                 self.send_json({"ok": True, "tags": change_tags(body)})
             elif path == "/api/tags/set":
-                self.send_json({"ok": True, **set_tags(body)})
+                self.send_json({"ok": True, **set_tags(body, self.asker(body))})
             elif path == "/api/transcripts/state":
                 self.send_json({"ok": True, **tr_set_category(body.get("channel"), body.get("id"), body.get("category"))})
             elif path == "/api/shots/capture":
@@ -5202,6 +5309,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(404)
         except PermissionError as e:
             self.send_json({"error": str(e) or "Not allowed"}, 403)
+        except StaleCopy as e:                               # a save from an older copy (R-04): nothing was changed
+            self.send_json({"error": str(e), "stale": True, "rev": e.rev}, 409)
         except (ValueError, KeyError, TypeError, OSError) as e:
             self.send_json({"error": str(e)}, 400)
         except Exception as e:
@@ -5534,6 +5643,10 @@ video{width:100%;max-height:min(var(--video-h, min(68vh, calc(100vh - 330px))), 
 .oline{display:flex;gap:10px;padding:6px;border-radius:6px;white-space:normal;align-items:flex-start}
 .oline img{width:48px;border-radius:4px;cursor:zoom-in}
 textarea.notes{width:100%;min-height:200px;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;resize:vertical}
+.card.unsaved{border-color:var(--warn);flex:none}
+.card.unsaved h2{color:var(--warn);flex:1}
+.card.unsaved .why{font-size:12.5px;color:var(--muted);padding:8px 14px 0}
+.card.unsaved textarea.notes{display:block;width:calc(100% - 28px);margin:8px 14px 12px;min-height:90px;max-height:240px}
 .saved{font-size:12px;color:var(--muted);margin-left:8px}
 .favs{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:12px;padding:14px}
 .fav{background:var(--panel2);border:1px solid var(--line);border-radius:8px;overflow:hidden;display:flex;flex-direction:column}
@@ -6140,7 +6253,7 @@ async function ping(){                     // heartbeat: every 5 s, every 2 s wh
   const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), 10000);
   try {
     const res = await fetch("/api/ping", {cache: "no-store", signal: ctl.signal}); setConn(true);
-    res.json().then(j => { checkVersion(j); checkFiles(j); }).catch(() => {});
+    res.json().then(j => { checkVersion(j); checkFiles(j); if (j.boot && bootId !== null && j.boot !== bootId) restarted(); }).catch(() => {});
   }
   catch (e) { setConn(false); }
   finally { clearTimeout(t); connBusy = false; }
@@ -6156,9 +6269,35 @@ async function api(path, body){
   catch (e) { setConn(false); throw new Error(CONN_DOWN); }       // no answer at all: its window was closed
   setConn(true);
   const j = await res.json();
-  if (!res.ok) throw new Error(j.error || res.statusText);
+  if (!res.ok) { const err = new Error(j.error || res.statusText); err.status = res.status; err.data = j; throw err; }
+  if (j.revs) applyRevs(j.revs);
   return j;
 }
+/* ---------- revisions (audit R-04) ----------
+   Every video has a revision (state.rev, from hub.json; a transcript: it.rev). The server raises it with every change
+   of the category, favorites, tags or My notes, and refuses a save made from a copy with another number (answer 409,
+   stale): this page then reloads that video and says so, instead of writing its older copy over the newer one.
+   revs in an answer = the revisions that request raised {video: [before, after]}: taken only by a copy that stood at
+   "before", so a copy that already missed a change stays old and its next save is refused. */
+function applyRevs(m){
+  const ks = Object.keys(m); if (!ks.length) return;
+  const byId = ks.length > 8 ? new Map(reels.map(r => [r.id, r])) : null;
+  for (const k of ks) {
+    const [a, b] = m[k];
+    if (k.startsWith("t/")) { const it = tr.items.find(x => "t/" + x.ch + "/" + x.id === k); if (it && (it.rev || 0) === a) it.rev = b; }
+    else { const r = byId ? byId.get(k) : reels.find(x => x.id === k); if (r && r.state && (r.state.rev || 0) === a) r.state.rev = b; }
+  }
+}
+const chains = {}, inFlight = {};          // saves of one video go one after the other: each takes the revision the one before got
+function chain(id, fn){
+  inFlight[id] = (inFlight[id] || 0) + 1;
+  const run = () => Promise.resolve().then(fn).finally(() => { inFlight[id]--; });
+  const p = (chains[id] || Promise.resolve()).then(run, run);
+  chains[id] = p.catch(() => {});
+  return p;
+}
+const unsent = id => !!(pending[id] || pending["n:" + id] || inFlight[id]);   // typed or clicked here, not answered yet
+const isStale = e => !!(e && ((e.data && e.data.stale) || /filled in from a share/.test(e.message || "")));
 
 /* ---------- transcript text at a snapshot's time ---------- */
 function textAt(r, shot){
@@ -6174,20 +6313,36 @@ async function loadReels(keepId, changedIds){
   await flushSaves();
   const j = await api("/api/reels");
   const old = new Map(reels.map(r => [r.id, r]));
-  reels = j.reels.map(r => {                 // keep your in-progress edits for reels the run didn't touch
+  // the app was started again while this page stayed open: every copy here may be old, take the server's (R-04)
+  const reboot = changedSeq !== null && j.boot && j.boot !== bootId;
+  if (reboot) changedIds = new Set(j.reels.map(r => r.id));
+  let openFresh = false;
+  rebootKept = 0;
+  reels = j.reels.map(r => {
     const o = old.get(r.id);
-    if (o && !(changedIds && changedIds.has(r.id))) { r.state = o.state; if (o.notesDraft !== undefined) r.notesDraft = o.notesDraft; }
+    if (!o) return r;
+    if (o.unsaved) r.unsaved = o.unsaved;    // what a refused save left to copy stays until you dismiss it
+    if (reboot) { if (keepTyped(r, typedIn(o))) rebootKept++; delete typed[r.id]; }   // typed while the app was closed: kept to copy
+    if (changedIds && changedIds.has(r.id) && !(reboot && unsent(r.id))) return r;
+    if (o.notesDraft !== undefined) r.notesDraft = o.notesDraft;
+    // Keep this page's copy while it holds something not answered yet, or while the server's is not newer. A newer
+    // revision (another tab or a program saved it) or a hub.json that turned unreadable: take the server's copy.
+    const newer = (r.state.rev || 0) > (o.state.rev || 0) || !!r.state._bad !== !!o.state._bad;
+    if (unsent(r.id) || !newer) r.state = o.state;
+    else if (current && current.id === r.id) openFresh = true;
     return r;
   });
   cats = j.categories; chanCats = new Set(j.channel_cats || []); homes = j.homes || homes; tags = j.tags || tags; vault = j.vault || vault; trashDir = j.trash || trashDir; me = j.me || me;
   trackHomes(j.homes_job); trackOnline(j.online);
   if (changedSeq === null) { changedSeq = j.changed_seq || 0; bootId = j.boot; }
-  else if (j.boot && j.boot !== bootId) { bootId = j.boot; changedSeq = 0; }
+  else if (j.boot && j.boot !== bootId) { bootId = j.boot; changedSeq = j.changed_seq || 0; }   // every copy is fresh from this listing
   applyMe();
   if (changedIds && current && !changedIds.has(current.id) && reels.some(r => r.id === current.id)) {
     current = reels.find(r => r.id === current.id);      // same reel still open: don't redraw (keeps video + typing)
     $("#count").textContent = reels.length ? `${reels.length} reel${reels.length>1?"s":""}` : "";
-    renderList(); updateNavSafe(); return;
+    renderList(); updateNavSafe();
+    if (openFresh) refreshOpen(current);
+    return;
   }
   $("#count").textContent = reels.length ? `${reels.length} reel${reels.length>1?"s":""}` : "";
   renderList();
@@ -6221,41 +6376,138 @@ function showHubBad(r){                   // the banner over a video whose hub.j
   $("#main").classList.toggle("badhub", hubBad(r) && !!d);
   if (d) { if (hubBad(r)) d.dataset.bad = hubBadText(r); else delete d.dataset.bad; }
 }
+// state.rev goes with every save: the server refuses one made from an older copy (R-04)
+const stateBody = r => ({id: r.id, state: r.state});
+const notesBody = (r, text) => ({id: r.id, notes: text, sb: sbAt(r), rev: (r.state && r.state.rev) || 0});
+const typed = {};                          // video -> Map(snapshot -> the text typed under that favorite here, not saved yet)
+function sendState(r){                     // one save of a video's state; what it carried is no longer "typed, not saved"
+  const sent = typed[r.id] ? new Map(typed[r.id]) : null;
+  return api("/api/state", stateBody(r)).then(j => {
+    const t = typed[r.id];
+    if (sent && t) { sent.forEach((text, shot) => { if (t.get(shot) === text) t.delete(shot); }); if (!t.size) delete typed[r.id]; }
+    return j;
+  });
+}
 function saveState(r, now){
   if (isBusy(r)) return;
   clearTimeout(saveTimers[r.id]);
-  const go = () => { delete pending[r.id]; return api("/api/state", {id: r.id, state: r.state}).catch(e => saveFailed(r, e)); };
-  pending[r.id] = {url: "/api/state", body: () => ({id: r.id, state: r.state}), go};
+  const go = () => { delete pending[r.id]; return chain(r.id, () => sendState(r)).catch(e => saveFailed(r, e)); };
+  pending[r.id] = {url: "/api/state", body: () => stateBody(r), go};
   if (now) go(); else saveTimers[r.id] = setTimeout(go, 500);
 }
 const notesTimers = {};
+function notesSaved(r, text, msg){
+  for (const x of new Set([r, reels.find(y => y.id === r.id) || r])) { x.notes = text; if (x.notesDraft === text) delete x.notesDraft; }
+  const sv = $("#saved"); if (sv && current && current.id === r.id) { sv.textContent = msg; sv.hidden = false; }
+}
 function notesChanged(r, text){
   if (isBusy(r)) return;
   r.notesDraft = text;
   clearTimeout(notesTimers[r.id]);
   const go = () => { delete pending["n:" + r.id];
-    return api("/api/notes", {id: r.id, notes: text, sb: sbAt(r)}).then(() => { r.notes = text; delete r.notesDraft; const sv = $("#saved"); if (sv && current === r) { sv.textContent = "Saved"; sv.hidden = false; } })
+    return chain(r.id, () => api("/api/notes", notesBody(r, text))).then(() => notesSaved(r, text, "Saved"))
       .catch(e => saveFailed(r, e, "notes")); };
-  pending["n:" + r.id] = {url: "/api/notes", body: () => ({id: r.id, notes: text, sb: sbAt(r)}), go};
+  pending["n:" + r.id] = {url: "/api/notes", body: () => notesBody(r, text), go};
   notesTimers[r.id] = setTimeout(go, 800);
 }
 const sbAt = r => (r.state && r.state.shared_by ? r.state.shared_by.at || "" : "");   // which fill-in this copy shows
 function saveFailed(r, e, what){
-  if (/filled in from a share/.test(e.message)) {   // this page had the reel from before a share filled it in
-    delete r.notesDraft; toast(e.message);
-    return loadReels(current && current.id, new Set([r.id])).catch(() => {});
-  }
+  if (isStale(e)) return staleCopy(r, e);          // this page's copy is older than the laptop's: nothing was saved
   alert(`Could not save${what ? " " + what : ""}: ` + e.message);
   if (/hub\.json of this video can't be read/.test(e.message))   // it went bad while this page was open (R-05): show it as it is now
     return loadReels(current && current.id, new Set([r.id])).catch(() => {});
 }
-async function flushSaves(){               // write anything typed but not yet saved
+/* A refused save (R-04): the video reloads here with a message and the change is made again. What was typed in this
+   page (My notes, the text under a favorite) is not thrown away: it stays in a box on that video, to copy from. */
+const staleIds = new Map(); let staleTimer = null, staleMsg = "";
+function typedIn(r){                        // what was typed into this copy and never reached the disk
+  const notes = r.notesDraft !== undefined && r.notesDraft.trim() && r.notesDraft !== r.notes ? r.notesDraft : "";
+  const favs = [...(typed[r.id] || new Map())].filter(([shot, text]) => (text || "").trim())
+    .map(([shot, text]) => ({shot, at: tlabel(r, r.times[shot] ?? 0), text}));
+  return {notes, favs};
+}
+function staleCopy(r, e){
+  const live = reels.find(x => x.id === r.id) || r, mine = typedIn(live), had = staleIds.get(r.id);
+  if (had) { mine.notes = mine.notes || had.notes; had.favs.forEach(f => mine.favs.some(x => x.shot === f.shot) || mine.favs.push(f)); }
+  staleIds.set(r.id, mine); staleMsg = e.message;
+  delete typed[r.id];
+  delete pending[r.id]; delete pending["n:" + r.id]; clearTimeout(saveTimers[r.id]); clearTimeout(notesTimers[r.id]);
+  delete live.notesDraft; delete r.notesDraft;
+  clearTimeout(staleTimer); staleTimer = setTimeout(staleReload, 60);      // several refused at once: one reload
+}
+let rebootKept = 0;                         // videos whose typed text the last reload after a restart kept
+function keepTyped(r, mine){                // r: the fresh copy; mine: what the older copy had typed (typedIn). True when something is kept
+  const now = new Map(((r.state && r.state.favorites) || []).map(f => [f.shot, f.text]));
+  const favs = mine.favs.filter(f => now.get(f.shot) !== f.text), notes = mine.notes && mine.notes !== r.notes ? mine.notes : "";
+  if (!notes && !favs.length) return false;
+  const u = r.unsaved || {notes: "", favs: []};
+  if (notes) u.notes = notes;
+  favs.forEach(f => { u.favs = u.favs.filter(x => x.shot !== f.shot).concat([f]); });
+  r.unsaved = u;
+  return true;
+}
+async function staleReload(){
+  const got = new Map(staleIds); staleIds.clear();
+  try { await loadReels(current && current.id, new Set(got.keys())); }
+  catch (e) { got.forEach((v, k) => staleIds.has(k) || staleIds.set(k, v)); staleTimer = setTimeout(staleReload, 3000); return; }
+  let kept = 0;
+  got.forEach((mine, id) => { const r = reels.find(x => x.id === id); if (r && keepTyped(r, mine)) kept++; });
+  if (current && got.has(current.id)) showUnsaved(current);
+  const one = got.size === 1, share = /filled in from a share/.test(staleMsg);
+  toastLong((share ? "This video was just filled in from a share, so your change was not saved. It is reloaded here: make your change again."
+    : one ? "This video was changed somewhere else (another tab, or a program) after this page loaded it, so your change was not saved. It is reloaded here: make your change again."
+          : `${got.size} videos were changed somewhere else after this page loaded them, so your change was not saved. They are reloaded here: make your change again.`)
+    + (kept ? " What you typed is kept in the box \"Not saved\" on the video, to copy from." : ""));
+}
+function unsavedText(u){
+  return [u.notes ? "My notes:\n" + u.notes : "", ...u.favs.map(f => `Favorite at ${f.at}:\n${f.text}`)].filter(Boolean).join("\n\n");
+}
+function unsavedBox(r){
+  const u = r.unsaved; if (!u) return "";
+  return `<div class="card unsaved" id="unsaved"><div class="cardhead"><h2>Not saved</h2>
+      <button class="btn small" id="unsavedcopy">Copy</button><button class="btn small" id="unsavedok" title="Take this box away: the text in it is then gone">Dismiss</button></div>
+    <div class="why">This video was changed somewhere else while this page had an older copy, so a save was refused. This is what you typed here: copy what you still need and put it in again.</div>
+    <textarea class="notes" id="unsavedtext" readonly>${esc(unsavedText(u))}</textarea></div>`;
+}
+function showUnsaved(r){                    // put the box into the open video, or take it out
+  const old = $("#unsaved"), html = unsavedBox(r);
+  if (old) old.outerHTML = html;
+  else if (html) { const right = document.querySelector("#main .detail .right"); if (right) right.insertAdjacentHTML("afterbegin", html); }
+}
+function refreshOpen(r){                    // the open video got a newer copy: show it without touching the player
+  if (!r || !document.querySelector("#main .detail")) return;
+  refreshShots(r);
+  if ($("#catsel")) $("#catsel").outerHTML = catSelect(r);
+  if ($("#rtags")) $("#rtags").outerHTML = tagBox(r.state.tags || [], "rtags");
+  const n = $("#notes"); if (n && r.notesDraft === undefined && document.activeElement !== n) n.value = r.notes;
+  showShareLine(r); showHubBad(r); updateNavSafe();
+}
+let restartBusy = false;
+async function restarted(){                 // Reels Hub was closed and started again while this page stayed open
+  if (restartBusy) return;
+  restartBusy = true;
+  try {
+    await loadReels(current && current.id);  // sends what waits here first; then every video is taken from the server
+    loadTr().catch(() => {});
+    toastLong("Reels Hub was started again: this page has reloaded your library."
+      + (rebootKept ? " What you typed here before and was not saved is kept in the box \"Not saved\" on the video, to copy from." : ""));
+  } catch (e) {}                             // not reachable yet: the next heartbeat tries again
+  finally { restartBusy = false; }
+}
+async function flushSaves(){               // write anything typed but not yet saved, and wait for the saves on their way
   for (const k of Object.keys(pending)) { clearTimeout(saveTimers[k]); clearTimeout(notesTimers[k.replace(/^n:/, "")]); }
   await Promise.all(Object.values(pending).map(p => p.go()));
+  await Promise.all(Object.values(chains));
 }
 window.addEventListener("pagehide", () => {    // tab closing: send pending saves in the background
-  for (const p of Object.values(pending)) {
-    try { navigator.sendBeacon(p.url, new Blob([JSON.stringify(p.body())], {type: "application/json"})); } catch (e) {}
+  const done = new Set();
+  for (const k of Object.keys(pending)) {
+    if (done.has(k)) continue;
+    const id = k.replace(/^n:/, ""), st = pending[id], nt = pending["n:" + id];
+    let url = pending[k].url, body = pending[k].body();
+    // a video's state and its My notes both wait: one request, so the two cannot refuse each other (R-04)
+    if (st && nt) { const n = nt.body(); url = "/api/state"; body = {...st.body(), notes: n.notes, sb: n.sb}; done.add(id); done.add("n:" + id); }
+    try { navigator.sendBeacon(url, new Blob([JSON.stringify(body)], {type: "application/json"})); } catch (e) {}
   }
 });
 
@@ -6287,8 +6539,19 @@ function tagBox(list, id){
 const tagTarget = id => id === "rtags" ? (current && {reel: current.id}) : (tr.current && (tr.current.reel && reels.some(r => r.id === tr.current.reel) ? {reel: tr.current.reel} : {ch: tr.current.ch, id: tr.current.id}));
 const targetTags = t => t.reel ? ((reels.find(r => r.id === t.reel) || {state: {}}).state.tags || []) : ((tr.items.find(x => x.ch === t.ch && x.id === t.id) || {}).tags || []);
 async function saveTags(t, list, quiet){
-  const body = t.reel ? {id: t.reel, tags: list} : {channel: t.ch, id: t.id, tags: list};
-  let j; try { j = await api("/api/tags/set", body); } catch (e) { if (!quiet) alert(e.message); return false; }
+  const body = () => {                     // built when its turn comes: the revision the save before it got
+    if (t.reel) { const r = reels.find(x => x.id === t.reel); return {id: t.reel, tags: list, rev: (r && r.state.rev) || 0}; }
+    const it = tr.items.find(x => x.ch === t.ch && x.id === t.id); return {channel: t.ch, id: t.id, tags: list, rev: (it && it.rev) || 0};
+  };
+  let j; try { j = await chain(t.reel || "t/" + t.ch + "/" + t.id, () => api("/api/tags/set", body())); }
+  catch (e) {
+    if (isStale(e)) {                      // an older copy (R-04): nothing was saved, show the video as it is now
+      const r = t.reel && reels.find(x => x.id === t.reel);
+      if (r) staleCopy(r, e);
+      else { toastLong("This transcript was changed somewhere else after this page loaded it, so the tag was not saved. It is reloaded here: make your change again."); loadTr().catch(() => {}); }
+    } else if (!quiet) alert(e.message);
+    return false;
+  }
   tags = j.all;
   if (t.reel) { const r = reels.find(x => x.id === t.reel); if (r) r.state.tags = j.tags; tr.items.forEach(it => { if (it.reel === t.reel) it.tags = j.tags; }); }
   else { const it = tr.items.find(x => x.ch === t.ch && x.id === t.id); if (it) it.tags = j.tags; }
@@ -6315,6 +6578,7 @@ async function sortNotes(){
   loadReels(current && current.id).catch(() => {}); loadTr().catch(() => {});
 }
 async function tagAction(body){
+  await flushSaves();
   let r; try { r = await api("/api/tags", body); } catch (e) { return alert(e.message); }
   tags = r.tags;
   const fix = l => l && (body.action === "rename" ? l.map(t => t === body.name ? body.new : t) : l.filter(t => t !== body.name));
@@ -6484,6 +6748,7 @@ function chanMenu(btn){                     // the folder button on a channel: p
 }
 async function setChannelHome(key, name, cat){
   closeMenu();
+  await flushSaves();
   let j;
   try { j = await api("/api/channels/home", {key, category: cat}); } catch (err) { return alert(err.message); }
   homes = j.homes || homes;
@@ -6703,6 +6968,7 @@ async function deleteShots(names, ask, allowFav=false){
       ? "This image is a favorite.\n\nDelete it? It is removed from your favorites and deleted from the snapshots."
       : `${favHit.length} of these are favorites.\n\nDelete them anyway? They are removed from your favorites and deleted from the snapshots.`)) return;
   let j;
+  await flushSaves();
   try { j = await api("/api/shots/delete", {id: r.id, shots: keep, force: allowFav}); } catch (e) { return alert(e.message); }
   const gone = new Set(j.deleted);
   r.shots = r.shots.filter(s => !gone.has(s));
@@ -6884,6 +7150,7 @@ function setCategory(r, cat){
 }
 
 async function catAction(body){
+  await flushSaves();
   try { const r = await api("/api/categories", body); cats = r.categories; chanCats = new Set(r.channel_cats || []); homes = r.homes || homes; tags = r.tags || tags; }
   catch (e) { return alert(e.message); }
   if (body.action === "rename") reels.forEach(r => { if (r.state.category === body.name) r.state.category = body.new; });
@@ -6938,6 +7205,7 @@ function render(r){
     </div>
     <div class="split" data-split="player" role="separator" aria-orientation="vertical" aria-label="Width of the video column" tabindex="0" title="Drag to change the width · double-click for the standard width"></div>
     <div class="right">
+      ${unsavedBox(r)}
       <div class="card">
         <div class="tabs">${tabs.map(([k,l,n]) => `<div class="tab ${tab===k?"active":""}" data-tab="${k}">${l}${n!==""?`<span class="n">${n}</span>`:""}</div>`).join("")}</div>
         <div class="pane ${tab==="transcript"?"active":""}" data-pane="transcript">${
@@ -7044,7 +7312,10 @@ function showObsLine(r, fresh){
 }
 async function sendObsidian(){
   const r = current, b = $("#obsbtn");
-  clearTimeout(saveTimers[r.id]); await api("/api/state", {id: r.id, state: r.state}).catch(() => {});
+  clearTimeout(saveTimers[r.id]); delete pending[r.id];
+  let stale = false;
+  await chain(r.id, () => sendState(r)).catch(e => { if (isStale(e)) { stale = true; saveFailed(r, e); } });
+  if (stale) return;                         // an older copy (R-04): it reloads; send after making the change again
   b.disabled = true; b.textContent = "Sending...";
   try {
     const j = await api("/api/obsidian", {id: r.id});
@@ -7472,7 +7743,7 @@ document.addEventListener("click", async e => {
   if ((el = c("[data-mv]"))) { const [i, d] = el.dataset.mv.split(":").map(Number), favs = current.state.favorites, j = i + d;
     if (j >= 0 && j < favs.length) { favs.splice(j, 0, favs.splice(i, 1)[0]); saveState(current, true); renderFavs(current);
       const card = document.querySelector(`.fav[data-i="${j}"]`); card && card.scrollIntoView({block:"nearest", inline:"nearest"}); } return; }
-  if ((el = c("[data-reset]"))) { const f = current.state.favorites[+el.dataset.reset]; f.text = textAt(current, f.shot); f.corrected = false; saveState(current, true); return renderFavs(current); }
+  if ((el = c("[data-reset]"))) { const f = current.state.favorites[+el.dataset.reset]; f.text = textAt(current, f.shot); f.corrected = false; if (typed[current.id]) typed[current.id].delete(f.shot); saveState(current, true); return renderFavs(current); }
   if ((el = c("[data-rename]"))) { const old = el.closest(".group").dataset.cat; const n = prompt("Rename category", old); if (n && n.trim() && n.trim() !== old) catAction({action:"rename", name: old, new: n.trim()}); return; }
   if ((el = c("[data-delcat]"))) { const n = el.closest(".group").dataset.cat; if (confirm(`Delete category "${n}"? Its reels move to Unassigned.`)) catAction({action:"delete", name: n}); return; }
   if ((el = c("[data-catfold]"))) return catFold(el.dataset.catfold);
@@ -7547,11 +7818,15 @@ document.addEventListener("click", async e => {
     case "viewbtn": if (mode === "transcripts") setMode("reels"); return setView(view === "gallery" ? "detail" : "gallery");
     case "expandbtn": return toggleFull();
     case "closelog": return $("#log").classList.remove("show");
+    case "unsavedcopy": return copyText($("#unsavedtext").value, "Copied - paste it where it belongs with Ctrl+V");
+    case "unsavedok": { if (current) delete current.unsaved; const u = $("#unsaved"); if (u) u.remove(); return; }
     case "savenotes": {
       clearTimeout(notesTimers[current.id]); delete pending["n:" + current.id];
       if (isBusy(current)) return;
-      try { await api("/api/notes", {id: current.id, notes: $("#notes").value, sb: sbAt(current)}); current.notes = $("#notes").value; delete current.notesDraft; $("#saved").textContent = "Saved into note.md"; $("#saved").hidden = false; }
-      catch (err) { saveFailed(current, err, "notes"); } return;
+      const r = current, text = $("#notes").value;
+      r.notesDraft = text;                   // kept to copy from if the save is refused (R-04)
+      try { await chain(r.id, () => api("/api/notes", notesBody(r, text))); notesSaved(r, text, "Saved into note.md"); }
+      catch (err) { saveFailed(r, err, "notes"); } return;
     }
     case "run": {
       if (runBusy) return;
@@ -7599,6 +7874,7 @@ document.addEventListener("input", e => {
   if (e.target.classList.contains("favtext")) {
     const f = current.state.favorites[+e.target.dataset.i];
     f.text = e.target.value;
+    (typed[current.id] = typed[current.id] || new Map()).set(f.shot, f.text);    // kept to copy if its save is refused (R-04)
     f.corrected = f.text.trim() !== textAt(current, f.shot).trim();
     const foot = e.target.nextElementSibling;
     foot.querySelector(".corr").hidden = !f.corrected; foot.querySelector("[data-reset]").hidden = !f.corrected;
@@ -8267,7 +8543,7 @@ let lastRunTargets = new Set(), runBusy = false, polling = false, changedSeq = n
 function takeChanged(list, boot){          // reels an inbox Add filled in since we last looked: reload them
   const L = Array.isArray(list) ? list : [], ids = new Set();
   if (changedSeq === null) return ids;     // nothing loaded yet: the first list sets the starting point
-  if (boot && boot !== bootId) { bootId = boot; changedSeq = 0; }   // the app was restarted: its count starts again
+  if (boot && boot !== bootId) { restarted(); return ids; }         // the app was restarted: the whole library reloads (R-04)
   L.forEach(c => { if (c.seq > changedSeq) ids.add(c.folder); });
   changedSeq = L.reduce((m, c) => Math.max(m, c.seq || 0), changedSeq);
   return ids;
