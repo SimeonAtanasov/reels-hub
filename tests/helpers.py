@@ -9,6 +9,8 @@ import json, os, shutil, sys, tempfile, traceback
 from pathlib import Path
 
 APP = Path(__file__).resolve().parent.parent
+REAL_APPDATA = os.environ.get("APPDATA")      # before Env replaces it: on Windows Python's own per-user packages
+                                             # (numpy, faster-whisper) live under it, which a pipeline run needs
 FAKE_JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 60 + b"\xff\xd9"      # only copied by the app, never decoded here
 
 

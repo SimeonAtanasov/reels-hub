@@ -322,6 +322,7 @@ INBOX = {"checked": "", "error": "", "busy": False, "queue": [], "adding": None,
          "whoami_at": 0.0, "last": None, "partial": {}}   # partial: share id -> reel downloaded but not filled in
 INBOX_LOCK = threading.RLock()           # also guards RUNQ: both lines of waiting work change only under it
 INBOX_WAKE = threading.Event()
+REDONE = {}                              # reel id -> "ok" | "failed": how its last Re-process ended (the page's toast)
 CHANGED = {"seq": 0, "list": []}         # reels an inbox Add filled in [{seq, folder}]: the page reloads them
 BOOT = os.urandom(6).hex()               # a new count each start: an open page notices the restart
 APP_DATE = "2026-11-15"                  # the day of the last change to reels_hub.py or reels2notes.py: set it with each
@@ -4533,9 +4534,14 @@ def _run_job(urls, max_shots, redo, flags, target, share, done, job=JOB):
                 st = read_state(folder)
                 if not st.get("_bad") and st["favorites"]:
                     st["favorites"] = []; write_state(folder, st); write_note_favorites(folder, [])
-                    job["log"].append("-- favorites cleared (the snapshots were replaced)")
-        elif redo and target:
-            job["log"].append("-- the run failed, so this video's favorites were kept")
+                    job["log"].append("-- favorites cleared (the snapshots were replaced; the old ones are in the "
+                                      "reels folder's _trash)")
+        elif redo and target:                          # the pipeline left shots/ alone (audit R-03)
+            job["log"].append("-- the run failed, so this video's snapshots and favorites are as they were")
+        if redo and target:
+            REDONE[target] = "ok" if proc.returncode == 0 else "failed"
+            while len(REDONE) > 50:
+                REDONE.pop(next(iter(REDONE)))
         job["log"].append(f"-- finished (exit code {proc.returncode})")
     except Exception as e:
         job["log"].append(f"-- could not start: {e}")
@@ -4648,7 +4654,7 @@ class Handler(BaseHTTPRequestHandler):
                             "busy": sorted(JOB["busy"]) if JOB["running"] else [],
                             "transcripts": bool(TRJOB["running"]),
                             "queue": queue_list(), "changed": CHANGED["list"], "boot": BOOT, "homes_job": dict(HOMES),
-                            "awake": AWAKE["on"], "online": lib_public()})
+                            "awake": AWAKE["on"], "online": lib_public(), "redone": dict(REDONE)})
         elif path.startswith("/media/"):
             self.serve_file(path[len("/media/"):])
         else:
@@ -6312,15 +6318,15 @@ function saveShotsChoice(){ try { localStorage.setItem("rh-maxshots", $("#maxsho
 async function reprocess(r){
   if (!r.url) return alert("This reel has no source link, so it can't be re-processed.");
   const n = shotsValue(), nTxt = shotsText(n);
-  const favNote = r.state.favorites.length ? `\n\nIts ${r.state.favorites.length} favorite${r.state.favorites.length===1?"":"s"} will be cleared when it finishes, because the snapshots are replaced (they are kept if the run fails).` : "";
-  if (!confirm(`Re-process this video with ${nTxt}?\n\nThe transcript and snapshots are made again from the downloaded video (no new download). Your Obsidian note is not changed.${favNote}`)) return;
+  const favNote = r.state.favorites.length ? `\n\nIts ${r.state.favorites.length} favorite${r.state.favorites.length===1?"":"s"} will be cleared when it finishes, because the snapshots are replaced.` : "";
+  if (!confirm(`Re-process this video with ${nTxt}?\n\nThe transcript and snapshots are made again from the downloaded video (no new download). Your Obsidian note is not changed.${favNote}\n\nThe old snapshots (edited and hand-taken ones too) move to the reels folder's _trash when it finishes. If the run fails, nothing changes.`)) return;
   await flushSaves();
   let j;
   try { j = await api("/api/run", {target: r.id, action: "redo", max_shots: n}); } catch (e) { return alert(e.message); }
   busyEpoch++; busyIds.add(r.id); lastRunTargets.add(r.id);
   if (j.queued) waitingIds.add(r.id);
   showBusy();
-  toast(j.queued ? `Re-process queued: ${queuedText(j.queued)}` : "Re-processing... favorites are cleared only if it succeeds");
+  toast(j.queued ? `Re-process queued: ${queuedText(j.queued)}` : "Re-processing... nothing changes unless it succeeds");
   openLog("video"); ensurePoll();
 }
 async function newVersion(r){
@@ -7980,7 +7986,11 @@ async function reloadChanged(ids){       // reels a run changed: take the server
   const redone = [...ids].filter(id => lastRunTargets.has(id));
   redone.forEach(id => lastRunTargets.delete(id));
   try { await loadReels(current && current.id, ids); } catch (e) {}
-  if (current && redone.includes(current.id)) toast("Re-process finished");
+  if (current && redone.includes(current.id)) {       // say what really happened (audit R-03)
+    const res = lastStatus && lastStatus.redone ? lastStatus.redone[current.id] : "";
+    if (res === "failed") toastLong("Re-process failed: the snapshots and favorites are as they were (see the Log)");
+    else toast("Re-process finished");
+  }
 }
 function syncBusy(s, q, ep){
   // Paused reels come from the server: the one being re-processed (or filled in from the inbox) and the

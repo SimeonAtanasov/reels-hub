@@ -678,6 +678,66 @@ def replace_retry(src, dst, tries=60):
             time.sleep(0.05 if i < 20 else 0.2)
 
 
+def folder_id(info, url=""):
+    """The video's id as it may appear in a folder name (audit R-09): only letters, digits, '.', '_' and '-'
+    (anything else becomes '_'), no leading dots, no trailing dots or spaces, at most 80 characters; a hash of the
+    link when nothing is left. A site decides the id: '../../x' or 'a\\b' must never become a path, and Windows
+    cannot store ':' or a trailing dot. The ids of the four sites already are plain, so their folders keep their name."""
+    raw = str(info.get("id") or "")
+    vid = re.sub(r"[^0-9A-Za-z._-]+", "_", raw).lstrip(".")[:80].rstrip(". ")
+    if not vid.strip("._-"):
+        import hashlib
+        vid = "id" + hashlib.sha1((url or raw).encode("utf-8")).hexdigest()[:12]
+    return vid
+
+
+def folder_name(info, url=""):
+    """<date>_<id> for a reel folder and a transcript folder. A video without an upload date gets 00000000, as the
+    transcripts lane always did: a name starting with '_' is hidden by every listing (audit R-21)."""
+    date = str(info.get("upload_date") or "")
+    return f"{date if re.fullmatch(r'[0-9]{8}', date) else '00000000'}_{folder_id(info, url)}"
+
+
+def inside(parent, child):
+    """True when child is a plain folder directly inside parent (checked again before every rename, audit R-09)."""
+    try:
+        return Path(child).resolve().parent == Path(parent).resolve() and Path(child).name not in ("", ".", "..")
+    except OSError:
+        return False
+
+
+SHOTS_NEW = "shots.new"        # where a run makes its snapshots; shots/ is left alone until the note is written (R-03)
+
+
+def shots_stage(workdir):
+    """A fresh <reel>/shots.new/ for this run's snapshots (what a run that broke off left there is removed first)."""
+    stage = workdir / SHOTS_NEW
+    if stage.exists():
+        shutil.rmtree(stage)
+    stage.mkdir()
+    return stage
+
+
+def shots_commit(out, workdir, stage):
+    """The run is done (note.md written): the old set (shots/ with the edited originals in shots/_orig, shots.json,
+    shots_manual.json) moves to <reels>/_trash/<reel>-shots-<time>/ (a rename, as for a deleted reel: you can still
+    take an edited or hand-taken snapshot back from there), then the new set takes its place. Audit R-03."""
+    old = [workdir / n for n in ("shots", "shots.json", "shots_manual.json") if (workdir / n).exists()]
+    if old:
+        base = Path(out) / "_trash" / f"{workdir.name}-shots-{time.strftime('%Y%m%d-%H%M%S')}"
+        trash, k = base, 2
+        while trash.exists():
+            trash = base.with_name(f"{base.name}-{k}"); k += 1
+        trash.mkdir(parents=True)
+        for f in old:
+            replace_retry(f, trash / f.name)
+        print(f"  the old snapshots moved to _trash/{trash.name}")
+    for n in ("shots", "shots.json"):
+        if (stage / n).exists():
+            replace_retry(stage / n, workdir / n)
+    shutil.rmtree(stage, ignore_errors=True)
+
+
 def write_note(workdir, url, info, shots, transcript, lang, ocr_lines, owner="", slides=None, extra=()):
     author = info.get("uploader") or info.get("channel") or "unknown"
     caption = (info.get("description") or "").strip()
@@ -918,10 +978,12 @@ def load_slides(workdir):
         return None
 
 
-def slide_shots(workdir, slides, max_shots=0, every=0):
+def slide_shots(workdir, slides, max_shots=0, every=0, into=None):
     """Snapshots of a slideshow: each photo slide's full image (time = middle of the slide), and for video
-    slides a frame every few seconds (as Auto would). A fixed maximum thins the video frames only."""
-    shots = workdir / "shots"
+    slides a frame every few seconds (as Auto would). A fixed maximum thins the video frames only.
+    into: where shots/ and shots.json go (the run's shots.new/), default workdir."""
+    into = into or workdir
+    shots = into / "shots"
     shots.mkdir(exist_ok=True)
     sd = workdir / "slides"
     photos, frames = [], []
@@ -951,14 +1013,14 @@ def slide_shots(workdir, slides, max_shots=0, every=0):
         shutil.rmtree(d, ignore_errors=True)
     print(f"  {len(files)} snapshots ({len(photos)} photo slides"
           f"{f' + {len(frames)} frames from video slides' if frames else ''})")
-    (workdir / "shots.json").write_text(json.dumps(dict(zip([f.name for f in files], times)), indent=1),
+    (into / "shots.json").write_text(json.dumps(dict(zip([f.name for f in files], times)), indent=1),
                                         encoding="utf-8")
     return files
 
 
 def new_version(out, workdir, video, info):
     """Copy the downloaded video into <date>_<id>_v2 (v3, ...) so it can be processed again separately."""
-    base = f"{info.get('upload_date', '')}_{info['id']}"
+    base = re.sub(r"_v\d+$", "", workdir.name)        # the versions sit beside the folder they come from
     k = 2
     while (out / f"{base}_v{k}").exists():
         k += 1
@@ -1073,19 +1135,26 @@ def _process(url, args, i=1, n=1, stats=None):
                 video, info = download(url, tmp, args.browser, args.cookies, prog)
         finally:
             flag_clear(args.out, YIELD)
-        workdir = Path(args.out) / f"{info.get('upload_date', '')}_{info['id']}"
+        workdir = Path(args.out) / folder_name(info, url)
+        if not inside(args.out, workdir):
+            raise RuntimeError(f"the video's id {info.get('id')!r} does not make a folder inside the reels folder")
         tmp.rename(workdir)
         video = workdir / video.name
     if args.channel_category and not (workdir / "hub.json").exists():
         channel_category(Path(args.out), workdir, info, url)
-    shots_dir = workdir / "shots"
-    if shots_dir.exists():
-        shutil.rmtree(shots_dir)                             # also removes edited originals in shots/_orig
-    (workdir / "shots_manual.json").unlink(missing_ok=True)  # your own snapshots are gone with the old set
     print(f"  platform: {platform_of(url, info)} - {info.get('title') or info.get('id')}")
+    stage = shots_stage(workdir)       # the old snapshots, edited and hand-taken ones too, stay until this run is done
+    try:
+        _process_body(url, args, workdir, video, info, prog, stage)
+    except BaseException:
+        shutil.rmtree(stage, ignore_errors=True)            # a failed run leaves the reel as it was (audit R-03)
+        raise
+
+
+def _process_body(url, args, workdir, video, info, prog, stage):
     slides = load_slides(workdir)
     if slides:
-        return _process_slides(url, args, workdir, video, info, slides, prog)
+        return _process_slides(url, args, workdir, video, info, slides, prog, stage)
     dur = video_duration(video) or float(info.get("duration") or 0)
     prog.plan(dur)
     est = sum(prog.est.values())
@@ -1095,7 +1164,7 @@ def _process(url, args, i=1, n=1, stats=None):
     transcript, lang, starts = transcribe(video, args.model, args.lang, prog, args.out)
     prog.start("snapshots")
     t0 = time.time()
-    shots = snapshots(video, workdir, args.scene, args.max_shots, starts, prog, args.every)
+    shots = snapshots(video, stage, args.scene, args.max_shots, starts, prog, args.every)
     if dur > 5:
         learn(args.out, prog.stats, "shot_factor", (time.time() - t0) / dur)
     prog.plan(dur, len(shots))
@@ -1105,12 +1174,13 @@ def _process(url, args, i=1, n=1, stats=None):
         step = max(1, -(-len(shots) // args.ocr_max))       # read text from at most --ocr-max frames
         ocr_lines = ocr(shots[::step], prog, args.out)
     note = write_note(workdir, url, info, shots, transcript, lang, ocr_lines, args.owner)
+    shots_commit(args.out, workdir, stage)
     print(f"  done in {fmt_dur(time.time() - prog.t0)} ({prog.steps()}) -> {note}")
     # for Reels Hub: which folder this link went to (an Add from the inbox fills in that reel next)
     print("@@DONE " + json.dumps({"url": url, "folder": workdir.name}), flush=True)
 
 
-def _process_slides(url, args, workdir, video, info, slides, prog):
+def _process_slides(url, args, workdir, video, info, slides, prog, stage):
     """The rest of a slideshow: transcript only if a slide is a video, snapshots from the slides, OCR, note."""
     dur = sum(float(s.get("dur") or 0) for s in slides) or video_duration(video)
     videos = [s for s in slides if s["kind"] == "video"]
@@ -1124,7 +1194,7 @@ def _process_slides(url, args, workdir, video, info, slides, prog):
         prog.start("transcribe")
         transcript, lang, _ = transcribe(video, args.model, args.lang, prog, args.out)
     prog.start("snapshots")
-    shots = slide_shots(workdir, slides, args.max_shots, args.every)
+    shots = slide_shots(workdir, slides, args.max_shots, args.every, stage)
     prog.plan(sum(float(s["dur"]) for s in videos), len(shots))
     ocr_lines = None
     if not args.no_ocr:
@@ -1132,6 +1202,7 @@ def _process_slides(url, args, workdir, video, info, slides, prog):
         step = max(1, -(-len(shots) // args.ocr_max))
         ocr_lines = ocr(shots[::step], prog, args.out)
     note = write_note(workdir, url, info, shots, transcript, lang, ocr_lines, args.owner, slides)
+    shots_commit(args.out, workdir, stage)
     print(f"  done in {fmt_dur(time.time() - prog.t0)} ({prog.steps()}) -> {note}")
     print("@@DONE " + json.dumps({"url": url, "folder": workdir.name}), flush=True)
 
@@ -1496,7 +1567,9 @@ def transcript_one(url, args, out, prog, source_hint="link"):
     vid = str(info.get("id") or "")
     title = (info.get("title") or vid).strip().replace("\n", " ")
     key, name = tr_key(info, url), tr_name(info, url)
-    dest = out / TR_DIR / key / f"{info.get('upload_date') or '00000000'}_{vid}"
+    dest = out / TR_DIR / key / folder_name(info, url)
+    if not inside(out / TR_DIR / key, dest) or not inside(out / TR_DIR, dest.parent):
+        raise RuntimeError(f"the video's id {vid!r} does not make a folder inside the reels folder")
     if dest.exists():
         shutil.rmtree(tmp)
         print(f"  already done: {title}")
