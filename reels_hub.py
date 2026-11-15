@@ -530,7 +530,45 @@ def write_state(folder, state):
     atomic_write(folder / "hub.json", json.dumps(state, indent=1, ensure_ascii=False))
 
 
+LIST_COND = threading.Condition()
+LIST = {"asked": 0, "done_for": 0, "running": False, "result": []}
+
+
 def list_reels():
+    """One library listing at a time (2026-11-15). Before, the page asked for /api/reels every second while a run went,
+    without waiting for the answer, so dozens of listings ran side by side and each took about 40 s. Now a request
+    that comes while a listing runs waits for the next one, which serves every request that came in the meantime."""
+    with LIST_COND:
+        LIST["asked"] += 1
+        me = LIST["asked"]
+        while True:
+            if LIST["done_for"] >= me:
+                return LIST["result"]
+            if not LIST["running"]:
+                break
+            LIST_COND.wait()
+        LIST["running"], covers = True, LIST["asked"]
+    ok, items = False, []
+    try:
+        items, ok = _list_reels(), True
+        return items
+    finally:
+        with LIST_COND:
+            LIST["running"] = False
+            if ok:
+                LIST["result"], LIST["done_for"] = items, covers
+            LIST_COND.notify_all()
+
+
+def count_reels():
+    """How many reels the library has, without reading them (the page's quiet check while a run goes)."""
+    if not OUT.exists():
+        return 0
+    return sum(1 for f in OUT.iterdir()
+               if f.is_dir() and not f.name.startswith(("_", ".")) and (f / "note.md").exists())
+
+
+def _list_reels():
     if not OUT.exists():
         return []
     start_homes()
@@ -4444,6 +4482,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"ok": True, "boot": BOOT})
         elif path == "/api/config":
             self.send_json(config_info())
+        elif path == "/api/reels/count":
+            self.send_json({"count": count_reels() if CONFIG.get("name") else 0})
+        elif path == "/api/reel":                       # one reel, fresh (the Paint check when the window gets focus)
+            rid = urllib.parse.parse_qs(urlparse(self.path).query).get("id", [""])[0]
+            r = parse_note(reel_dir(rid))
+            self.send_json({"reel": r} if r else {"error": "unknown reel"}, 200 if r else 404)
         elif path == "/api/reels":
             cl = CONFIG.get("cloud") or {}
             seq = CHANGED["seq"]                     # read before listing: later fill-ins count as changed
@@ -6655,8 +6699,8 @@ function edKey(e){
 window.addEventListener("focus", async () => {
   if (!current || ed) return;
   try {
-    const j = await api("/api/reels"), r = j.reels.find(x => x.id === current.id);
-    if (!r) return;
+    const r = (await api("/api/reel?id=" + encodeURIComponent(current.id))).reel;
+    if (!r || !current || r.id !== current.id) return;
     const changed = r.shots.some(s => (r.mt || {})[s] !== (current.mt || {})[s]);
     current.edited = r.edited;
     if (changed) { current.mt = r.mt; refreshShots(current);
@@ -7828,7 +7872,14 @@ async function removeQueued(el){
   lastQueueHtml = null; ensurePoll();
   if (kind === "add") refreshInbox(true);
 }
-async function refreshQuiet(){
+let quietBusy = false, quietAt = 0;
+async function refreshQuiet(){        // while a run goes: one check at a time, at most every 5 s, the count first (2026-11-15)
+  if (quietBusy || Date.now() - quietAt < 5000) return;
+  quietBusy = true;
+  try { await quietCheck(); } finally { quietBusy = false; quietAt = Date.now(); }
+}
+async function quietCheck(){
+  if ((await api("/api/reels/count")).count === reels.length) return;
   const j = await api("/api/reels");
   if (j.reels.length !== reels.length) {
     const known = new Map(reels.map(r => [r.id, r]));

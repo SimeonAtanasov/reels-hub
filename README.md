@@ -97,6 +97,8 @@ It opens http://127.0.0.1:8765. Paste links, one per line, and press **Run**. Th
 
 **The laptop stays awake while Reels Hub works:** while a video or a transcripts run is going, or anything waits in line to start by itself, Reels Hub asks Windows not to go to sleep (the screen can still turn off), so a long line is not paused halfway. When the line is done, or only items set for Later wait, Windows may sleep again as usual. The black window says when this starts and stops. Closing the lid, the Sleep button or a low battery still put the laptop to sleep: for a long line keep it plugged in with the lid open. To check it, in a Command Prompt opened as administrator: `powercfg /requests` lists python.exe under SYSTEM while Reels Hub keeps the PC awake.
 
+**Messages in the black window:** "library listed in Ns: n videos, m notes not found in the vault" shows when reading the whole library took more than 10 seconds (n = your videos; m = videos whose Obsidian note is no longer where the app left it, 0 is good). "Online copy: Can't reach ... (trying again in 5 min)" means the laptop had no internet at that moment; it tries again by itself.
+
 The top right of the page shows **Connected to this PC** with a green dot while the app answers. Keep its black Command Prompt window open while you use it: when that window is closed, the status turns yellow within a few seconds and says *The server does not answer: start Reels Hub again*. Start it again (**Reels Hub** on the desktop, or `reels-hub.bat`) and the open page connects by itself. Changes made while it is yellow can't be saved (the app tells you when a save fails).
 
 Command line only:
