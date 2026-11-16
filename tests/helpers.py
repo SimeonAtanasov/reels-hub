@@ -94,6 +94,18 @@ class Env:
         root = Path(root or self.vault)
         return {p.relative_to(root).as_posix(): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
 
+    def retry(self, call, tries=60):
+        """Do what the test itself does to a file or folder (rename, delete), trying again for a few seconds when
+        Windows says another program has it open (a virus scanner looking at a file that was just written)."""
+        import time
+        for k in range(tries):
+            try:
+                return call()
+            except PermissionError:
+                if k == tries - 1:
+                    raise
+                time.sleep(0.1)
+
     # ---------- results ----------
     def check(self, name, cond, detail=""):
         (self.ok if cond else self.bad).append(name)

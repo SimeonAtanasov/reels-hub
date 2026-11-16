@@ -659,6 +659,57 @@ def read_text(path):
     return Path(path).read_text(encoding="utf-8", errors="replace")
 
 
+# ---------------------------------------------------------------- a vault note read to be written again (audit R-53)
+# Before, every rewrite of a vault note went through read_text and atomic_write: a byte that is not UTF-8 (a line typed
+# in another editor) came back as U+FFFD, and on Windows text mode turned every "\n" of the note into "\r\n". Now
+# the note is read and written as bytes. note_read gives the text with "\n" line ends for the app's patterns, the odd
+# bytes carried as lone surrogates (surrogateescape), and the text as it is in the file; note_write puts the same
+# bytes back and gives every line the line end it had (a line the app adds or changes gets the note's usual one).
+# A note the app makes itself has "\n" line ends, as Obsidian's own notes have.
+
+def note_read(path):
+    """(text, raw) of a vault note that may be written again: text for the patterns, raw for note_write."""
+    raw = Path(path).read_bytes().decode("utf-8", errors="surrogateescape")
+    return raw.replace("\r\n", "\n"), raw
+
+
+def _line_ends(raw, text):
+    """text (with "\n" line ends) with the line ends of raw, the note as it was read."""
+    if "\r\n" not in raw:
+        return text
+    old, new = raw.split("\n"), text.split("\n")
+    last = len(old) - 1
+    crlf = [i < last and l.endswith("\r") for i, l in enumerate(old)]
+    usual = sum(crlf) * 2 >= last                       # what most lines have: for the lines the app writes
+    if sum(crlf) == last:                              # every line: the common case, a note the app wrote before
+        return text.replace("\n", "\r\n")
+    bare = [l[:-1] if c else l for l, c in zip(old, crlf)]
+    a = 0                                              # the same lines at the top and at the bottom keep theirs
+    while a < min(len(bare), len(new)) and bare[a] == new[a]:
+        a += 1
+    z = 0
+    while z < min(len(bare), len(new)) - a and bare[-1 - z] == new[-1 - z]:
+        z += 1
+    ends = crlf[:a] + [usual] * (len(new) - a - z) + (crlf[len(crlf) - z:] if z else [])
+    mid_old, mid_new = bare[a:len(bare) - z], new[a:len(new) - z]
+    if mid_old and mid_new and len(mid_old) * len(mid_new) <= 4_000_000:      # unchanged lines between two changes
+        import difflib
+        for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, mid_old, mid_new, autojunk=False).get_opcodes():
+            if tag == "equal":
+                ends[a + j1:a + j2] = crlf[a + i1:a + i2]
+    ends[-1] = False                                   # the last piece has no line end after it
+    return "\n".join(l + "\r" if e else l for l, e in zip(new, ends))
+
+
+def note_write(path, text, raw=None):
+    """Write a vault note. raw: the note as note_read gave it (its bytes and line ends are kept); None: a new note."""
+    if raw is None:
+        data = text.encode("utf-8")
+    else:
+        data = _line_ends(raw, text).encode("utf-8", errors="surrogateescape")
+    atomic_write_bytes(path, data)
+
+
 def reel_dir(rid):
     """A reel folder from an id sent by the page: a plain folder name directly inside the reels folder."""
     if not isinstance(rid, str) or not re.fullmatch(r"[^/\\:*?\"<>|\x00-\x1f]{1,200}", rid) \
@@ -1149,7 +1200,7 @@ def _list_reels():
                 obs = None
         if obs is None:
             try:
-                obs = ensure_vault_note(f, r)
+                obs = ensure_vault_note(f, r, since=t0)   # a note not at its place: one vault walk per listing (R-13)
             except Exception as e:
                 obs = {"error": f"Obsidian: {e}"}
             # ensure_vault_note may have changed hub.json after parse_note read it: a video that took over its
@@ -1209,9 +1260,13 @@ AI_SECTIONS = ["Obsidian Tags", "Summary", "Memorable Things / Main Takeaways", 
                "Reflective Questions", "Actionable Insights", "Compare and Contrast"]
 AI_TODO = "<!-- reels-hub:ai-todo - ask Claude to fill this in, or use \"Copy AI prompt\" in Reels Hub -->"
 MISS = {}                                   # reel id -> time of the last failed vault search
-VIDX = {"at": 0.0, "map": {}, "n": 0}       # reel id -> note paths, from one walk over the vault (_vault_index)
-VIDX_LOCK = threading.Lock()
-VIDX_AGE = 120                              # seconds an index is reused: one vault walk per listing, not one per note
+MISS_KEEP = 60                              # seconds a note that was not found is left alone (audit R-13: was 30 min)
+TWICE = set()                               # ids that two or more notes carry: named once in the black window
+VIDX = {"at": 0.0, "map": {}, "n": 0,       # reel id -> note paths, from a walk over the vault (_vault_index)
+        "files": {}, "vault": ""}           # files: note path -> ((mtime_ns, size), its ids), so the next walk
+VIDX_LOCK = threading.Lock()                # opens only new and changed notes
+VIDX_AGE = 120                              # seconds an index is reused for a hit; a miss walks again (R-13)
+VIDX_SETTLE = 2_000_000_000                 # ns: a note changed in the last 2 s is opened again at the next walk
 
 
 def vault_ok():
@@ -1234,53 +1289,114 @@ def _marker(reel_id):
     return f"<!-- reels-hub:id={reel_id} -->"
 
 
-def find_vault_note(folder, r, state):
-    """Where the reel's note is now: the saved path, or wherever you moved it in the vault."""
+def _named_note(r, state):
+    """The note of a video from before note_path was kept: <platform folder>/<note_name>.md, taken only when that
+    file carries the video's id (audit R-13: a note of your own with the same file name was taken by its name)."""
+    name = state.get("note_name")
+    if not name or not isinstance(name, str):
+        return None
+    old = f"{vault_dir(r['platform'])}/{name}.md"
+    try:
+        if (VAULT / old).is_file() and has_marker(read_text(VAULT / old), r["id"]):
+            return old
+    except OSError:
+        pass
+    return None
+
+
+def _id_hits(rid, since=None):
+    """The notes that carry this id, by the vault index. since: the index must be from that moment or later (a
+    walk is made when it is older); None: the index as it is, at most VIDX_AGE old."""
+    return [h for h in _vault_index(since).get(rid, []) if (VAULT / h).is_file()]
+
+
+def find_vault_note(folder, r, state, since=None, fresh=False):
+    """Where the reel's note is now: the saved path, or wherever you moved it in the vault (audit R-13). A note that
+    is not at its place is looked up by its id in the vault index; when the index does not have it, the vault is
+    walked once more (the index may be from before the move) and only then the miss is kept, for MISS_KEEP seconds.
+    since: the moment the caller's listing began: one walk after it serves every note of that listing; None: now.
+    fresh: look now, whatever was found or not found before (Send to Obsidian, before it makes a new note)."""
+    began = time.time()
     rel = state.get("note_path") or ""
     if rel and (VAULT / rel).is_file():
         return rel
-    if state["note_name"]:                                  # notes made by older versions
-        old = f"{vault_dir(r['platform'])}/{state['note_name']}.md"
-        if (VAULT / old).is_file():
-            return old
+    old = _named_note(r, state)                             # notes made by older versions
+    if old:
+        return old
     if not (rel or state["note_name"]) and not _lost_hub(folder):
         return None                                         # never created: nothing to look for
-    if time.time() - MISS.get(r["id"], 0) < 1800:        # a full vault scan is costly on OneDrive
+    if not fresh and began - MISS.get(r["id"], 0) < MISS_KEEP:
         return None
-    hits = [h for h in _vault_index().get(r["id"], []) if (VAULT / h).is_file()]   # it was moved or renamed in Obsidian
+    hits = [] if fresh else _id_hits(r["id"])               # it was moved or renamed in Obsidian
+    if not hits:                                            # not in the index: it may be from before the move
+        hits = _id_hits(r["id"], began if since is None else since)
     if len(hits) == 1:
+        MISS.pop(r["id"], None)
         return hits[0]
-    if len(hits) > 1:
+    if len(hits) > 1 and r["id"] not in TWICE:              # said once per start, not at every look
+        TWICE.add(r["id"])
         print(f"  {len(hits)} notes carry the id {r['id']} (a copy?) - not guessing: {hits}")
     MISS[r["id"]] = time.time()
     return None
 
 
-def _vault_index(max_age=VIDX_AGE):
+def _note_ids(path):
+    """The video ids a note carries in its first 4000 characters, as whole lines (R-14)."""
+    with open(path, encoding="utf-8", errors="ignore") as fh:
+        head = fh.read(4000)
+    return tuple(sorted(set(re.findall(r"^[ \t]*<!-- reels-hub:id=(\S+?) -->[ \t]*$", head, re.M))
+                        | set(re.findall(r"^reel_id:\s*(\S+)\s*$", head, re.M))))
+
+
+def _vault_index(since=None):
     """Reel id -> note paths (vault-relative), read from the head of every note (2026-11-11). Before, each note not at
     its saved path walked the whole vault on its own, under DATA_LOCK: with many such notes on OneDrive a library
-    listing took about 6 minutes and every other request waited. Now one walk serves them all for VIDX_AGE seconds,
-    and ensure_vault_note starts it before taking DATA_LOCK."""
+    listing took about 6 minutes and every other request waited. One walk serves them all, and ensure_vault_note
+    starts it before taking DATA_LOCK.
+    2026-11-16 (audit R-13): the walk keeps each note's time stamp and size with its ids, so the next walk only
+    lists the folders and opens the notes that are new, moved, renamed or changed. That makes a fresh look cheap
+    enough to take before a note is called "not found". since=None: the index as it is when it is younger than
+    VIDX_AGE; since=<time>: an index made at that moment or later (else the vault is walked now)."""
     with VIDX_LOCK:
-        if time.time() - VIDX["at"] < max_age:
+        now = time.time()
+        same = VIDX["vault"] == str(VAULT)
+        if same and VIDX["at"] and (now - VIDX["at"] < VIDX_AGE if since is None else VIDX["at"] >= since):
             return VIDX["map"]
-        t0, idx, n = time.time(), {}, 0
-        for p in VAULT.rglob("*.md"):
-            rel = p.relative_to(VAULT)
-            if any(part.startswith(".") for part in rel.parts):
-                continue
+        known = VIDX["files"] if same else {}
+        idx, files, opened, stack, now_ns = {}, {}, 0, [(VAULT, "")], time.time_ns()
+        while stack:
+            d, pre = stack.pop()
             try:
-                with open(p, encoding="utf-8", errors="ignore") as fh:
-                    head = fh.read(4000)
+                with os.scandir(d) as it:
+                    entries = list(it)
             except OSError:
                 continue
-            n += 1
-            ids = set(re.findall(r"^[ \t]*<!-- reels-hub:id=(\S+?) -->[ \t]*$", head, re.M)) \
-                | set(re.findall(r"^reel_id:\s*(\S+)\s*$", head, re.M))           # whole lines only (R-14)
-            for i in ids:
-                idx.setdefault(i, []).append(rel.as_posix())
-        VIDX.update(at=time.time(), map=idx, n=n)
-        print(f"  looked for moved notes: {n} notes in the vault read in {time.time() - t0:.1f}s")
+            for e in entries:
+                if e.name.startswith("."):                  # .obsidian, .trash, hidden files
+                    continue
+                try:
+                    if e.is_dir(follow_symlinks=False):
+                        stack.append((e.path, pre + e.name + "/"))
+                        continue
+                    if not e.name.lower().endswith(".md"):
+                        continue
+                    st = e.stat()                           # on Windows from the folder's own list: no extra call
+                    sig, rel = (st.st_mtime_ns, st.st_size), pre + e.name
+                    hit = known.get(rel)
+                    if hit and hit[0] == sig and now_ns - sig[0] > VIDX_SETTLE:
+                        ids = hit[1]
+                    else:
+                        ids = _note_ids(e.path); opened += 1
+                except OSError:
+                    continue
+                files[rel] = (sig, ids)
+                for i in ids:
+                    idx.setdefault(i, []).append(rel)
+        took = time.time() - now
+        first = not (same and VIDX["at"])
+        VIDX.update(at=time.time(), map=idx, n=len(files), files=files, vault=str(VAULT))
+        if first or took > 2:                               # the first walk reads every note; later ones say so only when slow
+            print(f"  looked for moved notes: {len(files)} notes in the vault, {opened} read, in {took:.1f}s", flush=True)
         return idx
 
 
@@ -1295,13 +1411,47 @@ def _lost_hub(folder):
 
 
 def _needs_search(r, state, folder=None):
-    """The note is not where hub.json says and was not looked for in the last 30 minutes."""
+    """The note is not where hub.json says and was not looked for in the last MISS_KEEP seconds."""
     rel = state.get("note_path") or ""
     if rel and (VAULT / rel).is_file():
         return False
     if not (rel or state.get("note_name")) and not (folder and _lost_hub(folder)):
         return False
-    return time.time() - MISS.get(r["id"], 0) >= 1800
+    if _named_note(r, state):
+        return False
+    return time.time() - MISS.get(r["id"], 0) >= MISS_KEEP
+
+
+def _twin_lost(folder):
+    """A video without a note of its own whose transcript-only twin has a note that is not at its place (moved in
+    Obsidian): the vault is walked before DATA_LOCK, so _adopt_transcript_note finds that note by its id."""
+    root = OUT / TR_DIR
+    try:
+        for cdir in (root.iterdir() if root.is_dir() else ()):
+            rec = cdir / folder.name
+            if not cdir.name.startswith((".", "_")) and (rec / "hub.json").is_file():
+                rel = _hub(rec).get("note_path") or ""
+                if isinstance(rel, str) and rel and not (VAULT / rel).is_file():
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def _note_now(folder, st):
+    """hub.json's note_path, or, when no file is there any more (the note was moved or renamed in Obsidian), the one
+    note the vault index has under this video's id (audit R-13: transcript-only notes were never looked for, and a
+    change made right after a move did not reach the note). st gets the new place: the caller writes it.
+    The caller holds DATA_LOCK, so only the index that is there already is asked: never a vault walk under the lock
+    (the listings do the walk, before they take it)."""
+    rel = st.get("note_path") or ""
+    if not isinstance(rel, str) or not rel or (VAULT / rel).is_file():
+        return rel if isinstance(rel, str) else ""
+    hits = [h for h in VIDX["map"].get(folder.name, []) if (VAULT / h).is_file()] if VIDX["vault"] == str(VAULT) else []
+    if len(hits) != 1:
+        return rel
+    st["note_path"], st["note_name"] = hits[0], Path(hits[0]).stem
+    return hits[0]
 
 
 def has_marker(text, rid):
@@ -1310,24 +1460,30 @@ def has_marker(text, rid):
         or re.search(rf"^reel_id:\s*{re.escape(rid)}\s*$", text, re.M) is not None   # a quoted marker is not one (R-14)
 
 
-def ensure_vault_note(folder, r):
-    """Create the reel's note once, in your note format; afterwards only the Favorites part is ever updated."""
+def ensure_vault_note(folder, r, since=None, fresh=False):
+    """Create the reel's note once, in your note format; afterwards only the Favorites part is ever updated.
+    since, fresh: see find_vault_note."""
     if not vault_ok():
         return {"error": f"Vault not found: {VAULT}"}
+    if since is None or fresh:
+        since = time.time()
     try:
-        if _needs_search(r, read_state(folder), folder):
-            _vault_index()                          # the slow part, before DATA_LOCK, so other requests go on
+        st = read_state(folder)
+        if not st.get("_bad") and ((fresh and (st.get("note_path") or st.get("note_name")))
+                                   or _needs_search(r, st, folder)
+                                   or (not (st.get("note_path") or st.get("note_name")) and _twin_lost(folder))):
+            _vault_index(since)                     # the walk, before DATA_LOCK, so other requests go on
     except Exception as e:
         print(f"  vault search: {e}")
     with DATA_LOCK:
-        return _ensure_vault_note(folder, r)
+        return _ensure_vault_note(folder, r, since, fresh)
 
 
-def _ensure_vault_note(folder, r):
+def _ensure_vault_note(folder, r, since=None, fresh=False):
     state = read_state(folder)
     if state.get("_bad"):
         return {"error": "hub.json is unreadable - not touching the Obsidian note"}
-    rel, created = find_vault_note(folder, r, state), False
+    rel, created = find_vault_note(folder, r, state, since, fresh), False
     if not rel:
         if state.get("note_path") or state["note_name"]:
             return {"missing": True, "error": "Obsidian note not found (deleted?) - Send to Obsidian creates a new one"}
@@ -1347,10 +1503,14 @@ def _ensure_vault_note(folder, r):
             name = f"{base} ({k})"; k += 1
         rel = f"{dname}/{name}.md"
         (VAULT / dname).mkdir(parents=True, exist_ok=True)
-        atomic_write(VAULT / rel, vault_note_text(folder, r, state))
+        note_write(VAULT / rel, vault_note_text(folder, r, state))
         created = True
     if rel != state.get("note_path"):
-        st = read_state(folder); st["note_path"] = rel; st["note_name"] = Path(rel).stem; write_state(folder, st)
+        st = read_state(folder); st["note_path"] = rel; st["note_name"] = Path(rel).stem
+        if created:                             # what the new note's Tags line carries is the app's (R-51)
+            st["cat_tag"] = ("#" + re.sub(r"[^0-9A-Za-z]+", "", st["category"].title())) if st["category"] else ""
+            st["tag_tokens"] = [t for t in dict.fromkeys(_tag_tok(x) for x in st["tags"]) if t]
+        write_state(folder, st)
     if created:                                 # after note_path is in hub.json: _set_creator_tag reads it there
         _new_note_creator(folder, rel)
     return {"name": Path(rel).stem, "path": rel, "uri": obsidian_uri(rel), "sent": state["sent"]}
@@ -1448,7 +1608,11 @@ def send_to_obsidian(reel_id):
         raise ValueError("unknown reel")
     _hub_ok(folder)                                           # unreadable hub.json: nothing is sent or changed (R-05)
     info = ensure_vault_note(folder, r)
+    if info.get("missing"):                                   # not found a moment ago: the vault is walked afresh
+        info = ensure_vault_note(folder, r, fresh=True)       # first, so a note that was only moved is taken (R-13)
     if info.get("missing"):                                   # note was deleted: make a fresh one
+        if len(_id_hits(reel_id)) > 1:
+            raise ValueError("More than one note in the vault carries this video's id - keep one of them, then send again")
         with DATA_LOCK:
             st = read_state(folder); st["note_path"] = ""; st["note_name"] = ""; write_state(folder, st)
         MISS.pop(reel_id, None)
@@ -1501,7 +1665,7 @@ def send_to_obsidian(reel_id):
     block = "\n".join(block).rstrip("\n")
 
     with DATA_LOCK:
-        text = read_text(path)
+        text, raw = note_read(path)
         _check_send_blocks(text, reel_id, info["path"])   # again: the note may have changed while the images copied
         new = _set_block(text, FAV_START, FAV_END, block, "Favorites")
         if new is None:                                # both marker lines removed by hand: append a fresh section
@@ -1518,14 +1682,24 @@ def send_to_obsidian(reel_id):
             fs = _marker_line_re(FAV_START).search(text)
             text = text[:fs.end()] + "\n" + vid_line + "\n" + text[fs.end():]
         cat = state["category"]
-        text = re.sub(r'^\*\*Category\*\*:.*$', lambda m: f'**Category**: {cat or "-"}', text, count=1, flags=re.M)
+        text = _set_category_line(text, reel_id, cat)
         fm = re.match(r"^---\n.*?\n---\n", text, re.S)                # older notes: only inside the frontmatter
         if fm:
             new_fm = re.sub(r'^category:.*$', lambda m: 'category: "' + cat.replace('"', "'") + '"', fm.group(0), count=1, flags=re.M)
             text = new_fm + text[fm.end():]
-        atomic_write(path, text)
+        note_write(path, text, raw)
         st = read_state(folder); st["sent"] = time.strftime("%Y-%m-%d %H:%M"); write_state(folder, st)
     return {"name": info["name"], "uri": info["uri"], "count": len(favs), "sent": st["sent"]}
+
+
+def _set_category_line(text, rid, cat):
+    """The note's **Category** line set to cat. Only the app's own line, which stands above the id marker (audit
+    R-51: the first line of that shape anywhere was taken, also one of yours further down). A note without such a
+    line above the marker (the template notes) gets none. Notes from before the marker (a reel_id: line): the first
+    one, as before."""
+    m = _marker_line_re(_marker(rid)).search(text)
+    head = text[:m.start()] if m else text
+    return re.sub(r"^\*\*Category\*\*:.*$", lambda _: f"**Category**: {cat or '-'}", head, count=1, flags=re.M) + text[len(head):]
 
 
 def _check_send_blocks(text, reel_id, rel):
@@ -1653,9 +1827,36 @@ def _note_there(folder, rel):
     return there
 
 
-def tr_item(folder, key, full=None):
+def _tr_moved(folder, rel, since):
+    """A transcript-only video's note is not where its hub.json says: where the vault index has its id now (audit
+    R-13: these notes were never looked for, so one moved by hand was "no note" for good and Get the video made a
+    second one). hub.json gets the new place. Returns it, or "" (not found, or more than one note with the id).
+    Asked together with _note_there, so at most every NOTE_CHECK seconds per item."""
+    if not vault_ok() or folder.parent.parent != OUT / TR_DIR:
+        return ""
+    try:
+        hits = _id_hits(folder.name, since)
+        if len(hits) != 1:
+            return ""
+        with DATA_LOCK:
+            st, bad = _hub_read(folder)
+            if bad or (st.get("note_path") or "") != rel or not has_marker(read_text(VAULT / hits[0]), folder.name):
+                return ""
+            st["note_path"], st["note_name"] = hits[0], Path(hits[0]).stem
+            _hub_write(folder, st)
+        print(f"  {folder.name}: its note was moved in the vault, found again at {hits[0]}")
+        TR_NOTE[str(folder)] = (time.time(), hits[0], True)
+        return hits[0]
+    except Exception as e:
+        print(f"  {folder.name}: note not looked up ({e})")
+        return ""
+
+
+def tr_item(folder, key, full=None, since=None, late=None):
     """One transcript-only video for the catalogue: reads note.md and hub.json only when their time stamp or size
-    changed. full: the names of the downloaded videos, when the caller has them (else the folder is asked)."""
+    changed. full: the names of the downloaded videos, when the caller has them (else the folder is asked).
+    since: the catalogue's start, for the look-up of a note that was moved (_tr_moved; None: no look-up).
+    late: a list that gets the folder when it never had a note (R-20)."""
     ns = _stamp(folder / "note.md")
     if ns is None:
         return None
@@ -1699,10 +1900,18 @@ def tr_item(folder, key, full=None):
             TR_CACHE.pop(str(folder), None)
         TR_NOTE.pop(str(folder), None)               # read again: its note may have moved with it
     rel = it.pop("note_path")
-    it["note"] = {"name": Path(rel).stem, "path": rel, "uri": obsidian_uri(rel)} if _note_there(folder, rel) else None
+    if not isinstance(rel, str):
+        rel = ""
+    found = _note_there(folder, rel)
+    if rel and not found and since is not None:
+        rel = _tr_moved(folder, rel, since) or rel
+        found = _note_there(folder, rel)
+    it["note"] = {"name": Path(rel).stem, "path": rel, "uri": obsidian_uri(rel)} if found else None
     it.pop("full_flag")
     there = (folder.name in full) if full is not None else (OUT / folder.name / "note.md").is_file()
     it["full"] = folder.name if there else None      # the same video, in full
+    if late is not None and not rel and not there:
+        late.append(folder)
     return it
 
 
@@ -1728,7 +1937,8 @@ def list_transcripts():
     """The catalogue: channels (folders in _transcripts) and their transcript-only videos."""
     start_homes()
     root = OUT / TR_DIR
-    chans, items = [], []
+    chans, items, late = [], [], []
+    since = time.time()                      # a moved note: one vault walk after this moment serves the whole call
     homes = read_homes()
     reels = _reel_folders()
     full = {f.name for f in reels}                               # the videos that are here in full, by folder name
@@ -1744,7 +1954,7 @@ def list_transcripts():
         except OSError:
             subs = []
         for f in subs:
-            it = tr_item(f, cdir.name, full)
+            it = tr_item(f, cdir.name, full, since, late)
             if it and not it["cat_set"] and home:                # no category yet: the channel's home
                 try:
                     _auto_category(f, homes)
@@ -1762,7 +1972,9 @@ def list_transcripts():
                       "run": tr_run_state(meta.get("run")), "wrong_lang": wrong})
     _add_reels(chans, items, reels)
     items.sort(key=lambda x: (x["date"], x["id"]), reverse=True)
-    return {"channels": chans, "items": items, "channel_cats": channel_cats(), "tags": read_tags(), "homes": homes}
+    making = late_notes(late)                                    # transcripts that never got a note (R-20)
+    return {"channels": chans, "items": items, "channel_cats": channel_cats(), "tags": read_tags(), "homes": homes,
+            "late": making}
 
 
 def _video_id(folder_name):
@@ -1850,19 +2062,27 @@ def _tr_set_category(folder, cat, prev=None, refresh=True):
         st["category"] = cat
         tag = ("#" + re.sub(r"[^0-9A-Za-z]+", "", cat.title())) if cat else ""
         old_tag = st.get("cat_tag") or ""
-        gone = {t for t in (old_tag, _tag_token(old_cat) if old_cat else "") if t} - set(st.get("tag_tokens") or [])
-        rel = st.get("note_path") or ""
+        mine = set(st.get("tag_tokens") or []) | {_tag_tok(x) for x in _clean_tags(st.get("tags"))}   # a tag's token stays
+        gone = {t for t in (old_tag, _tag_token(old_cat) if old_cat else "") if t} - mine
+        rel = _note_now(folder, st) if vault_ok() else (st.get("note_path") or "")
+        wrote = False
         if vault_ok() and rel and (VAULT / rel).is_file():
-            text = read_text(VAULT / rel)
+            text, raw = note_read(VAULT / rel)
             if has_marker(text, folder.name):
                 def tags(m):
                     parts = [t for t in m.group(1).split() if t not in gone and t != tag]
                     return "**Tags**: " + " ".join(parts + ([tag] if tag else []))
                 new = re.sub(r"^\*\*Tags\*\*:(.*)$", tags, text, count=1, flags=re.M)
-                new = re.sub(r"^\*\*Category\*\*:.*$", lambda m: f"**Category**: {cat or '-'}", new, count=1, flags=re.M)
+                new = _set_category_line(new, folder.name, cat)
                 if new != text:
-                    atomic_write(VAULT / rel, new)
-        st["cat_tag"] = tag
+                    note_write(VAULT / rel, new, raw)
+                wrote = True
+        # cat_tag is the category token the note carries (audit R-51). The note could not be written (the vault is
+        # away, the note is not at its place): it still carries the old one, which the next change must take out.
+        if wrote or not rel:
+            st["cat_tag"] = tag
+        elif not old_tag and old_cat:
+            st["cat_tag"] = _tag_token(old_cat)
         _hub_write(folder, st)
         forget_tr(folder)
         try:
@@ -2218,20 +2438,28 @@ def _write_item_tags(folder, tags, bump=False):
     tags = _clean_tags(tags)
     old = [t for t in st.get("tag_tokens") or [] if isinstance(t, str)]
     want = [t for t in dict.fromkeys(_tag_tok(x) for x in tags) if t]
-    keep = set(want) | {st.get("cat_tag") or "", _tag_token(st.get("category") or "")}
-    rel = st.get("note_path") or ""
+    keep = set(want) | {st.get("cat_tag") or "", _tag_token(st.get("category") or ""), str(st.get("creator_tag") or "")}
+    rel = _note_now(folder, st) if vault_ok() else (st.get("note_path") or "")
+    # tag_tokens = the tokens the app itself put on the line (audit R-51). Before, every token of the video's tags was
+    # kept there, so taking a tag off also removed a token typed by hand, or the creator's, when it was the same.
+    tokens = list(want) if not rel else list(old)      # no note yet: a new note gets them all; a note out of reach keeps its own
     if vault_ok() and rel and (VAULT / rel).is_file():
-        text = read_text(VAULT / rel)
+        text, raw = note_read(VAULT / rel)
         if has_marker(text, folder.name):
+            added = []
             def line(m):
                 parts = [t for t in m.group(1).split() if not (t in old and t not in keep)]
-                return "**Tags**: " + " ".join(parts + [t for t in want if t not in parts])
+                added.extend(t for t in want if t not in parts)
+                return "**Tags**: " + " ".join(parts + added)
             new = re.sub(r"^\*\*Tags\*\*:(.*)$", line, text, count=1, flags=re.M)
             if new != text:
-                atomic_write(VAULT / rel, new)
-    st["tags"], st["tag_tokens"] = tags, want
+                note_write(VAULT / rel, new, raw)
+            tokens = [t for t in want if t in old or t in added]
+    st["tags"], st["tag_tokens"] = tags, tokens
     if not tags:
-        st.pop("tags"); st.pop("tag_tokens")
+        st.pop("tags")
+    if not tokens:
+        st.pop("tag_tokens")
     _hub_write(folder, st, bump)
     forget_tr(folder)
     return tags
@@ -2308,7 +2536,7 @@ def _set_creator_tag(folder, write=True):
     rel = st.get("note_path") or ""
     if not (vault_ok() and rel and (VAULT / rel).is_file()):
         return "no note"
-    text = read_text(VAULT / rel)
+    text, raw = note_read(VAULT / rel)
     if not has_marker(text, folder.name):
         return "not the app's note"
     m = re.search(r"^\*\*Tags\*\*:(.*)$", text, re.M)
@@ -2325,7 +2553,7 @@ def _set_creator_tag(folder, write=True):
     if want not in parts:
         parts.append(want)
     if line_changes:
-        atomic_write(VAULT / rel, text[:m.start()] + "**Tags**: " + " ".join(parts) + text[m.end():])
+        note_write(VAULT / rel, text[:m.start()] + "**Tags**: " + " ".join(parts) + text[m.end():], raw)
     st["creator_tag"] = want
     _hub_write(folder, st)
     forget_tr(folder)
@@ -2604,11 +2832,91 @@ def transcript_note(folder, from_channel):
         (VAULT / dname).mkdir(parents=True, exist_ok=True)
         text = template_note_text(folder, r) if r["platform"] in TEMPLATE_FILES else \
             vault_note_text(folder, r, read_state(folder), tonly={"label": label, "video": TR_VIDEO_LINE})
-        atomic_write(VAULT / rel, text)
+        note_write(VAULT / rel, text)
         st.update(note_path=rel, note_name=name, **{"from": "channel" if from_channel else "link"})
         _hub_write(folder, st)
         _new_note_creator(folder, rel)
         return {"name": name, "path": rel, "uri": obsidian_uri(rel)}
+
+
+# ---------------------------------------------------------------- notes made late (audit R-20)
+# A transcript made while the vault was missing (its drive not there, the folder renamed) has no note, and nothing
+# made one afterwards: a second run skips what is here. Now the catalogue hands every transcript-only video whose
+# hub.json names no note to late_notes(), which makes them in a background thread once the vault is there, one video
+# at a time (DATA_LOCK per note, a short pause between two), then the channel notes. Never for a note that was made
+# and deleted by hand (hub.json still names its place), never while a transcripts run goes (it makes its own).
+
+LATE = {"running": False, "total": 0, "done": 0}
+LATE_LOCK = threading.Lock()
+LATE_IDLE = [0.0]                           # when a pass ended that could make none: the next one waits NOTE_CHECK
+
+
+def _from_channel(folder, st):
+    """Did this transcript come from a channel or playlist run? hub.json "from" says so (kept at the run since
+    2026-11-16 also when no note could be made); without it: the channel's _channel.json has a run record."""
+    if st.get("from") in ("channel", "link"):
+        return st["from"] == "channel"
+    return bool(_channel_meta(folder.parent).get("run"))
+
+
+def late_notes(folders):
+    """Start the pass for these transcript folders unless one runs, nothing is to do or the vault is away.
+    Returns {running, total, done} for the page."""
+    with LATE_LOCK:
+        if folders and not LATE["running"] and vault_ok() and not TRJOB["running"] \
+                and time.time() - LATE_IDLE[0] >= NOTE_CHECK:
+            LATE.update(running=True, total=len(folders), done=0)
+            threading.Thread(target=_late_notes, args=(list(folders),), daemon=True).start()
+        return dict(LATE)
+
+
+def _late_notes(folders):
+    made, chans, cut = 0, set(), False
+    try:
+        for f in folders:
+            try:
+                if TRJOB["running"] or not vault_ok():
+                    cut = True
+                    break
+                st, bad = _hub_read(f)
+                if not (f / "note.md").is_file() or bad or st.get("note_path") or (OUT / f.name / "note.md").is_file():
+                    continue                      # gone, unreadable, has one by now, or here in full (the video's note)
+                from_channel = _from_channel(f, st)
+                note = transcript_note(f, from_channel)
+                if note.get("path"):
+                    made += 1
+                    try:                          # the category and tags it was given meanwhile, onto the new note
+                        with DATA_LOCK:
+                            st = _hub(f)
+                            if "category" not in st:
+                                _auto_category(f)
+                            elif st.get("category"):
+                                _tr_set_category(f, str(st["category"]), prev=str(st["category"]), refresh=False)
+                            if _clean_tags(_hub(f).get("tags")):
+                                _write_item_tags(f, _hub(f).get("tags"))
+                    except Exception as e:
+                        print(f"  {f.name}: category or tags not written to the new note ({e})")
+                    if from_channel:
+                        chans.add(f.parent.name)
+                elif note.get("error"):
+                    print(f"  {f.name}: no Obsidian note ({note['error']})")
+            except Exception as e:
+                print(f"  {f.name}: no Obsidian note ({e})")
+            finally:
+                LATE["done"] += 1
+            time.sleep(PASS_BREATH)
+        for key in sorted(chans):
+            try:
+                channel_note(key)
+            except Exception as e:
+                print(f"  channel note of {key}: {e}")
+        if made:
+            print(f"  made {made} Obsidian note{'s' if made != 1 else ''} for transcripts that had none "
+                  "(the vault was not there when they were made)", flush=True)
+    finally:
+        with LATE_LOCK:
+            LATE["running"] = False
+            LATE_IDLE[0] = 0.0 if made or cut else time.time()
 
 
 def channel_note(key, strict=False):
@@ -2636,8 +2944,9 @@ def channel_note(key, strict=False):
         mark = f"<!-- reels-hub:channel={key} -->"
         if not (rel and (VAULT / rel).is_file()):
             rel = _channel_note_path(key, meta, cname)
+        raw = None
         if (VAULT / rel).is_file():
-            text = read_text(VAULT / rel)
+            text, raw = note_read(VAULT / rel)
             if not has_channel_marker(text, key):
                 print(f"  {rel} is not this channel's note (its marker is missing) - not changing it")
                 return None
@@ -2663,7 +2972,7 @@ def channel_note(key, strict=False):
                               mark, "",
                               "## Videos (Reels Hub)", VIDS_START, _defuse_block(block), VIDS_END, "",
                               "## My notes", "", ""])
-        atomic_write(VAULT / rel, text)
+        note_write(VAULT / rel, text, raw)
         meta["note_path"] = rel
         _save_channel_meta(cdir, meta)
     return rel
@@ -2697,10 +3006,10 @@ def _adopt_transcript_note(folder, r):
         if not cdir.is_dir() or cdir.name.startswith((".", "_")) or not (rec / "note.md").is_file():
             continue
         st = _hub(rec)
-        rel = st.get("note_path") or ""
+        rel = _note_now(rec, st)                       # also a note that was moved by hand (R-13)
         if not rel or not (VAULT / rel).is_file():
             continue
-        text = read_text(VAULT / rel)
+        text, raw = note_read(VAULT / rel)
         if not has_marker(text, folder.name):
             continue
         try:
@@ -2713,7 +3022,7 @@ def _adopt_transcript_note(folder, r):
             text = text[:span[0]] + _defuse_block("\n".join(ocr + _text_lines(r))) + "\n" + text[span[1]:].lstrip("\n")
             text = re.sub(r"^\*\*Transcript:\*\* .*\n", "", text, count=1, flags=re.M)
             text = re.sub(r"^<!-- reels-hub:transcript=.*-->\n", "", text, count=1, flags=re.M)
-            atomic_write(VAULT / rel, text)
+            note_write(VAULT / rel, text, raw)
             print(f"  {rel}: the caption text was replaced by the full video's transcript")
         st["full"] = folder.name
         _hub_write(rec, st)
@@ -3728,14 +4037,20 @@ def save_edit(reel_id, name, data_url):
 
 
 def reset_edit(reel_id, name):
-    import shutil
     p = _shot_path(reel_id, name)
     orig = p.parent / "_orig" / p.name
     if not orig.exists():
         raise ValueError("this snapshot has not been edited")
     with DATA_LOCK:
-        shutil.copy2(orig, p)
-        orig.unlink()
+        try:
+            kept = _bin_shot(p.parent.parent, p, "edited")    # the edited picture goes to _trash (R-52)
+        except OSError:
+            raise ValueError("this picture is in use - close Paint or the other program and try again")
+        try:
+            _move_file(orig, p)
+        except OSError:
+            _move_file(kept, p)                               # nothing changed
+            raise ValueError("the original is in use - close the other program and try again")
         os.utime(p, None)                     # new mtime so the browser reloads it
         forget_reel(p.parent.parent)
     return int(p.stat().st_mtime)
@@ -3784,10 +4099,17 @@ def delete_shots(reel_id, names, force=False):
                 continue
             p = folder / "shots" / n
             if p.exists():
-                p.unlink(); gone.append(n)
+                try:
+                    _bin_shot(folder, p)                   # into _trash, never removed for good (R-52)
+                except OSError:
+                    continue                               # in use (Paint): it stays, and stays listed
+                gone.append(n)
                 o = folder / "shots" / "_orig" / n
                 if o.exists():
-                    o.unlink()
+                    try:
+                        _bin_shot(folder, o, "_orig")
+                    except OSError:
+                        pass
         man = manual_shots(folder)
         if any(n in man for n in gone):
             atomic_write((folder / "shots_manual.json"), json.dumps([n for n in man if n not in gone]))
@@ -3807,10 +4129,28 @@ def delete_shots(reel_id, names, force=False):
 
 
 def _unique(dest):
+    """A name in a bin that is free: dest, else dest with the time, else with the time and a number (audit R-52:
+    two notes of one name deleted in the same second got the same name, and the second replaced the first)."""
     if not dest.exists():
         return dest
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    return dest.with_name(f"{dest.stem} ({stamp}){dest.suffix}")
+    new, k = dest.with_name(f"{dest.stem} ({stamp}){dest.suffix}"), 2
+    while new.exists():
+        new = dest.with_name(f"{dest.stem} ({stamp} {k}){dest.suffix}"); k += 1
+    return new
+
+
+def _bin_shot(folder, p, sub=""):
+    """Move a snapshot file into the reels folder's _trash (audit R-52: deleted snapshots, their originals and the
+    edited picture on Reset were removed for good, the only deletes of the app that went to no bin). They go to
+    _trash/<reel>-shots-deleted/ (originals in _orig/, edited pictures in edited/). Returns the new place."""
+    dest = OUT / "_trash" / f"{folder.name}-shots-deleted"
+    if sub:
+        dest = dest / sub
+    dest.mkdir(parents=True, exist_ok=True)
+    new = _unique(dest / p.name)
+    _move_file(p, new)                    # a rename, tried again while another program holds the file for a moment
+    return new
 
 
 def delete_reels(ids, with_obsidian):
@@ -5417,6 +5757,15 @@ def _transcript_done(d, channels, job=TRJOB):
         note = transcript_note(folder, from_channel)
         if note.get("path"):
             job["log"].append(f"  Obsidian note: {note['path']}")
+        else:                                           # no note now (the vault is away): where it came from is kept,
+            try:                                        # so the note made later goes to the same folder (R-20)
+                with DATA_LOCK:
+                    st, bad = _hub_read(folder)
+                    if not bad and "from" not in st:
+                        st["from"] = "channel" if from_channel else "link"
+                        _hub_write(folder, st)
+            except Exception:
+                pass
         try:
             if _auto_category(folder):                  # the channel's home category, if it has one
                 job["log"].append(f"  category: {_hub(folder).get('category')} (the channel's)")
@@ -5424,8 +5773,8 @@ def _transcript_done(d, channels, job=TRJOB):
             job["log"].append(f"  category not set: {e}")
         if from_channel:
             channels.add(parts[1])
-        elif note.get("error") and not job.get("vault_warned"):
-            job["log"].append(f"  Obsidian: {note['error']} (no notes this run)")
+        if note.get("error") and not job.get("vault_warned"):   # also for a channel run (R-20: it said nothing)
+            job["log"].append(f"  Obsidian: {note['error']} (no notes now: Reels Hub makes them when the vault is back)")
             job["vault_warned"] = True
     except Exception as e:
         job["log"].append(f"  Obsidian: {e}")
@@ -7491,7 +7840,7 @@ async function deleteShots(names, ask, allowFav=false){
   const favHit = names.filter(n => isFav(r, n));
   const keep = allowFav ? names : names.filter(n => !isFav(r, n));
   if (!keep.length) return;
-  if (ask && !confirm(`Delete ${keep.length} snapshot${keep.length>1?"s":""} that aren't favorites?\n\nYour ${r.state.favorites.length} favorite${r.state.favorites.length===1?"":"s"} stay. Deleted snapshots only come back with Re-process.`)) return;
+  if (ask && !confirm(`Delete ${keep.length} snapshot${keep.length>1?"s":""} that aren't favorites?\n\nYour ${r.state.favorites.length} favorite${r.state.favorites.length===1?"":"s"} stay. Deleted snapshots go to _trash in the reels folder.`)) return;
   if (allowFav && favHit.length && !confirm(favHit.length === 1
       ? "This image is a favorite.\n\nDelete it? It is removed from your favorites and deleted from the snapshots."
       : `${favHit.length} of these are favorites.\n\nDelete them anyway? They are removed from your favorites and deleted from the snapshots.`)) return;
@@ -8049,7 +8398,7 @@ async function edSave(){
   finally { $("#edsave").disabled = false; }
 }
 async function edReset(){
-  if (!confirm("Throw away all edits and go back to the original snapshot?")) return;
+  if (!confirm("Throw away all edits and go back to the original snapshot?\n\nThe edited picture goes to _trash in the reels folder.")) return;
   const shot = ed.shot;
   try { const j = await api("/api/shots/reset", {id: current.id, shot}); closeEditor(); await afterImageChange(shot, j.mt, false); toast("Back to the original"); }
   catch (e) { alert(e.message); }
@@ -8777,12 +9126,15 @@ function setMode(m){
   if (trm) { clearSel(); renderTrList(); renderTrMain(); loadTr().catch(() => {}); }
   else { renderList(); setView(view); }
 }
+let lateTimer = null;
 async function loadTr(){
   const j = await api("/api/transcripts");
   if (j.channel_cats) chanCats = new Set(j.channel_cats);
   if (j.homes) homes = j.homes;
   if (j.tags) tags = j.tags;
   tr.channels = j.channels || []; tr.items = (j.items || []).map(it => ({...it, label: it.title, version: 1}));
+  if (j.late && j.late.running && !lateTimer)       // notes are being made for transcripts that had none: look again
+    lateTimer = setTimeout(() => { lateTimer = null; loadTr().catch(() => {}); }, 3000);
   const n = tr.items.length; $("#trcount").textContent = n; $("#trcount").hidden = !n;
   if (tr.current) tr.current = tr.items.find(it => it.ch === tr.current.ch && it.id === tr.current.id) || null;
   if (mode !== "transcripts") return;
