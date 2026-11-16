@@ -47,3 +47,7 @@ cloud/node_modules/
 cloud/.wrangler/
 DEPLOY.md
 _queue.json
+
+# A running Reels Hub marks its reels folder; a category change in progress (audit R-10, R-11)
+_running.json
+_pass.json

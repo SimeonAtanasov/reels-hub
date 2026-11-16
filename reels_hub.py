@@ -33,7 +33,7 @@ inbox address and this laptop's service token (in the ReelsHub folder in %APPDAT
 Options:  --port 8765   --out PATH   --vault PATH   --no-browser
 Uses only the Python standard library. Listens on 127.0.0.1 only (not reachable from other devices).
 """
-import argparse, base64, itertools, json, mimetypes, os, re, shutil, subprocess, sys, tempfile, threading, time, webbrowser
+import argparse, base64, itertools, json, mimetypes, os, re, shutil, socket, subprocess, sys, tempfile, threading, time, webbrowser
 import urllib.error, urllib.parse, urllib.request
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -192,6 +192,7 @@ def apply_config(cfg):
     v = OVERRIDES.get("vault") if "vault" in OVERRIDES else cfg.get("vault", "")
     VAULT = Path(v).expanduser() if v else Path("/nonexistent-vault-disabled")
     OUT.mkdir(parents=True, exist_ok=True)
+    forget_all()                                 # other folders, another owner: what the listings kept no longer holds
 
 
 def save_config(body):
@@ -219,6 +220,13 @@ def save_config(body):
             raise ValueError("That Obsidian vault folder doesn't exist - check the path, or leave it empty")
         if not (vp / ".obsidian").is_dir():
             warn = "Note: that folder has no .obsidian folder - make sure it's the vault itself"
+    moving = out_p.resolve() != OUT.resolve()      # another reels folder: the running mark goes with the app (R-10)
+    if moving:
+        pass_free()                                # a category change still at work on the folder being left (R-11)
+        there = run_holder(out_p)
+        if there:
+            raise ValueError(f"Another Reels Hub already runs on that reels folder (http://127.0.0.1:{there}). "
+                             "Close it first, or choose another folder.")
     with CONFIG_LOCK:
         old = load_config() or {}
         cloud, changed = cloud_from_form(body, old.get("cloud") or {})
@@ -232,7 +240,11 @@ def save_config(body):
         if cloud:
             cfg["cloud"] = cloud
         _config_write(cfg)
+        had = RUNNING["path"] is not None
         apply_config(cfg)
+        if moving and had and RUNNING["path"].parent.resolve() != OUT.resolve():   # (--out on the command line: OUT stays)
+            run_release()
+            run_claim(PORT)
     MISS.clear()
     test = None
     if cloud and (changed or not cloud.get("person")):  # new address or token: ask the inbox who this laptop is
@@ -371,7 +383,9 @@ def tr_source_label(source):
     site = src.split(" ")[0]
     rest = src[len(site):].strip()
     return f"{names.get(site, site.title())} {rest}".strip() if rest else names.get(site, site.title())
-TR_CACHE = {}                            # transcript folder -> (note mtime, hub mtime, item) for the catalogue
+TR_CACHE = {}                            # transcript folder -> (note.md stamp, hub.json stamp, item) for the catalogue
+TR_NOTE = {}                             # folder -> (checked at, note path, there): the vault asked once a minute (R-12)
+REEL_CHAN = {}                           # reel folder -> ((video.info.json stamp, link), its channel for the catalogue)
 TR_CONTROL = "_control.json"             # in _transcripts: {"pause", "stop"} for the transcripts run (reels2notes reads it)
 TR_YIELD, TR_TRBUSY = "_yield.json", "_trbusy.json"   # in _transcripts: the two lanes taking turns (reels2notes YIELD, TRBUSY)
 TEMPLATE_FILES = {"YouTube": "'YouTube Template.md", "TikTok": "`TikTok Template.md"}   # in the vault's Templates folder
@@ -434,7 +448,7 @@ INBOX_WAKE = threading.Event()
 REDONE = {}                              # reel id -> "ok" | "failed": how its last Re-process ended (the page's toast)
 CHANGED = {"seq": 0, "list": []}         # reels an inbox Add filled in [{seq, folder}]: the page reloads them
 BOOT = os.urandom(6).hex()               # a new count each start: an open page notices the restart
-APP_DATE = "2026-11-15"                  # the day of the last change to reels_hub.py or reels2notes.py: set it with each
+APP_DATE = "2026-11-16"                  # the day of the last change to reels_hub.py or reels2notes.py: set it with each
 
 
 def _code_hash():
@@ -656,6 +670,128 @@ def reel_dir(rid):
     return folder
 
 
+# ---------------------------------------------------------------- the listings read from memory (audit R-12)
+# One listing of the library read every video's files again (note.md, hub.json three times, shots.json, the time of
+# every snapshot) and asked the vault for every note: 10 to 17 s for about 870 videos on Simeon's laptop (2026-11-15).
+# Now what was read of a video is kept (REEL_CACHE) and its files are read again only when one of them changed: the
+# time stamp and size of note.md, hub.json, shots.json, shots_manual.json and slides.json, and the time stamps of the
+# video's folder, its shots folder and shots/_orig (a snapshot added or deleted, an edit made or reset). An image
+# saved from Paint changes the file but not its folder, so the snapshots that have a copy in shots/_orig are looked at
+# one by one. Whether the note is still at its place in the vault is asked at most every NOTE_CHECK seconds per video,
+# so a note moved or deleted in Obsidian shows up to a minute later. parse_note itself always reads the files: the
+# single-video calls (/api/reel, Run on one video, Send to Obsidian, a share) use it as before.
+REEL_CACHE = {}                              # str(reel folder) -> {sig, edited, item (JSON text), obs: (checked at, answer) or None}
+REEL_FILES = ("note.md", "hub.json", "shots.json", "shots_manual.json", "slides.json")
+NOTE_CHECK = 60                              # seconds between two looks for one video's note in the vault
+SETTLE = 2.0                                 # a file changed in the last 2 s is read again next time: a second change
+                                             # inside one tick of a coarse clock (FAT, exFAT) would look the same
+LISTED = {"n": 0, "read": 0}                 # listings since the start (the first ones always print their time), videos read
+
+
+def _stamp(p):
+    """(time stamp in ns, size) of a file or folder; None when it is not there."""
+    try:
+        st = os.stat(p)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
+def _settled(*stamps):
+    """None of these was changed in the last SETTLE seconds (or carries a time in the future)."""
+    edge = (time.time() - SETTLE) * 1e9
+    return all(s is None or s[0] < edge for s in stamps)
+
+
+def _reel_sig(folder, edited=()):
+    shots = folder / "shots"
+    return (tuple(_stamp(folder / n) for n in REEL_FILES) + (_stamp(folder), _stamp(shots), _stamp(shots / "_orig"))
+            + tuple(_stamp(shots / n) for n in edited))
+
+
+def forget_reel(folder):
+    """The app changed this video's files in a way a time stamp may not show: read them again next time."""
+    REEL_CACHE.pop(str(folder), None)
+
+
+def forget_all():
+    """Settings changed (the folders, who you are): nothing kept in memory is taken as read."""
+    REEL_CACHE.clear(); TR_CACHE.clear(); TR_NOTE.clear(); STATE_CACHE.clear(); REEL_CHAN.clear()
+
+
+def reel_item(folder):
+    """parse_note for the listings: from memory while the video's files are as they were, else read again and kept.
+    Every call gives objects of its own (the listing adds to them)."""
+    key = str(folder)
+    hit = REEL_CACHE.get(key)
+    sig = _reel_sig(folder, hit["edited"] if hit else ())
+    if sig[0] is None:                           # no note.md: not a finished video
+        REEL_CACHE.pop(key, None)
+        return None
+    if hit and hit["sig"] == sig:
+        return json.loads(hit["item"])
+    REEL_CACHE.pop(key, None)
+    LISTED["read"] += 1
+    r = parse_note(folder)
+    if r is None:
+        return None
+    edited = tuple(r["edited"])
+    after = _reel_sig(folder, edited)
+    # kept only when nothing changed while it was read, the files have settled, and hub.json could be read
+    if after[:len(REEL_FILES) + 3] == sig[:len(REEL_FILES) + 3] and _settled(*after) and not r["state"].get("_bad"):
+        REEL_CACHE[key] = {"sig": after, "edited": edited, "item": json.dumps(r, ensure_ascii=False), "obs": None}
+    return r
+
+
+def _note_quick(r):
+    """The listing's answer when the video's note is still where hub.json says, without opening anything: the same
+    answer _ensure_vault_note gives for a note at its place. None: not there (or no place known), ask in full."""
+    st = r["state"]
+    rel = st.get("note_path") or ""
+    if st.get("_bad") or not isinstance(rel, str) or not rel or not (VAULT / rel).is_file():
+        return None
+    return {"name": Path(rel).stem, "path": rel, "uri": obsidian_uri(rel), "sent": st["sent"]}
+
+
+def _note_kept(folder):
+    """The vault's answer for this video from the last NOTE_CHECK seconds, or None: ask again."""
+    hit = REEL_CACHE.get(str(folder))
+    obs = hit and hit.get("obs")
+    if obs and 0 <= time.time() - obs[0] < NOTE_CHECK:
+        return json.loads(obs[1])
+    return None
+
+
+def _note_keep(folder, answer):
+    """Keep a "found" or "not found" answer for NOTE_CHECK seconds; anything else (an error, a video still being
+    added) is asked again at the next listing. Only while hub.json is the one the kept video was read from."""
+    hit = REEL_CACHE.get(str(folder))
+    if not hit or not isinstance(answer, dict):
+        return
+    found = bool(answer.get("path")) and not answer.get("error")
+    if (found or answer.get("missing")) and _stamp(Path(folder) / "hub.json") == hit["sig"][1]:
+        hit["obs"] = (time.time(), json.dumps(answer, ensure_ascii=False))
+    else:
+        hit["obs"] = None
+
+
+STATE_CACHE = {}                             # str(folder) -> (hub.json stamp, read_state as JSON text): the catalogue
+
+
+def state_kept(folder):
+    """read_state from memory while hub.json is as it was (the catalogue asks it for every downloaded video)."""
+    key, st = str(folder), _stamp(Path(folder) / "hub.json")
+    hit = STATE_CACHE.get(key)
+    if hit and hit[0] == st:
+        return json.loads(hit[1])
+    s = read_state(folder)
+    if not s.get("_bad") and _stamp(Path(folder) / "hub.json") == st and _settled(st):
+        STATE_CACHE[key] = (st, json.dumps(s, ensure_ascii=False))
+    else:
+        STATE_CACHE.pop(key, None)
+    return s
+
+
 # ---------------------------------------------------------------- note.md parsing
 def parse_note(folder):
     note = folder / "note.md"
@@ -804,6 +940,7 @@ def _capture(folder, t, manual=True):
             d = {}
         d[name] = round(t, 3)
         atomic_write(sj, json.dumps(d, indent=1))
+        forget_reel(folder)
         if manual:
             man = manual_shots(folder) + [name]
             atomic_write((folder / "shots_manual.json"), json.dumps(man))
@@ -987,36 +1124,58 @@ def _list_reels():
     if not OUT.exists():
         return []
     start_homes()
-    items, t0 = [], time.time()
-    for f in OUT.iterdir():
-        if not f.is_dir() or f.name.startswith(("_", ".")):
-            continue
+    items, t0, seen, read0 = [], time.time(), set(), LISTED["read"]
+    vok = vault_ok()
+    with os.scandir(OUT) as entries:              # the folder's own list says which entries are folders
+        folders = [OUT / e.name for e in entries if not e.name.startswith(("_", ".")) and e.is_dir()]
+    for f in folders:
+        key = str(f)
         try:
-            r = parse_note(f)
+            r = reel_item(f)                      # from memory while its files are as they were (audit R-12)
         except Exception as e:                    # one broken folder must not hide the whole library
             print(f"  skipped {f.name}: {e}")
             continue
         if not r:
             continue
-        try:
-            r["obsidian"] = ensure_vault_note(f, r)
-        except Exception as e:
-            r["obsidian"] = {"error": f"Obsidian: {e}"}
-        # ensure_vault_note may have changed hub.json after parse_note read it: a video that took over its
-        # transcript's note also takes its category and tags (_adopt_transcript_note). The page must get that state,
-        # not the one from before (audit R-07: its first save put the old category back and moved the note).
-        if not r["state"].get("_bad"):
-            fresh = read_state(f)
-            if not fresh.get("_bad"):
-                r["state"] = fresh
+        seen.add(key)
+        if not vok:
+            obs = {"error": f"Vault not found: {VAULT}"}      # what ensure_vault_note says without a vault
+        else:
+            try:
+                obs = _note_kept(f)               # the vault was asked for this video less than a minute ago
+                if obs is None:
+                    obs = _note_quick(r)          # still at its place: one look into the vault, no file opened
+            except Exception:                     # a hub.json with values of another kind (R-50): the full way says it
+                obs = None
+        if obs is None:
+            try:
+                obs = ensure_vault_note(f, r)
+            except Exception as e:
+                obs = {"error": f"Obsidian: {e}"}
+            # ensure_vault_note may have changed hub.json after parse_note read it: a video that took over its
+            # transcript's note also takes its category and tags (_adopt_transcript_note). The page must get that
+            # state, not the one from before (audit R-07: its first save put the old category back and moved the note).
+            # hub.json still as it was read (same time stamp and size): the state is the one in hand.
+            hit = REEL_CACHE.get(key)
+            if not r["state"].get("_bad") and not (hit and _stamp(f / "hub.json") == hit["sig"][1]):
+                fresh = read_state(f)
+                if not fresh.get("_bad"):
+                    r["state"] = fresh
+        _note_keep(f, obs)
+        r["obsidian"] = obs
         try:
             r["ch"], r["chname"] = reel_channel(f)      # the channel group it shows in, inside its category
         except Exception:
             r["ch"], r["chname"] = "", ""
         items.append(r)
-    if time.time() - t0 > 10:
+    for key in [k for k in list(REEL_CACHE) if k not in seen]:    # deleted, moved away, or another reels folder
+        REEL_CACHE.pop(key, None)
+    LISTED["n"] += 1
+    took, read = time.time() - t0, LISTED["read"] - read0
+    if LISTED["n"] <= 3 or took > 2:              # the first three always: the time before and after the memory fills
         miss = sum(1 for r in items if isinstance(r.get("obsidian"), dict) and r["obsidian"].get("missing"))
-        print(f"  library listed in {time.time() - t0:.0f}s: {len(items)} videos, {miss} notes not found in the vault")
+        print(f"  library listed in {took:.1f}s: {len(items)} videos ({read} read from their files, {len(items) - read} "
+              f"from memory), {miss} notes not found in the vault", flush=True)
     return sorted(items, key=lambda r: (r["date"], r["id"]), reverse=True)
 
 
@@ -1480,12 +1639,27 @@ def _save_channel_meta(cdir, meta):
     CH_META.pop(str(cdir), None)
 
 
-def tr_item(folder, key):
-    """One transcript-only video for the catalogue: reads only the head of note.md (cached by file times)."""
-    try:
-        mt = ((folder / "note.md").stat().st_mtime, (folder / "hub.json").stat().st_mtime if (folder / "hub.json").exists() else 0)
-    except OSError:
+def _note_there(folder, rel):
+    """Is this item's note at its place in the vault? Asked at most every NOTE_CHECK seconds per item (R-12: the
+    catalogue asked for every one of about 7,000 notes on every call)."""
+    if not rel:
+        return False
+    key, now = str(folder), time.time()
+    hit = TR_NOTE.get(key)
+    if hit and hit[1] == rel and 0 <= now - hit[0] < NOTE_CHECK:
+        return hit[2]
+    there = (VAULT / rel).is_file()
+    TR_NOTE[key] = (now, rel, there)
+    return there
+
+
+def tr_item(folder, key, full=None):
+    """One transcript-only video for the catalogue: reads note.md and hub.json only when their time stamp or size
+    changed. full: the names of the downloaded videos, when the caller has them (else the folder is asked)."""
+    ns = _stamp(folder / "note.md")
+    if ns is None:
         return None
+    mt = (ns, _stamp(folder / "hub.json"))
     hit = TR_CACHE.get(str(folder))
     if hit and hit[0] == mt:
         it = dict(hit[1])
@@ -1511,7 +1685,7 @@ def tr_item(folder, key):
         it = {"ch": key, "id": folder.name, "title": (t.group(1).strip() if t else folder.name)[:200],
               "author": meta.get("author", ""), "date": meta.get("date", ""), "duration": meta.get("duration_s", ""),
               "url": url, "platform": meta.get("platform") or platform_of(url), "lang": lm.group(1) if lm else "",
-              "source": meta.get("transcript", ""), "lines": n, "added": int(mt[0])}
+              "source": meta.get("transcript", ""), "lines": n, "added": int(ns[0] // 1_000_000_000)}
         st = _hub(folder)
         it["note_path"] = st.get("note_path") or ""
         it["full_flag"] = st.get("full") or ""
@@ -1519,16 +1693,35 @@ def tr_item(folder, key):
         it["tags"] = _clean_tags(st.get("tags"))
         it["rev"] = _rev(st)                         # sent back with a save of its tags (R-04)
         it["cat_set"] = "category" in st             # no category yet: its channel's home, if any (_auto_category)
-        TR_CACHE[str(folder)] = (mt, dict(it))
+        if (_stamp(folder / "note.md"), _stamp(folder / "hub.json")) == mt and _settled(*mt):
+            TR_CACHE[str(folder)] = (mt, dict(it))   # kept when nothing changed while it was read
+        else:
+            TR_CACHE.pop(str(folder), None)
+        TR_NOTE.pop(str(folder), None)               # read again: its note may have moved with it
     rel = it.pop("note_path")
-    it["note"] = {"name": Path(rel).stem, "path": rel, "uri": obsidian_uri(rel)} if rel and (VAULT / rel).is_file() else None
+    it["note"] = {"name": Path(rel).stem, "path": rel, "uri": obsidian_uri(rel)} if _note_there(folder, rel) else None
     it.pop("full_flag")
-    it["full"] = folder.name if (OUT / folder.name / "note.md").is_file() else None   # the same video, in full
+    there = (folder.name in full) if full is not None else (OUT / folder.name / "note.md").is_file()
+    it["full"] = folder.name if there else None      # the same video, in full
     return it
 
 
 def _tr_folders(cdir):
     return sorted(f for f in cdir.iterdir() if f.is_dir() and not f.name.startswith((".", "_")) and (f / "note.md").is_file())
+
+
+def forget_tr(folder):
+    """The app changed this catalogue item or its note: read it, and ask the vault for its note, again next time."""
+    TR_CACHE.pop(str(folder), None)
+    TR_NOTE.pop(str(folder), None)
+
+
+def _reel_folders():
+    """The downloaded videos' folders, in name order (the original before _v2, _v3): one look at the reels folder."""
+    try:
+        return [f for f in sorted(OUT.iterdir()) if f.is_dir() and not f.name.startswith(("_", ".")) and (f / "note.md").is_file()]
+    except OSError:
+        return []
 
 
 def list_transcripts():
@@ -1537,30 +1730,37 @@ def list_transcripts():
     root = OUT / TR_DIR
     chans, items = [], []
     homes = read_homes()
+    reels = _reel_folders()
+    full = {f.name for f in reels}                               # the videos that are here in full, by folder name
+    pref = _pref_lang()
     for cdir in (sorted(root.iterdir()) if root.is_dir() else []):
         if not cdir.is_dir() or cdir.name.startswith((".", "_")):
             continue
         meta = _channel_meta(cdir)
         home = home_of(cdir.name, homes)
-        n = 0
-        for f in _tr_folders(cdir):
-            it = tr_item(f, cdir.name)
+        n = wrong = 0
+        try:                                                     # every folder in it; tr_item leaves out one without note.md
+            subs = sorted(f for f in cdir.iterdir() if not f.name.startswith((".", "_")))
+        except OSError:
+            subs = []
+        for f in subs:
+            it = tr_item(f, cdir.name, full)
             if it and not it["cat_set"] and home:                # no category yet: the channel's home
                 try:
                     _auto_category(f, homes)
-                    it = tr_item(f, cdir.name) or it
+                    it = tr_item(f, cdir.name, full) or it
                 except Exception as e:
                     print(f"  {f.name}: category not set ({e})")
             if it:
                 items.append(it); n += 1
+                if pref and "caption" in (it["source"] or "") and not it["full"] and not _lang_ok(it["lang"], pref):
+                    wrong += 1
         rel = meta.get("note_path") or ""
-        note = {"name": Path(rel).stem, "path": rel, "uri": obsidian_uri(rel)} if rel and (VAULT / rel).is_file() else None
+        note = {"name": Path(rel).stem, "path": rel, "uri": obsidian_uri(rel)} if _note_there(cdir, rel) else None
         chans.append({"key": cdir.name, "name": meta.get("name") or cdir.name, "handle": meta.get("handle", ""), "home": home,
                       "url": meta.get("url", ""), "platform": meta.get("platform", ""), "count": n, "note": note,
-                      "run": tr_run_state(meta.get("run")),
-                      "wrong_lang": sum(1 for it in items if it["ch"] == cdir.name and _pref_lang() and "caption" in (it["source"] or "")
-                                        and not it["full"] and not _lang_ok(it["lang"], _pref_lang()))})
-    _add_reels(chans, items)
+                      "run": tr_run_state(meta.get("run")), "wrong_lang": wrong})
+    _add_reels(chans, items, reels)
     items.sort(key=lambda x: (x["date"], x["id"]), reverse=True)
     return {"channels": chans, "items": items, "channel_cats": channel_cats(), "tags": read_tags(), "homes": homes}
 
@@ -1570,24 +1770,47 @@ def _video_id(folder_name):
     return re.sub(r"_v\d+$", "", folder_name).split("_", 1)[-1]
 
 
-def _add_reels(chans, items):
+def _reel_chan(f, link):
+    """A downloaded video's channel as the catalogue shows it {has, key, name, handle, url}, from video.info.json.
+    Kept by that file's time stamp and size (R-12: every call of the catalogue read every one of these files again,
+    38 MB for about 880 videos). link: the video's link from its note."""
+    import reels2notes as r2n
+    key, sig = str(f), (_stamp(f / "video.info.json"), link)
+    hit = REEL_CHAN.get(key)
+    if hit and hit[0] == sig:
+        return hit[1]
+    info = _info(f)
+    has = bool(info and any(info.get(k) for k in ("channel", "uploader", "uploader_id")))
+    url = link or (info.get("webpage_url") if info else "") or ""
+    c = {"has": has, "key": r2n.tr_key(info, url) if has else "_unknown",
+         "name": r2n.tr_name(info, url) if has else "Unknown channel",
+         "handle": ("@" + r2n._handle(info, url).lstrip("@")) if has else "",
+         "url": r2n._channel_url(url, info) if has else ""}
+    if _stamp(f / "video.info.json") == sig[0] and _settled(sig[0]):
+        REEL_CHAN[key] = (sig, c)
+    return c
+
+
+def _add_reels(chans, items, folders=None):
     """Downloaded videos in the catalogue too (2026-11-07): one entry per video, under its channel, marked as a video.
     A transcript of the same video (same id from the link) is joined to it: the entry then shows the video's
-    transcript, category and note, so a Re-process of the video updates it. Clicking opens the video."""
-    import reels2notes as r2n
+    transcript, category and note, so a Re-process of the video updates it. Clicking opens the video.
+    folders: the videos' folders when the caller has listed them already."""
     reels = {}
-    for f in sorted(OUT.iterdir()):                       # sorted: the original before _v2, _v3
-        if f.is_dir() and not f.name.startswith(("_", ".")) and (f / "note.md").is_file():
-            reels.setdefault(_video_id(f.name), f)
+    folders = _reel_folders() if folders is None else folders
+    for f in folders:                                     # in name order: the original before _v2, _v3
+        reels.setdefault(_video_id(f.name), f)
     if not reels:
         return
+    full = {f.name for f in folders}
     by_vid = {_video_id(it["id"]): it for it in items}
     known = {c["key"]: c for c in chans}
+    homes = None
     for vid, f in reels.items():
-        rk = tr_item(f, "")
+        rk = tr_item(f, "", full)
         if not rk:
             continue
-        st = read_state(f)
+        st = state_kept(f)                                # read_state, from memory while hub.json is as it was
         it = by_vid.get(vid)
         if it:                                            # joined: the video's data wins
             for k in ("title", "duration", "lang", "lines", "url", "date"):
@@ -1597,20 +1820,24 @@ def _add_reels(chans, items):
             if rk.get("note"):
                 it["note"] = rk["note"]
             continue
-        info = _info(f)
-        has_ch = info and any(info.get(k) for k in ("channel", "uploader", "uploader_id"))
-        url = rk.get("url") or (info.get("webpage_url") if info else "") or ""
-        key = r2n.tr_key(info, url) if has_ch else "_unknown"
+        c = _reel_chan(f, rk.get("url") or "")
+        key = c["key"]
         if key not in known:
-            known[key] = {"key": key, "name": r2n.tr_name(info, url) if has_ch else "Unknown channel",
-                          "handle": ("@" + r2n._handle(info, url).lstrip("@")) if has_ch else "",
-                          "url": r2n._channel_url(url, info) if has_ch else "", "platform": rk.get("platform") or "",
+            if homes is None:
+                homes = read_homes()
+            known[key] = {"key": key, "name": c["name"], "handle": c["handle"], "url": c["url"],
+                          "platform": rk.get("platform") or "",
                           "count": 0, "note": None, "run": None, "wrong_lang": 0, "videos_only": True,
-                          "home": home_of(key) if has_ch else ""}
+                          "home": home_of(key, homes) if c["has"] else ""}
             chans.append(known[key])
         known[key]["count"] += 1
         rk.update(ch=key, reel=f.name, full=f.name, category=st["category"], tags=st["tags"], source="video")
         items.append(rk)
+    if len(STATE_CACHE) > len(folders) + 50 or len(REEL_CHAN) > len(folders) + 50:     # videos that are gone
+        here = {str(f) for f in folders}
+        for cache in (STATE_CACHE, REEL_CHAN):
+            for k in [k for k in list(cache) if k not in here]:
+                cache.pop(k, None)
 
 
 def _tr_set_category(folder, cat, prev=None, refresh=True):
@@ -1637,7 +1864,7 @@ def _tr_set_category(folder, cat, prev=None, refresh=True):
                     atomic_write(VAULT / rel, new)
         st["cat_tag"] = tag
         _hub_write(folder, st)
-        TR_CACHE.pop(str(folder), None)
+        forget_tr(folder)
         try:
             move_note(folder, cat, extra=[old_cat], refresh=refresh)
         except Exception as e:
@@ -1752,9 +1979,10 @@ def _plan_move(folder, cat, extra=()):
     return (rel, new)
 
 
-def move_note(folder, cat, extra=(), refresh=True):
+def move_note(folder, cat, extra=(), refresh=True, touched=None):
     """Move this video's note to its category folder. Returns the new path or None. refresh=False: the caller
-    rewrites the channel notes once at the end (a whole channel moving)."""
+    rewrites the channel notes once at the end (a whole channel moving); touched: a set that then gets the keys of
+    the channels whose note lists this video."""
     with DATA_LOCK:
         plan = _plan_move(folder, cat, extra)
         if not plan or plan[0] == "clash":
@@ -1766,7 +1994,7 @@ def move_note(folder, cat, extra=(), refresh=True):
         _move_file(VAULT / old, VAULT / new)
         st = _hub(folder); st["note_path"] = new; st["note_name"] = Path(new).stem
         _hub_write(folder, st)
-        TR_CACHE.pop(str(folder), None)
+        forget_tr(folder)
         keys = set()
         root = OUT / TR_DIR                      # the same video's transcript folder points to the same note
         if root.is_dir():
@@ -1777,9 +2005,11 @@ def move_note(folder, cat, extra=(), refresh=True):
                     if h.get("note_path") == old:
                         h["note_path"] = new; h["note_name"] = Path(new).stem
                         _hub_write(rec, h)
-                        TR_CACHE.pop(str(rec), None)
+                        forget_tr(rec)
                     if rec == folder or h.get("note_path") == new:
                         keys.add(cdir.name)
+        if touched is not None:
+            touched.update(keys)
         for k in (keys if refresh else ()):       # the channel note links by path
             if _channel_meta(OUT / TR_DIR / k).get("note_path"):
                 try:
@@ -1789,21 +2019,78 @@ def move_note(folder, cat, extra=(), refresh=True):
     return new
 
 
-def sort_notes(dry=False):
+def _note_arrived(folder, cat):
+    """A move that was cut off between its two steps (the app was closed in that instant): the note already is in
+    the folder it was going to, while hub.json still names the old place. Take it there, when it carries this video's
+    id marker. Returns the new path, or None when there is nothing of that kind. Only for a pass that goes on after
+    it was cut off: for a transcript-only note nothing else would find the note again (R-13)."""
+    with DATA_LOCK:
+        if not vault_ok():
+            return None
+        st = _hub(folder)
+        rel = st.get("note_path") or ""
+        if not isinstance(rel, str) or not rel or (VAULT / rel).is_file():
+            return None
+        if _in_tr(folder) and (OUT / folder.name / "note.md").is_file():
+            return None                            # the same video is here in full: its folder carries the note
+        new = f"{note_home(_note_platform(folder), cat, _note_chan(folder, cat))}/{rel.rsplit('/', 1)[-1]}"
+        try:
+            if new == rel or not (VAULT / new).is_file() or not has_marker(read_text(VAULT / new), folder.name):
+                return None
+        except OSError:
+            return None
+        st["note_path"] = new; st["note_name"] = Path(new).stem
+        _hub_write(folder, st)
+        forget_tr(folder)
+        root = OUT / TR_DIR                        # the same video's transcript folder points to the same note
+        if root.is_dir():
+            for cdir in root.iterdir():
+                rec = cdir / folder.name
+                if cdir.is_dir() and not cdir.name.startswith((".", "_")) and rec != folder and (rec / "hub.json").is_file():
+                    h = _hub(rec)
+                    if h.get("note_path") == rel:
+                        h["note_path"] = new; h["note_name"] = Path(new).stem
+                        _hub_write(rec, h)
+                        forget_tr(rec)
+        print(f"  {folder.name}: its note was already moved, its place is noted now ({new})")
+        return new
+
+
+def sort_notes(dry=False, background=False):
     """Settings > Move notes to category folders: every video's note that is still in the app's folders goes to
     <platform>/<category>/ (Unassigned: <platform>/), <platform>/<category>/<channel>/ for a channel at home in that
-    category, and each channel note goes with its channel. dry: count and examples only."""
+    category, and each channel note goes with its channel. dry: count and examples only. The moving itself is a pass
+    (audit R-11, see pass_start): one note at a time, so the rest of the app goes on; background=True (the page)
+    answers at once with {"pass": ...} and the page shows how far it is; else the call returns when it is done."""
+    pass_free()                                    # a category being renamed or deleted moves the same notes
     if line_busy():
         raise ValueError("Wait for the current run (and the ones waiting) to finish")
     if not vault_ok():
         raise ValueError("No Obsidian vault set (Settings)")
     cats_need()                                    # with the lists unreadable every note would leave its category folder
+    if dry:
+        moves, clashes, mine, chmoves = _sort_plan()
+        return {"count": len(moves) + len(chmoves), "clashes": len(clashes), "yours": mine,
+                "examples": [f"{p[0]}  ->  {p[1].rsplit('/', 1)[0]}/" for _, _, p in moves[:8]]
+                            + [f"{r}  ->  {n.rsplit('/', 1)[0]}/" for _, _, r, n in chmoves[:2]]}
+    return pass_start("sort", background=background)
+
+
+def _sort_folders():
+    """Every video folder and every transcript-only folder (a transcript of a video that is here in full is left out)."""
     folders = [f for f in OUT.iterdir() if f.is_dir() and not f.name.startswith((".", "_")) and (f / "note.md").is_file()]
     root = OUT / TR_DIR
     if root.is_dir():
         for cdir in root.iterdir():
             if cdir.is_dir() and not cdir.name.startswith((".", "_")):
                 folders += [f for f in _tr_folders(cdir) if not (OUT / f.name / "note.md").is_file()]
+    return folders
+
+
+def _sort_plan():
+    """(moves, clashes, yours, channel note moves) for Move notes to category folders: what would move where."""
+    folders = _sort_folders()
+    root = OUT / TR_DIR
     cats = read_cats()
     moves, clashes, mine = [], [], 0
     for f in folders:
@@ -1827,11 +2114,27 @@ def sort_notes(dry=False):
             plan = _channel_note_plan(cdir, meta)       # <platform>/<home>/<channel>/ or <platform>/Channels/<channel>/
             if plan:
                 chmoves.append((cdir, meta) + plan)
-    if dry:
-        return {"count": len(moves) + len(chmoves), "clashes": len(clashes), "yours": mine,
-                "examples": [f"{p[0]}  ->  {p[1].rsplit('/', 1)[0]}/" for _, _, p in moves[:8]]
-                            + [f"{r}  ->  {n.rsplit('/', 1)[0]}/" for _, _, r, n in chmoves[:2]]}
-    done = 0
+    return moves, clashes, mine, chmoves
+
+
+def _sort_pass():
+    """The pass behind Move notes to category folders. What is already in its folder is not in the plan, so a pass
+    that was cut off simply goes on with the rest. Each channel's own note is rewritten once at the end (it links by
+    path), not after every note (audit R-11)."""
+    if not vault_ok():
+        raise ValueError("No Obsidian vault set (Settings)")
+    cats_need()
+    if PASS["resumed"]:                            # cut off last time: a note moved whose new place was not written yet
+        cats = read_cats()
+        for f in _sort_folders():
+            try:
+                c = str(_hub(f).get("category") or "")
+                _note_arrived(f, c if c in cats else "")
+            except Exception as e:
+                print(f"  {f.name}: {e}")
+    moves, clashes, mine, chmoves = _sort_plan()
+    PASS.update(total=len(moves) + len(chmoves), done=0)
+    done, touched = 0, set()
     for cdir, meta, rel, new in chmoves:
         try:
             with DATA_LOCK:
@@ -1842,12 +2145,22 @@ def sort_notes(dry=False):
             done += 1
         except Exception as e:
             print(f"  channel note {cdir.name} not moved ({e})")
+        PASS["done"] += 1
     for f, cat, _ in moves:
         try:
-            if move_note(f, cat):
+            if move_note(f, cat, refresh=False, touched=touched):
                 done += 1
         except Exception as e:
             print(f"  {f.name}: note not moved ({e})")
+        PASS["done"] += 1
+        time.sleep(PASS_BREATH)
+    PASS["step"] = "channel notes"
+    for k in sorted(touched):
+        try:
+            if _channel_meta(OUT / TR_DIR / k).get("note_path"):
+                channel_note(k)
+        except Exception as e:
+            print(f"  channel note {k} not refreshed ({e})")
     return {"count": done, "clashes": len(clashes), "yours": mine}
 
 
@@ -1920,7 +2233,7 @@ def _write_item_tags(folder, tags, bump=False):
     if not tags:
         st.pop("tags"); st.pop("tag_tokens")
     _hub_write(folder, st, bump)
-    TR_CACHE.pop(str(folder), None)
+    forget_tr(folder)
     return tags
 
 
@@ -2015,7 +2328,7 @@ def _set_creator_tag(folder, write=True):
         atomic_write(VAULT / rel, text[:m.start()] + "**Tags**: " + " ".join(parts) + text[m.end():])
     st["creator_tag"] = want
     _hub_write(folder, st)
-    TR_CACHE.pop(str(folder), None)
+    forget_tr(folder)
     return "added" if line_changes else "same"
 
 
@@ -2404,7 +2717,7 @@ def _adopt_transcript_note(folder, r):
             print(f"  {rel}: the caption text was replaced by the full video's transcript")
         st["full"] = folder.name
         _hub_write(rec, st)
-        TR_CACHE.pop(str(rec), None)
+        forget_tr(rec)
         # the category and tags you gave the transcript carry over to the video (instead of the channel's category
         # the download started with), with the note tokens that go with them, so the note stays where it is
         rh = _hub(folder)
@@ -2450,7 +2763,7 @@ def remove_transcripts(body):
             trash.mkdir(parents=True, exist_ok=True)
             with DATA_LOCK:
                 os.replace(f, _unique(trash / f.name))
-            TR_CACHE.pop(str(f), None)
+            forget_tr(f)
             if note:
                 vtrash.mkdir(exist_ok=True)
                 try:
@@ -3157,26 +3470,223 @@ def _move_channel_notes(extra=()):
                 print(f"  channel note {cdir.name} not moved ({e})")
 
 
-def recategorize(old, new):
-    for folder in OUT.iterdir():
-        f = folder / "hub.json"
-        if folder.is_dir() and f.exists() and not folder.name.startswith((".", "_")):
-            s = read_state(folder)
-            if s["category"] == old and not s.get("_bad"):
-                try:
-                    _tr_set_category(folder, new)          # hub.json, the note's tag and Category line, its folder
-                except Exception as e:
-                    print(f"  {folder.name}: category not changed ({e})")
+def recategorize(old, new, resumed=False):
+    """Every video and transcript in the category `old` gets `new` ("" = Unassigned): hub.json, the note's tag and
+    Category line, and the note's folder. One video at a time under DATA_LOCK, so saves, listings and runs go on
+    (audit R-11: it was one long stretch under the lock, and every moved note rewrote its whole channel note: 874
+    rewrites and a minute for 873 transcripts of one channel). The channel notes are rewritten once, by the caller
+    (_move_channel_notes). Returns how many videos it changed.
+    resumed: a pass that was cut off goes on. A video whose hub.json already carries the new category while its
+    note still sits in the old category's folder (the app was closed between the two steps) gets its note moved; one
+    whose note was moved while hub.json still names the old place gets the new place written (_note_arrived)."""
+    sub = clean_name(old, "") if old else ""
+
+    def late(st):
+        rel = str(st.get("note_path") or "")
+        return bool(resumed and sub and (st.get("category", "") or "") == new and sub in rel.split("/")[1:-1])
+    todo = []                                             # (folder, the whole change or only the note's move)
+    for folder in sorted(OUT.iterdir()):
+        if folder.is_dir() and (folder / "hub.json").exists() and not folder.name.startswith((".", "_")):
+            st, bad = _hub_read(folder)
+            if bad:                                       # unreadable: left alone, as before (R-05)
+                continue
+            if (st.get("category", "") or "") == old:
+                todo.append((folder, True))
+            elif late(st):
+                todo.append((folder, False))
     root = OUT / TR_DIR                                   # transcript-only videos keep their category in hub.json too
     if root.is_dir():
-        for cdir in root.iterdir():
+        for cdir in sorted(root.iterdir()):
             if cdir.is_dir() and not cdir.name.startswith((".", "_")):
-                for folder in cdir.iterdir():
-                    if folder.is_dir() and (folder / "hub.json").is_file() and _hub(folder).get("category") == old:
-                        try:
-                            _tr_set_category(folder, new)
-                        except Exception as e:
-                            print(f"  {folder.name}: category not changed ({e})")
+                for folder in sorted(cdir.iterdir()):
+                    if folder.is_dir() and (folder / "hub.json").is_file():
+                        st = _hub(folder)
+                        if st.get("category") == old:
+                            todo.append((folder, True))
+                        elif late(st):
+                            todo.append((folder, False))
+    PASS.update(total=len(todo), done=0)
+    n = 0
+    for folder, whole in todo:
+        try:
+            if whole:
+                _tr_set_category(folder, new, refresh=False)   # hub.json, the note's tag and Category line, its folder
+            elif not move_note(folder, new, extra=[old], refresh=False):
+                _note_arrived(folder, new)                # or the note moved and only its new place was not written
+            n += 1
+        except Exception as e:
+            print(f"  {folder.name}: category not changed ({e})")
+        PASS["done"] += 1
+        if PASS["done"] % 200 == 0:
+            print(f"  category change: {PASS['done']} of {PASS['total']} videos", flush=True)
+        time.sleep(PASS_BREATH)
+    return n
+
+
+# ---------------------------------------------------------------- long changes as a pass (audit R-11)
+# Renaming or deleting a category and Settings > Move notes to category folders touch every video of a category, or
+# every note. They ran inside one request under DATA_LOCK: with about 5,100 transcripts in one channel the page and
+# every save waited for many minutes, and closing the window in between left the category half renamed for good.
+# Now each is a pass: one at a time (a second one is refused until the first is done), one video at a time under
+# the lock, with its progress in /api/status (the page's status line next to Run). <reels>/_pass.json names the
+# pass from before its first change until it is done, so resume_pass() finishes it at the next start.
+PASS_FILE = "_pass.json"
+PASS = {"state": "", "kind": "", "old": "", "new": "", "done": 0, "total": 0, "step": "", "error": "", "resumed": False,
+        "result": None, "at": 0}             # state: "" | running | done | error
+PASS_LOCK = threading.Lock()
+PASS_KINDS = ("rename", "delete", "sort")
+PASS_BREATH = 0.001                          # seconds outside DATA_LOCK after every video: without it a waiting save or
+                                             # listing rarely gets the lock (the pass takes it again before they wake)
+PASS_WAIT = 0.5                              # seconds a background request waits for its pass before it answers
+
+
+def pass_text(p=None):
+    p = PASS if p is None else p
+    return (f"renaming the category {p['old']} to {p['new']}" if p["kind"] == "rename"
+            else f"deleting the category {p['old']}" if p["kind"] == "delete" else "moving notes to their category folders")
+
+
+def pass_public():
+    return {k: PASS[k] for k in ("state", "kind", "old", "new", "done", "total", "step", "error", "resumed", "result")}
+
+
+def pass_free():
+    """Refuse a second long change while one runs (both would move the same notes), and while one that stopped with
+    an error still waits to be finished (a new one would take its place in _pass.json)."""
+    if PASS["state"] == "running":
+        raise ValueError(f"Reels Hub is still {pass_text()} ({PASS['done']} of {PASS['total'] or '...'} done). "
+                         "Wait until that is finished, then try again.")
+    if PASS["state"] == "error" and (OUT / PASS_FILE).exists():
+        raise ValueError(f"Reels Hub stopped while {pass_text()} ({PASS['error']}). Close Reels Hub and start it again: "
+                         "it finishes that first. Then try again.")
+
+
+def _pass_claim(kind, old="", new="", resumed=False):
+    """Take the one pass slot and write _pass.json, before the first change of the pass."""
+    with PASS_LOCK:
+        pass_free()
+        PASS.update(state="running", kind=kind, old=old, new=new, done=0, total=0, step="", error="", resumed=resumed,
+                    result=None, at=time.time())
+    try:
+        atomic_write(OUT / PASS_FILE, json.dumps({"kind": kind, "old": old, "new": new,
+                                                  "at": time.strftime("%Y-%m-%d %H:%M:%S")}, ensure_ascii=False))
+    except Exception:
+        PASS.update(state="", kind="")
+        raise
+
+
+def _pass_drop():
+    """The pass did not start after all (its first step was refused): free the slot, no file."""
+    try:
+        (OUT / PASS_FILE).unlink(missing_ok=True)
+    except OSError:
+        pass
+    PASS.update(state="", kind="")
+
+
+def _pass_work():
+    """The pass itself. When it ends well _pass.json goes; when it stops with an error the file stays and the pass
+    goes on at the next start."""
+    kind, old, new, t0 = PASS["kind"], PASS["old"], PASS["new"], time.time()
+    try:
+        if kind == "sort":
+            res = _sort_pass()
+        else:
+            n = recategorize(old, new, PASS["resumed"])   # after the list: the notes' folders follow the new name
+            PASS["step"] = "channel notes"
+            _move_channel_notes([old])                    # a channel at home in it: its own note too
+            res = {"count": n}
+        try:
+            (OUT / PASS_FILE).unlink(missing_ok=True)
+        except OSError as e:
+            print(f"  {PASS_FILE} could not be removed ({e}): the pass is repeated at the next start, which changes nothing")
+        PASS.update(result=res, step="", state="done")
+        if res.get("count") or PASS["resumed"] or time.time() - t0 > 2:
+            print(f"  done {pass_text()}: {res.get('count', 0)} video{'' if res.get('count') == 1 else 's'} in {time.time() - t0:.1f}s",
+                  flush=True)
+        return res
+    except Exception as e:
+        PASS.update(state="error", error=str(e), step="")
+        print(f"  stopped {pass_text()} ({e}). It goes on at the next start of Reels Hub.", flush=True)
+        raise
+
+
+def pass_start(kind, old="", new="", background=False, claimed=False):
+    """Run a pass. background=True: in a thread, the answer is {"pass": ...} at once and /api/status tells how far it
+    is. Else in the caller's thread: it returns the pass's result when it is done (scripts and tests; a request that
+    waits this way no longer makes others wait, since the lock is taken per video)."""
+    if not claimed:
+        _pass_claim(kind, old, new)
+    if not background:
+        return _pass_work()
+    box = {}
+
+    def go():
+        _REQ.revs = box["revs"] = {}                      # the revisions the pass raises, for a pass that is done at once
+        try:
+            _pass_work()
+        except Exception:
+            pass                                          # said in the black window and in PASS["error"]
+    th = threading.Thread(target=go, daemon=True)
+    th.start()
+    th.join(PASS_WAIT)                                    # a small category is done before the page gets its answer:
+    mine = getattr(_REQ, "revs", None)                    # the answer then carries the new revisions, as before (R-04),
+    if not th.is_alive() and mine is not None:            # so a star right after a rename is not refused
+        mine.update(box.get("revs") or {})
+    return {"pass": pass_public()}
+
+
+def resume_pass():
+    """At start: a pass that was cut off (the window closed, a crash, a power cut) is finished in the background.
+    Its list change is done first when the app was closed before it (each step is safe to repeat)."""
+    f = OUT / PASS_FILE
+    try:
+        d = _json_dict(f.read_bytes())
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        print(f"  {PASS_FILE} could not be read ({e}): no pass to finish. Rename the category again, or press Move notes "
+              "to category folders, if something looks half done.")
+        try:
+            f.unlink()
+        except OSError:
+            pass
+        return None
+    kind, old, new = d.get("kind"), str(d.get("old") or "")[:100], str(d.get("new") or "")[:100]
+    if kind not in PASS_KINDS or (kind != "sort" and not old) or (kind == "rename" and not new):
+        try:
+            f.unlink()
+        except OSError:
+            pass
+        return None
+    try:
+        with DATA_LOCK:
+            _pass_claim(kind, old, new, resumed=True)
+            if kind != "sort":
+                cats_need()
+                _cats_step(kind, old, new)
+    except Exception as e:
+        PASS.update(state="error", error=str(e))
+        print(f"  could not go on {pass_text()} ({e}). It is tried again at the next start.", flush=True)
+        return None
+    print(f"Finishing what was cut off last time: {pass_text()}.", flush=True)
+    return pass_start(kind, old, new, background=True, claimed=True)
+
+
+def _cats_step(kind, old, new):
+    """The list part of a rename or delete (the caller holds DATA_LOCK). Safe to repeat: a list that already has the
+    change is left as it is. Returns the category list."""
+    cats = read_cats()
+    if kind == "rename" and old in cats:
+        cats[cats.index(old)] = new
+        raw = _cats_raw()                             # channels at home in it keep it under the new name
+        if isinstance(raw.get("homes"), dict):
+            _write_homes({k: (new if v == old else v) for k, v in raw["homes"].items()})
+        write_cats(cats, [new if c == old else c for c in channel_cats()])
+    elif kind == "delete" and old in cats:
+        cats.remove(old)
+        write_cats(cats)                              # first, so its channels lose it as their home
+    return cats
 
 
 def _shot_path(reel_id, name):
@@ -3213,6 +3723,7 @@ def save_edit(reel_id, name, data_url):
     with DATA_LOCK:
         _backup(p)
         atomic_write_bytes(p, raw)                # an edited image is your work: forced onto the disk (R-17)
+        forget_reel(p.parent.parent)
     return int(p.stat().st_mtime)
 
 
@@ -3226,6 +3737,7 @@ def reset_edit(reel_id, name):
         shutil.copy2(orig, p)
         orig.unlink()
         os.utime(p, None)                     # new mtime so the browser reloads it
+        forget_reel(p.parent.parent)
     return int(p.stat().st_mtime)
 
 
@@ -3233,6 +3745,7 @@ def open_external(reel_id, name):
     """Open the snapshot in the Windows image editor (Paint) - saves go straight back to the file."""
     p = _shot_path(reel_id, name)
     _backup(p)
+    forget_reel(p.parent.parent)              # Paint saves into the file itself: read this video again next time
     if sys.platform.startswith("win"):
         try:
             os.startfile(str(p), "edit")          # default 'Edit' app for JPG, usually Paint
@@ -3289,6 +3802,7 @@ def delete_shots(reel_id, names, force=False):
         text = note.read_text(encoding="utf-8", errors="replace")
         drop = {f"![[{folder.name}/shots/{n}]]" for n in gone}
         atomic_write(note, "\n".join(l for l in text.split("\n") if l.strip() not in drop))
+        forget_reel(folder)
     return {"deleted": gone}
 
 
@@ -3340,12 +3854,18 @@ def delete_reels(ids, with_obsidian):
     return {"deleted": done, "errors": errors}
 
 
-def change_cats(body):
+def change_cats(body, background=False):
+    """POST /api/categories {action add | rename | delete | move, name, new, dir}. Returns the category list.
+    rename and delete change the lists at once and then every video of the category as a pass (pass_start):
+    background=True (the page) returns as soon as the lists are written and the pass goes on in a thread; else the
+    call returns when the pass is done."""
     action = body.get("action")
     name = str(body.get("name", "")).strip()[:100]
     with DATA_LOCK:
         cats_need()
         cats = read_cats()
+        if action in ("rename", "delete"):
+            pass_free()                               # one long change at a time
         if action == "add":
             if not name:
                 raise ValueError("Category name is empty")
@@ -3361,20 +3881,23 @@ def change_cats(body):
                 raise ValueError("No such category")
             if new in cats and new != name:
                 raise ValueError("That category already exists")
-            cats[cats.index(name)] = new
-            raw = _cats_raw()                         # channels at home in it keep it under the new name
-            if isinstance(raw.get("homes"), dict):
-                _write_homes({k: (new if v == name else v) for k, v in raw["homes"].items()})
-            write_cats(cats, [new if c == name else c for c in channel_cats()])
-            recategorize(name, new)                   # after the list: the notes' folders follow the new name
-            _move_channel_notes([name])               # a channel at home in it: its own note too
-            return cats
+            if new == name:
+                return cats
+            _pass_claim("rename", name, new)          # _pass.json first: closed in the middle, the next start finishes it
+            try:
+                cats = _cats_step("rename", name, new)
+            except Exception:
+                _pass_drop()
+                raise
         elif action == "delete":
-            if name in cats:
-                cats.remove(name)
-            write_cats(cats)                          # first, so its channels lose it as their home
-            recategorize(name, "")
-            _move_channel_notes([name])
+            if not name:
+                raise ValueError("Category name is empty")
+            _pass_claim("delete", name)
+            try:
+                cats = _cats_step("delete", name, "")
+            except Exception:
+                _pass_drop()
+                raise
         elif action == "move":
             d = int(body.get("dir", 0))
             if name in cats:
@@ -3383,8 +3906,11 @@ def change_cats(body):
                 cats.insert(j, cats.pop(i))
         else:
             raise ValueError("Unknown action")
-        write_cats(cats)
-        return cats
+        if action not in ("rename", "delete"):
+            write_cats(cats)
+            return cats
+    pass_start(action, name, new if action == "rename" else "", background=background, claimed=True)   # outside the lock
+    return cats
 
 
 # ---------------------------------------------------------------- sharing (Cloudflare inbox)
@@ -5107,6 +5633,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"count": count_reels() if CONFIG.get("name") else 0})
         elif path == "/api/reel":                       # one reel, fresh (the Paint check when the window gets focus)
             rid = urllib.parse.parse_qs(urlparse(self.path).query).get("id", [""])[0]
+            forget_reel(reel_dir(rid))                  # read from its files, and so does the next listing
             r = parse_note(reel_dir(rid))
             self.send_json({"reel": r} if r else {"error": "unknown reel"}, 200 if r else 404)
         elif path == "/api/reels":
@@ -5114,7 +5641,7 @@ class Handler(BaseHTTPRequestHandler):
             seq = CHANGED["seq"]                     # read before listing: later fill-ins count as changed
             self.send_json({"reels": list_reels() if CONFIG.get("name") else [], "categories": read_cats(),
                             "channel_cats": channel_cats(), "tags": read_tags(), "homes": read_homes(),
-                            "homes_job": dict(HOMES),
+                            "homes_job": dict(HOMES), "pass": pass_public(),
                             "boot": BOOT, "changed_seq": seq,
                             "me": {"name": CONFIG.get("name", ""), "person": CONFIG.get("person", ""),
                                    "can_delete": can_delete(),
@@ -5131,6 +5658,7 @@ class Handler(BaseHTTPRequestHandler):
                             "busy": sorted(JOB["busy"]) if JOB["running"] else [],
                             "transcripts": bool(TRJOB["running"]),
                             "queue": queue_list(), "changed": CHANGED["list"], "boot": BOOT, "homes_job": dict(HOMES),
+                            "pass": pass_public(),
                             "awake": AWAKE["on"], "online": lib_public(), "redone": dict(REDONE)})
         elif path.startswith("/media/"):
             self.serve_file(path[len("/media/"):])
@@ -5258,8 +5786,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, **queue_move(body)})
             elif path == "/api/notes/creatortags":
                 self.send_json({"ok": True, **creator_tags(body)})
-            elif path == "/api/notes/sortfolders":
-                self.send_json({"ok": True, **sort_notes(bool(body.get("dry")))})
+            elif path == "/api/notes/sortfolders":         # background: the page; the pass goes on after the answer (R-11)
+                self.send_json({"ok": True, **sort_notes(bool(body.get("dry")), bool(body.get("background")))})
             elif path == "/api/tags":
                 self.send_json({"ok": True, "tags": change_tags(body)})
             elif path == "/api/tags/set":
@@ -5283,8 +5811,9 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Nothing to delete")
                 self.send_json({"ok": True, **delete_reels(ids, bool(body.get("obsidian")))})
             elif path == "/api/categories":
-                self.send_json({"ok": True, "categories": change_cats(body), "channel_cats": channel_cats(), "tags": read_tags(),
-                                "homes": read_homes()})
+                self.send_json({"ok": True, "categories": change_cats(body, bool(body.get("background"))),
+                                "channel_cats": channel_cats(), "tags": read_tags(), "homes": read_homes(),
+                                "pass": pass_public()})
             elif path == "/api/share":
                 self.send_json({"ok": True, **share_reels(body.get("ids"), str(body.get("to") or ""))})
             elif path == "/api/inbox/check":
@@ -6177,7 +6706,7 @@ function assemble(parts, closedSet){        // the Channels group around the cha
   return html + unas.map(p => p.html).join("");
 }
 let mode = "reels";                        // "reels" (the gallery) or "transcripts" (the catalogue of transcript-only videos)
-let tr = {channels: [], items: [], current: null, shown: ""}, trCollapsed = new Set(), trTick = 0;
+let tr = {channels: [], items: [], current: null, shown: ""}, trCollapsed = new Set(), trSeen = -1, trBusy = false, trAt = 0;
 let trGroupBy = "category", tfChan = new Set(), tfCat = new Set(), tfPlat = new Set(), tfTag = new Set();   // the catalogue's own grouping and filters
 try { trCollapsed = new Set(JSON.parse(localStorage.getItem("rh-trcollapsed") || "[]")); } catch (e) {}
 try { trGroupBy = localStorage.getItem("rh-trgroupby") || trGroupBy; const f = JSON.parse(localStorage.getItem("rh-trfilters") || "{}"); tfCat = new Set(f.c || []); tfPlat = new Set(f.p || []); tfTag = new Set(f.t || []); tfChan = new Set(f.h || []); } catch (e) {}
@@ -6333,7 +6862,7 @@ async function loadReels(keepId, changedIds){
     return r;
   });
   cats = j.categories; chanCats = new Set(j.channel_cats || []); homes = j.homes || homes; tags = j.tags || tags; vault = j.vault || vault; trashDir = j.trash || trashDir; me = j.me || me;
-  trackHomes(j.homes_job); trackOnline(j.online);
+  trackHomes(j.homes_job); trackOnline(j.online); trackPass(j.pass);
   if (changedSeq === null) { changedSeq = j.changed_seq || 0; bootId = j.boot; }
   else if (j.boot && j.boot !== bootId) { bootId = j.boot; changedSeq = j.changed_seq || 0; }   // every copy is fresh from this listing
   applyMe();
@@ -6573,9 +7102,8 @@ async function sortNotes(){
     + (j.yours ? `\n\n${j.yours} note${j.yours === 1 ? "" : "s"} you filed in your own folders stay where they are.` : "")
     + (j.clashes ? `\n${j.clashes} not moved: a note of the same name is already in the target folder.` : ""), null, "Move");
   if (!a.ok) return;
-  try { j = await api("/api/notes/sortfolders", {}); } catch (e) { return alert(e.message); }
-  toast(`Moved ${j.count} note${j.count === 1 ? "" : "s"}`);
-  loadReels(current && current.id).catch(() => {}); loadTr().catch(() => {});
+  try { j = await api("/api/notes/sortfolders", {background: true}); } catch (e) { return alert(e.message); }
+  trackPass(j.pass, true);                      // in the background: the status line counts, a line says when it is done
 }
 async function tagAction(body){
   await flushSaves();
@@ -7151,8 +7679,13 @@ function setCategory(r, cat){
 
 async function catAction(body){
   await flushSaves();
-  try { const r = await api("/api/categories", body); cats = r.categories; chanCats = new Set(r.channel_cats || []); homes = r.homes || homes; tags = r.tags || tags; }
+  // a rename or delete reaches every video of the category: the server does that in the background (audit R-11);
+  // the status line next to Run shows how far it is, and a second such change is refused until it is done
+  const long = body.action === "rename" || body.action === "delete";
+  let r;
+  try { r = await api("/api/categories", long ? {...body, background: true} : body); cats = r.categories; chanCats = new Set(r.channel_cats || []); homes = r.homes || homes; tags = r.tags || tags; }
   catch (e) { return alert(e.message); }
+  if (long && r.pass && r.pass.kind === body.action && r.pass.old === body.name) trackPass(r.pass, true);
   if (body.action === "rename") reels.forEach(r => { if (r.state.category === body.name) r.state.category = body.new; });
   if (body.action === "rename" && fCat.delete(body.name)) { fCat.add(body.new); saveFilters(); }
   if (body.action === "delete") reels.forEach(r => { if (r.state.category === body.name) r.state.category = ""; });
@@ -8568,6 +9101,35 @@ function trackHomes(h){
   };
   setTimeout(tick, 2000);
 }
+/* A category rename or delete and Move notes to category folders run as a pass on the server (audit R-11): the
+   status line next to Run shows how far it is; when it is done a line says so and the library is read again (the
+   videos it changed have a newer revision, so their copies here are replaced). mine: this page started it, so it
+   is followed to its end even when it was done before the answer came. */
+let passWatch = false, passJob = null;
+function passLine(p){
+  const what = p.kind === "rename" ? "Renaming category" : p.kind === "delete" ? "Deleting category" : "Moving notes";
+  return p.step ? `${what}: ${p.step}...` : `${what}: ${p.done || 0} / ${p.total || "..."}`;
+}
+function passText(p){ passJob = p; const st = $("#status"); if (!st.classList.contains("on")) st.textContent = passLine(p); }
+function trackPass(p, mine){
+  if (!p || passWatch || (p.state !== "running" && !mine)) return;
+  passWatch = true; if (p.state === "running") passText(p);
+  const tick = async () => {
+    let s; try { s = await api("/api/status"); } catch (e) { setTimeout(tick, 3000); return; }
+    const job = s.pass || {};
+    if (job.state === "running") { passText(job); setTimeout(tick, 1000); return; }
+    passWatch = false; passJob = null;
+    if (!$("#status").classList.contains("on") && /^(Renaming|Deleting|Moving)/.test($("#status").textContent)) $("#status").textContent = "Idle";
+    const res = job.result || {}, n = res.count || 0, vids = `${n} video${n === 1 ? "" : "s"}`;
+    if (job.state === "error") toastLong(`${passLine({kind: job.kind, step: "stopped"}).replace("...", "")} (${job.error || "error"}). It goes on at the next start of Reels Hub.`);
+    else if (job.kind === "rename") toast(`Renamed to ${job.new}: ${vids}`);
+    else if (job.kind === "delete") toast(`Category deleted: ${vids} now in Unassigned`);
+    else if (job.kind === "sort") toast(`Moved ${n} note${n === 1 ? "" : "s"}` + (res.clashes ? ` (${res.clashes} not moved: a note of the same name is already there)` : ""));
+    try { await loadReels(current && current.id); } catch (e) {}
+    loadTr().catch(() => {});
+  };
+  setTimeout(tick, p.state === "running" ? 500 : 0);
+}
 /* Online copy (phase 3, 2026-11-12): the laptop sends the library to Cloudflare in the background; the status line
    shows how far a big pass is, Settings shows the state, Update now and Remove the online copy */
 let onlineWatch = false, onlineJob = null, libLast = {};
@@ -8631,10 +9193,11 @@ async function poll(){
     lastBlockedAt = s.blocked.at;
   } else if (lastBlockedAt === null) lastBlockedAt = (s.blocked && s.blocked.at) || 0;
   const one = runs.length === 1 ? L[runs[0]] : null;
-  $("#status").textContent = runs.length > 1 ? "Running · 2 at once"
-    : one ? `Running · ${one.done || 0} / ${one.total != null ? one.total : one.urls.length} done`
-    : homesWatch && homesJob ? `Channel groups: ${homesJob.done || 0} / ${homesJob.total || "..."}`
-    : onlineWatch && onlineJob && onlineJob.total ? `Online copy: ${onlineJob.done || 0} / ${onlineJob.total}` : (L.video.finished || L.tr.finished ? "Finished" : "Idle");
+  $("#status").textContent = (runs.length > 1 ? "Running · 2 at once"
+    : one ? `Running · ${one.done || 0} / ${one.total != null ? one.total : one.urls.length} done` : "")
+      + (runs.length && passWatch && passJob ? " · " : "") + (passWatch && passJob ? passLine(passJob) : "")
+    || (homesWatch && homesJob ? `Channel groups: ${homesJob.done || 0} / ${homesJob.total || "..."}`
+    : onlineWatch && onlineJob && onlineJob.total ? `Online copy: ${onlineJob.done || 0} / ${onlineJob.total}` : (L.video.finished || L.tr.finished ? "Finished" : "Idle"));
   showProgress(s); showQueue(q);
   $("#status").classList.toggle("on", s.running);
   const fresh = takeChanged(s.changed, s.boot);
@@ -8642,7 +9205,13 @@ async function poll(){
   const trEnded = trWas && !s.transcripts; trWas = !!s.transcripts;
   if (s.running || q.some(x => !x.held)) {             // only items set for Later: nothing to watch
     wasRunning = true; refreshQuiet().catch(() => {});
-    if ((s.transcripts && ++trTick % 5 === 0) || trEnded) loadTr().catch(() => {});   // the catalogue fills up as it runs
+    // the catalogue fills up as a transcripts run goes: asked for again when the run has finished another video,
+    // one request at a time and at most every 5 s (audit R-12: it was asked every 5 s whatever happened)
+    const trDone = L.tr.done || 0;
+    if (trEnded || (s.transcripts && trDone !== trSeen && !trBusy && Date.now() - trAt >= 5000)) {
+      trSeen = trDone; trBusy = true;
+      loadTr().catch(() => {}).finally(() => { trBusy = false; trAt = Date.now(); });
+    }
     if (fresh.size || ended.length) reloadChanged(new Set([...fresh, ...ended]));
     setTimeout(poll, 1000); return;
   }
@@ -8819,6 +9388,106 @@ async function saveSetup(){
 PAGE = PAGE.replace("@@ICON@@", ICON_BODY).replace("@@VERSION@@", VERSION)
 
 
+# ---------------------------------------------------------------- one Reels Hub per reels folder (audit R-10)
+# A second start (a double-click on the shortcut while the app runs) was meant to be refused by the port being
+# busy. On Windows it was not: http.server sets SO_REUSEADDR, which there lets a second program bind a port in use
+# (Simeon's laptop, 2026-11-15: "second bind worked"). Two servers on one reels folder both ran the waiting line: the
+# same links twice, downloads that failed in one copy, a video folder holding another link's file, _queue.json
+# written by both. Two guards now:
+# - the port: HubServer binds without SO_REUSEADDR on Windows (with SO_EXCLUSIVEADDRUSE), so a second bind fails;
+# - the folder: <reels>/_running.json {pid, port, boot} while the app runs, whatever its port. A second start that
+#   finds one asks that port's /api/ping; an answer with the same boot means Reels Hub runs on this folder: the new
+#   window says so, opens that page and ends. No such process, or no such answer: the file was left behind by a
+#   crash or a closed window, and is replaced.
+RUN_FILE = "_running.json"
+RUNNING = {"path": None}                     # the mark this process holds, if any
+
+
+class HubServer(ThreadingHTTPServer):
+    allow_reuse_address = os.name != "nt"    # elsewhere it only allows a restart right after a stop
+
+    def server_bind(self):
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            try:
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            except OSError:
+                pass
+        super().server_bind()
+
+
+def _ping(port, timeout=1.5):
+    """The answer of a Reels Hub's /api/ping on this computer, or None."""
+    try:
+        op = urllib.request.build_opener(urllib.request.ProxyHandler({}))     # never through a proxy
+        with op.open(f"http://127.0.0.1:{int(port)}/api/ping", timeout=timeout) as r:
+            d = json.loads(r.read().decode("utf-8", "replace"))
+        return d if isinstance(d, dict) and d.get("ok") else None
+    except Exception:
+        return None
+
+
+def run_holder(folder):
+    """The port of another Reels Hub that runs on this reels folder right now, or None. A mark whose process is gone,
+    or whose port does not answer as that same start, counts as left behind."""
+    import reels2notes as r2n
+    try:
+        d = _json_dict((Path(folder) / RUN_FILE).read_bytes())
+    except (OSError, ValueError):
+        return None
+    pid, port = d.get("pid"), d.get("port")
+    if pid == os.getpid() or isinstance(port, bool) or not isinstance(port, int) or not r2n.pid_alive(pid):
+        return None
+    for k in range(3):                       # a copy that is just starting answers a moment later
+        a = _ping(port)
+        if a:
+            return port if a.get("boot") == d.get("boot") else None
+        if k < 2:
+            time.sleep(0.5)
+    return None
+
+
+def run_claim(port, folder=None):
+    """Mark the reels folder as this process's. Returns None when the mark is ours (or could not be written: the app
+    then runs without it), else the port of the Reels Hub that already runs on the folder."""
+    f = Path(folder or OUT) / RUN_FILE
+    mine = json.dumps({"pid": os.getpid(), "port": port, "boot": BOOT, "at": time.strftime("%Y-%m-%d %H:%M:%S")})
+    for _ in range(3):
+        try:
+            fd = os.open(f, os.O_WRONLY | os.O_CREAT | os.O_EXCL)       # made only if it is not there: two starts at
+        except FileExistsError:                                          # the same moment cannot both get it
+            other = run_holder(f.parent)
+            if other:
+                return other
+            try:
+                f.unlink()                   # left behind by a crash or a closed window
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                print(f"  {RUN_FILE} could not be replaced ({e}): going on without it")
+                return None
+            continue
+        except OSError as e:
+            print(f"  {RUN_FILE} could not be written ({e}): going on without it")
+            return None
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(mine)
+        RUNNING["path"] = f
+        return None
+    return None
+
+
+def run_release():
+    """Take this process's mark away (a clean stop, or the reels folder changed in Settings). Never another's."""
+    f, RUNNING["path"] = RUNNING["path"], None
+    if not f:
+        return
+    try:
+        if _json_dict(f.read_bytes()).get("pid") == os.getpid():
+            f.unlink()
+    except (OSError, ValueError):
+        pass
+
+
 def main():
     global PORT
     ap = argparse.ArgumentParser(description="Local web app for reels2notes.py")
@@ -8845,11 +9514,20 @@ def main():
     if not SCRIPT.exists():
         print(f"reels2notes.py not found next to this file ({HERE}) - Run will not work.")
     url = f"http://127.0.0.1:{args.port}"
+    other = run_claim(args.port)                # one Reels Hub per reels folder, whatever its port (audit R-10)
+    if other:
+        there = f"http://127.0.0.1:{other}"
+        print(f"Reels Hub already runs on this reels folder ({OUT}), at {there}. Opening its page.")
+        if not args.no_browser:
+            webbrowser.open(there)
+        return
     try:
-        srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+        srv = HubServer(("127.0.0.1", args.port), Handler)
     except OSError:
+        run_release()
         print(f"Port {args.port} is busy - Reels Hub is probably already running. Opening it.")
-        webbrowser.open(url)
+        if not args.no_browser:
+            webbrowser.open(url)
         return
     print(f"Reels Hub {VERSION} running at {url}  (reels folder: {OUT})\nPress Ctrl+C to stop.")
     if cfg:
@@ -8857,6 +9535,7 @@ def main():
         if n:
             print(f"Waiting line: {n} item(s) from last time (the one that was running is set for Later)")
         start_homes()                               # one time: channel categories -> channel groups (background)
+        resume_pass()                               # a category change or Move notes that was cut off: finish it (R-11)
     if cloud_settings():
         print(f"Sharing: inbox at {CONFIG['cloud']['url']} (checked every {PICKUP_EVERY} s while this runs)")
     seed_prev()                                 # a copy from before for config.json and _categories.json, from day one
@@ -8874,6 +9553,8 @@ def main():
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\nStopped.")
+    finally:
+        run_release()
 
 
 if __name__ == "__main__":
